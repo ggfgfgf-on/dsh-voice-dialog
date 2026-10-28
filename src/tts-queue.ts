@@ -189,6 +189,26 @@ export class TtsQueue {
     try { previous.close() } catch { /* already closed */ }
   }
 
+  /**
+   * Establish the Edge handshake ahead of the first sentence. The proxy
+   * occasionally resets a fresh TLS connection; retry a few times so the
+   * first reply does not have to wait for that recovery.
+   */
+  async warm(attempts = 3): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await this.ensureReady()
+        return
+      } catch (error) {
+        lastError = error
+        this.resetConnection()
+        if (attempt < attempts) await sleep(300)
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
+  }
+
   subscribe(listener: FrameListener): () => void {
     this.listeners.add(listener)
     return () => {
@@ -333,6 +353,9 @@ export class TtsQueue {
       // is scheduled with backoff instead of re-entering the pump at once.
       // eslint-disable-next-line no-console
       console.warn(`[dsh-voice-dialog] TTS unavailable: ${String(e)}`)
+      // A failed handshake can leave msedge-tts in a bad state; retrying the
+      // same instance tends to fail again. Re-dial before the backoff.
+      this.resetConnection()
       this.scheduleRetry(sessionId, q)
     } finally {
       q.busy = false

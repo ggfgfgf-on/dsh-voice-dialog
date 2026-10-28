@@ -16,6 +16,8 @@ export interface MicOptions {
   deviceId?: string
   onLevel?: (level: number) => void
   onSpeechStart?: () => void
+  /** Fired once the utterance closes, so playback can leave ducked mode. */
+  onSpeechEnd?: () => void
   onSegment?: (samples: Float32Array, seconds: number) => void
   onError?: (error: unknown) => void
 }
@@ -130,6 +132,7 @@ export class MicrophoneLoop {
     let silence = 0
     let speech = 0
     let totalMs = 0
+    let announced = false
 
     const reset = (): void => {
       preRoll = []
@@ -138,13 +141,20 @@ export class MicrophoneLoop {
       silence = 0
       speech = 0
       totalMs = 0
+      announced = false
     }
 
     const finalize = (): void => {
       const captured = flatten(segment)
       const seconds = captured.length / context.sampleRate
       const enough = speech >= this.options.minSpeechMs
+      const wasAnnounced = announced
       reset()
+      // Leave ducked mode before transcription starts; waiting for the ASR
+      // result kept the player quiet long after the user stopped speaking.
+      if (wasAnnounced) {
+        try { this.options.onSpeechEnd?.() } catch (error) { this.options.onError?.(error) }
+      }
       if (!enough || captured.length === 0) return
       const samples = resample(captured, context.sampleRate, TARGET_RATE)
       try { this.options.onSegment?.(samples, seconds) } catch (error) { this.options.onError?.(error) }
@@ -169,7 +179,6 @@ export class MicrophoneLoop {
         speech = chunkMs
         silence = 0
         totalMs = segment.reduce((n, c) => n + c.length, 0) / context.sampleRate * 1000
-        this.options.onSpeechStart?.()
         return
       }
 
@@ -178,6 +187,12 @@ export class MicrophoneLoop {
       if (rms >= this.options.threshold) {
         speech += chunkMs
         silence = 0
+        // A single click or speaker echo must not duck playback. Require a
+        // short sustained utterance before treating it as a barge-in.
+        if (!announced && speech >= this.options.minSpeechMs) {
+          announced = true
+          try { this.options.onSpeechStart?.() } catch (error) { this.options.onError?.(error) }
+        }
       } else {
         silence += chunkMs
       }

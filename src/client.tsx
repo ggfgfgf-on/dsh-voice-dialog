@@ -364,6 +364,18 @@ export async function apply(ctx: any): Promise<() => Promise<void>> {
   return async () => { await ui.dispose(); await disposeRemote() }
 }
 
+/** Capture survives a transient composer remount; only a real navigation stops it. */
+let retainedMic: MicrophoneLoop | null = null
+let retainedSession: string | null = null
+let retainedStopTimer: ReturnType<typeof setTimeout> | null = null
+
+function cancelRetainedStop(): void {
+  if (retainedStopTimer !== null) {
+    clearTimeout(retainedStopTimer)
+    retainedStopTimer = null
+  }
+}
+
 interface VoiceMicProps {
   ctx: any
   sessionId: string
@@ -401,6 +413,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   }, [active, onActiveChange])
 
   const stop = async (): Promise<void> => {
+    cancelRetainedStop()
+    retainedMic = null
+    retainedSession = null
     await micRef.current?.stop()
     micRef.current = null
     // Keep already captured segments: stopping the microphone must not lose
@@ -413,15 +428,40 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   }
 
   useEffect(() => {
+    if (retainedMic && retainedSession === sessionId) {
+      // The composer remounted while listening. Reattach instead of stopping.
+      cancelRetainedStop()
+      micRef.current = retainedMic
+      setActive(true)
+      setPhase('listening')
+      return
+    }
+    if (retainedMic) {
+      cancelRetainedStop()
+      void retainedMic.stop()
+      retainedMic = null
+      retainedSession = null
+    }
     setActive(false)
     setPhase('idle')
     setError('')
     return () => {
-      void micRef.current?.stop()
-      micRef.current = null
-      queueRef.current.length = 0
-      sharedPlayer.endSession()
-      sharedPlayer.restore()
+      const mic = micRef.current
+      if (!mic) return
+      // A slot remount must not kill an active conversation. Hold the capture
+      // for a moment; if this was real navigation, stop it after the grace.
+      retainedMic = mic
+      retainedSession = sessionId
+      cancelRetainedStop()
+      retainedStopTimer = setTimeout(() => {
+        if (retainedMic !== mic) return
+        retainedMic = null
+        retainedSession = null
+        retainedStopTimer = null
+        void mic.stop()
+        sharedPlayer.endSession()
+        sharedPlayer.restore()
+      }, 1200)
     }
   }, [sessionId])
 
@@ -482,8 +522,10 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       await sharedPlayer.enable()
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
+        silenceMs: getPreferences().pauseMs,
         onLevel: (value) => setLevel(value),
         onSpeechStart: () => { sharedPlayer.unmute(); sharedPlayer.duck() },
+        onSpeechEnd: () => { sharedPlayer.restore() },
         onSegment: (samples) => {
           queueRef.current.push(samples)
           void drain()
@@ -494,6 +536,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       })
       await mic.start()
       micRef.current = mic
+      cancelRetainedStop()
+      retainedMic = mic
+      retainedSession = sessionId
       sharedPlayer.beginSession()
       setActive(true)
       setPhase('listening')
@@ -741,6 +786,13 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
 
     <section>
       <h3>语音识别</h3>
+      <label>停顿多久算说完<select value={String(prefs.pauseMs)} disabled={busy}
+        onChange={(event) => { save({ pauseMs: Number(event.target.value) }) }}>
+        <option value="1200">1.2 秒（快，容易截话）</option>
+        <option value="1600">1.6 秒（默认）</option>
+        <option value="2000">2.0 秒（少截话）</option>
+        <option value="2500">2.5 秒（慢，适合思考）</option>
+      </select></label>
       {selection && <label>识别服务<select value={selection.providerId} disabled={busy}
         onChange={(event) => { void invoke(() => ctx.remote.speech.configure({ providerId: event.target.value })) }}>
         {catalog.providers.map((item: any) => <option key={item.id} value={item.id}>{item.name}</option>)}

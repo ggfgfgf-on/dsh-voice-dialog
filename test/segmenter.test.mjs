@@ -26,3 +26,17 @@ test('splits a long unpunctuated run at a natural separator', () => {
   assert.ok(out.length >= 1)
   assert.ok(out[0].length > 0)
 })
+test('never speaks a voice directive, even when split across deltas', () => {
+  const whole = new SentenceSegmenter()
+  const a = [...whole.feed('正常回答。[[voice: 不要读这个]]结束。'), ...whole.flush()]
+  assert.ok(a.every((sentence) => !sentence.toLowerCase().includes('voice')))
+
+  const split = new SentenceSegmenter()
+  const b = [
+    ...split.feed('先回答。[[voice: 不要'),
+    ...split.feed('读这个]]再说。'),
+    ...split.flush(),
+  ]
+  assert.ok(b.every((sentence) => !sentence.toLowerCase().includes('voice')))
+  assert.ok(b.join('').includes('再说'))
+})

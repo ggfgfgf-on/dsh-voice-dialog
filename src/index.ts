@@ -75,6 +75,12 @@ export function apply(ctx: Context, config: Config): void {
   const unsubscribe = queue.subscribe((frame) => { broadcast('audio', frame) })
   ctx.effect(() => unsubscribe)
   ctx.effect(() => async () => { await queue.close() })
+  // Dial Edge before the first reply: the proxy handshake is the slow/flaky
+  // part, and waiting for it inside the first sentence feels like no audio.
+  void queue.warm().catch((error: unknown) => {
+    // eslint-disable-next-line no-console
+    console.warn('[dsh-voice-dialog] TTS warmup failed: ' + String(error))
+  })
 
   // Model-facing audio control for spoken meta-commands such as
   // "louder", "repeat that" or "stop talking". The browser applies it

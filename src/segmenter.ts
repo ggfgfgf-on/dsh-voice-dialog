@@ -11,10 +11,16 @@ export interface SegmenterOptions {
 
 const TERMINAL = /[。！？!?；;…\n]/
 const SKIP_PREFIX = /^[\s.,，、:：;；!?！？)\]）"'”’〉》】]+$/
+/** A voice directive is control data, never speech; strip it if it leaks. */
+const VOICE_DIRECTIVE = /\[\[\s*voice\s*:[\s\S]*?\]\]/gi
+
+function stripVoiceDirectives(text: string): string {
+  return text.replace(VOICE_DIRECTIVE, ' ')
+}
 
 /** Strip markdown noise before synthesis (mirrors the dsh-tts plainText filter). */
 export function plainText(text: string): string {
-  return String(text)
+  return stripVoiceDirectives(String(text))
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`([^`]*)`/g, '$1')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
@@ -227,7 +233,7 @@ export class SentenceSegmenter {
     this.buffer = tail
     const out: string[] = []
     for (const s of sentences) {
-      const t = s.trim()
+      const t = stripVoiceDirectives(s).trim()
       if (t && !SKIP_PREFIX.test(t)) out.push(t)
     }
     // Safety valve: a wall of text without punctuation.
@@ -247,7 +253,7 @@ export class SentenceSegmenter {
     // only turns out not to be a fence once the stream ends.
     const rest = plainText(this.markdown.flush())
     if (rest) this.buffer += rest
-    const t = this.buffer.trim()
+    const t = stripVoiceDirectives(this.buffer).trim()
     this.buffer = ''
     if (t && !SKIP_PREFIX.test(t)) return [t]
     return []

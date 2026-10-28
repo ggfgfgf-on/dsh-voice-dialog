@@ -9,10 +9,17 @@ export interface VoiceDialogPreferences {
   duckLevel: number
   /** Preferred microphone device id ('' = browser default). */
   deviceId: string
+  /** Silence that closes an utterance, in milliseconds. */
+  pauseMs: number
 }
 
 const STORAGE_KEY = 'dsh-voice-dialog.preferences'
-const DEFAULTS: VoiceDialogPreferences = { autoRead: true, volume: 0.9, duckLevel: 0.18, deviceId: '' }
+const DEFAULTS: VoiceDialogPreferences = { autoRead: true, volume: 0.9, duckLevel: 0.18, deviceId: '', pauseMs: 1600 }
+
+function clampPause(value: unknown, fallback: number): number {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? Math.min(3000, Math.max(800, Math.round(number))) : fallback
+}
 const listeners = new Set<(value: VoiceDialogPreferences) => void>()
 
 function clamp(value: unknown, fallback: number): number {
@@ -29,6 +36,7 @@ function parse(raw: string | null): VoiceDialogPreferences {
       volume: clamp(value.volume, DEFAULTS.volume),
       duckLevel: clamp(value.duckLevel, DEFAULTS.duckLevel),
       deviceId: typeof value.deviceId === 'string' ? value.deviceId : DEFAULTS.deviceId,
+      pauseMs: clampPause(value.pauseMs, DEFAULTS.pauseMs),
     }
   } catch {
     return { ...DEFAULTS }
@@ -49,6 +57,7 @@ export function setPreferences(patch: Partial<VoiceDialogPreferences>): VoiceDia
   const next = { ...getPreferences(), ...patch }
   next.volume = clamp(next.volume, DEFAULTS.volume)
   next.duckLevel = clamp(next.duckLevel, DEFAULTS.duckLevel)
+  next.pauseMs = clampPause(next.pauseMs, DEFAULTS.pauseMs)
   current = next
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)) } catch { /* private mode */ }
   for (const listener of listeners) listener(next)
