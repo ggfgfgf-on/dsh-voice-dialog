@@ -18,6 +18,12 @@ test('splits Chinese and English terminal punctuation', () => {
   assert.deepEqual(s.flush(), [])
 })
 
+test('starts TTS at the first comma once the clause is long enough', () => {
+  const s = new SentenceSegmenter({ firstClauseChars: 8 })
+  assert.deepEqual(s.feed('好的，我先看一下，'), ['好的，我先看一下，'])
+  assert.deepEqual(s.feed('然后再说。'), ['然后再说。'])
+})
+
 test('keeps markdown fences out of speech', () => {
   const s = new SentenceSegmenter()
   assert.deepEqual(s.feed('说明：\n```ts\nconst x = 1\n```\n结束。'), ['说明：', '结束。'])

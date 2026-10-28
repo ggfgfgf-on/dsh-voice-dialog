@@ -728,7 +728,7 @@ async function* tapStream(
   control: (command: VoiceControl) => void,
 ): AsyncIterable<StreamChunk> {
   const replyId = `${sessionId}:${Date.now().toString(36)}:${replySequence++}`
-  const segmenter = new SentenceSegmenter()
+  const segmenter = new SentenceSegmenter({ firstClauseChars: 8 })
   const protocol = new VoiceProtocol()
   let directed = false
   const speak = (text: string): void => {

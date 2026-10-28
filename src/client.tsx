@@ -790,7 +790,17 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     const prefs = getPreferences()
     let identity: SpeakerIdentity | null = null
 
-    if (prefs.separateSpeakers && separationReadyRef.current && Date.now() >= separationRetryAtRef.current) {
+    const canSeparate = prefs.separateSpeakers && separationReadyRef.current
+      && Date.now() >= separationRetryAtRef.current
+    // Start normal ASR immediately. The separation model used to sit in front
+    // of it, so even a single speaker paid the whole inference cost before the
+    // transcript could enter the queue. With parallel ASR the two now race.
+    const speculative = canSeparate && prefs.parallelAsr
+      ? runLimited(() => transcribeSamples(samples))
+      : null
+    if (speculative) void speculative.catch(() => undefined)
+
+    if (canSeparate) {
       try {
         const split = await separateSegment(samples, sessionId, prefs.speakerThreshold)
         if (split.separated && split.sources.length >= 2) {
@@ -843,10 +853,15 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     if (lane === 'guest') setSpeaker(display || '其他人')
 
     const prefix = prefs.speakerPrefix && display ? '[声纹：' + display + '] ' : ''
-    const work = runLimited(async () => {
-      const text = await transcribeSamples(samples)
-      return text ? prefix + text : null
-    })
+    const work = speculative
+      ? (async () => {
+          const text = await speculative
+          return text ? prefix + text : null
+        })()
+      : runLimited(async () => {
+          const text = await transcribeSamples(samples)
+          return text ? prefix + text : null
+        })
     scheduler.enqueue(lane, canonical, work)
   }
 

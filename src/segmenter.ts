@@ -7,6 +7,8 @@
 export interface SegmenterOptions {
   /** Max buffered chars before a forced flush (safety valve for markdown walls). */
   maxSentenceChars?: number
+  /** Emit the first comma clause after this many visible chars, before the full stop. */
+  firstClauseChars?: number
 }
 
 const TERMINAL = /[。！？!?；;…\n]/
@@ -233,11 +235,14 @@ export function splitSentences(chunk: string): { sentences: string[]; tail: stri
 export class SentenceSegmenter {
   private buffer = ''
   private readonly maxChars: number
+  private readonly firstClauseChars: number
+  private emitted = false
   /** Removes markdown constructs that span deltas (fences, inline code). */
   private readonly markdown = new MarkdownStreamFilter()
 
   constructor(options: SegmenterOptions = {}) {
     this.maxChars = options.maxSentenceChars ?? 200
+    this.firstClauseChars = Math.max(0, options.firstClauseChars ?? 0)
   }
 
   /** Feed a raw delta; returns the complete sentences it completes. */
@@ -252,15 +257,41 @@ export class SentenceSegmenter {
       const t = stripVoiceDirectives(s).trim()
       if (t && !SKIP_PREFIX.test(t)) out.push(t)
     }
+    if (out.length > 0) this.emitted = true
+    // Long first sentence: start TTS at a natural comma instead of waiting
+    // for the final full stop. Only the first clause is split this way.
+    if (!this.emitted && this.firstClauseChars > 0) {
+      const clause = this.takeFirstClause()
+      if (clause) {
+        out.push(clause)
+        this.emitted = true
+      }
+    }
     // Safety valve: a wall of text without punctuation.
     if (this.buffer.length > this.maxChars) {
       const cut = this.buffer.search(/[，,、\s]/)
       const idx = cut > 0 ? cut : Math.floor(this.maxChars / 2)
       const head = this.buffer.slice(0, idx).trim()
       this.buffer = this.buffer.slice(idx)
-      if (head) out.push(head)
+      if (head) {
+        out.push(head)
+        this.emitted = true
+      }
     }
     return out
+  }
+
+  private takeFirstClause(): string {
+    const re = /[,，、]/g
+    let match: RegExpExecArray | null
+    while ((match = re.exec(this.buffer)) !== null) {
+      const end = match.index + 1
+      const head = this.buffer.slice(0, end).trim()
+      if (head.replace(/\s/g, '').length < this.firstClauseChars) continue
+      this.buffer = this.buffer.slice(end)
+      return head
+    }
+    return ''
   }
 
   /** Flush the remaining buffer (end of stream). */
