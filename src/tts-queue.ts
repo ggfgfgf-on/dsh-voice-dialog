@@ -45,6 +45,12 @@ const EDGE_TTS_HOST = 'speech.platform.bing.com'
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
+/** Convert a signed percentage (-50..50) into the SSML relative rate. */
+export function rateToProsody(rate: number): string {
+  const value = Math.max(-50, Math.min(50, Math.round(rate)))
+  return value === 0 ? 'default' : (value > 0 ? '+' : '') + value + '%'
+}
+
 let proxyNoticePrinted = false
 
 /** Only HTTP(S) CONNECT proxies are supported by https-proxy-agent. */
@@ -133,7 +139,7 @@ export class TtsQueue {
   private readonly queues = new Map<string, SessionQueue>()
   private readonly listeners = new Set<FrameListener>()
   private voice: string
-  private readonly prosody?: ProsodyOptions
+  private prosody?: ProsodyOptions
   private readonly synthAttempts: number
   private readonly retryDelayMs: number
   private ready: Promise<void> | null = null
@@ -164,6 +170,11 @@ export class TtsQueue {
     const previous = this.tts
     this.tts = createEdgeTts()
     try { await previous.close() } catch { /* already closed */ }
+  }
+
+  /** Change the speaking rate for subsequent sentences; the open handshake is reused. */
+  setRate(rate: number): void {
+    this.prosody = { ...(this.prosody ?? {}), rate: rateToProsody(rate) }
   }
 
   /** Initialize the Edge TTS WebSocket once (lazy, re-runnable after close). */
@@ -300,7 +311,7 @@ export class TtsQueue {
           try {
             // A reset cleared the handshake, so later attempts dial again.
             if (attempt > 1) await this.ensureReady()
-            const { audioStream } = await this.tts.toStream(item.text)
+            const { audioStream } = await this.tts.toStream(item.text, this.prosody)
             const chunks: Buffer[] = []
             for await (const chunk of audioStream) {
               chunks.push(chunk as Buffer)

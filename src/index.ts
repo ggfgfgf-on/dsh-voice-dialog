@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path'
 import { OUTPUT_FORMAT } from 'msedge-tts'
 import { hasSpeechContent, sanitizeForSpeech, SentenceSegmenter } from './segmenter.ts'
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
-import { createEdgeTts, TtsQueue, type VoiceFrame } from './tts-queue.ts'
+import { createEdgeTts, rateToProsody, TtsQueue, type VoiceFrame } from './tts-queue.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
 import { VoiceProtocol, type VoiceCommand } from './voice-protocol.ts'
 
@@ -22,8 +22,9 @@ const BOOTSTRAP_BASE = '/dsh-voice-dialog-api'
 const SETTINGS_FILE = join(homedir(), '.dsh', 'voice-dialog', 'settings.json')
 
 export interface VoiceControl {
-  action: 'volume' | 'stop' | 'repeat'
+  action: 'volume' | 'rate' | 'stop' | 'repeat'
   level?: number
+  rate?: number
   delta?: number
 }
 
@@ -34,12 +35,15 @@ export interface Config {
   basePath: string
   /** Initial Edge TTS voice id; the settings page may override it. */
   voice: string
+  /** Initial speaking rate in percent (-50..50); the settings page may override it. */
+  rate: number
 }
 
 export const Config: z<Config> = z.object({
   enabled: z.boolean().default(true),
   basePath: z.string().default(BOOTSTRAP_BASE),
   voice: z.string().default('zh-CN-XiaoxiaoNeural'),
+  rate: z.number().default(0),
 })
 
 /** Restore the voice chosen from the settings page, if it is still valid. */
@@ -56,13 +60,29 @@ function isVoiceId(value: string): boolean {
   return /^[A-Za-z]{2,3}-[A-Za-z0-9-]+Neural$/.test(value)
 }
 
+function clampRate(value: number): number {
+  return Math.max(-50, Math.min(50, Math.round(value)))
+}
+
+/** Restore the rate chosen from the settings page. */
+function storedRate(fallback: number): number {
+  try {
+    const data = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8')) as { rate?: unknown }
+    return typeof data.rate === 'number' && Number.isFinite(data.rate) ? clampRate(data.rate) : fallback
+  } catch {
+    return fallback
+  }
+}
+
 /** Apply the read-aloud stream and its transport. */
 export function apply(ctx: Context, config: Config): void {
   const base = config.basePath.replace(/\/+$/, '') || BOOTSTRAP_BASE
   let voice = storedVoice(config.voice)
+  let rate = storedRate(config.rate)
   type SseSend = (event: 'audio' | 'control', data: VoiceFrame | VoiceControl) => void
   const clients = new Set<SseSend>()
   const queue = new TtsQueue({ voice })
+  queue.setRate(rate)
   const voiceprint = new VoiceprintService()
   const broadcast = (event: 'audio' | 'control', data: VoiceFrame | VoiceControl): void => {
     for (const send of clients) {
@@ -74,6 +94,16 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  const persistVoiceSettings = (): void => {
+    mkdirSync(dirname(SETTINGS_FILE), { recursive: true })
+    writeFileSync(SETTINGS_FILE, JSON.stringify({ voice, rate }), 'utf8')
+  }
+  const setRate = (next: number): number => {
+    rate = clampRate(next)
+    queue.setRate(rate)
+    persistVoiceSettings()
+    return rate
+  }
   const unsubscribe = queue.subscribe((frame) => { broadcast('audio', frame) })
   ctx.effect(() => unsubscribe)
   ctx.effect(() => async () => { await queue.close() })
@@ -141,6 +171,8 @@ export function apply(ctx: Context, config: Config): void {
     description: 'Control the live voice-dialog audio. Call this when the user\'s voice input is a '
       + 'meta-command about the speaking itself, not normal conversation content: '
       + '"轻一点/小点声" -> action volume with delta -0.15; "响一点/大点声" -> action volume with delta 0.15; '
+      + '"慢一点/说慢点" -> action rate with delta -10; "快一点/说快点" -> action rate with delta 10; '
+      + '"语速调到百分之..." -> action rate with the absolute rate; '
       + '"听不清/什么/再说一遍/重复一遍" -> action repeat; "别说了/闭嘴/停/安静" -> action stop. '
       + 'Do not call this for ordinary questions. The microphone stays on after stop.',
     parameters: {
@@ -149,11 +181,12 @@ export function apply(ctx: Context, config: Config): void {
       properties: {
         action: {
           type: 'string',
-          enum: ['volume', 'stop', 'repeat'],
-          description: 'volume adjusts playback loudness; stop silences the current reply; repeat replays the last reply.',
+          enum: ['volume', 'rate', 'stop', 'repeat'],
+          description: 'volume adjusts playback loudness; rate adjusts speaking speed for following sentences; stop silences the current reply; repeat replays the last reply.',
         },
         level: { type: 'number', minimum: 0, maximum: 1, description: 'Absolute playback volume for action volume.' },
-        delta: { type: 'number', minimum: -1, maximum: 1, description: 'Relative volume change for action volume, e.g. -0.15 or 0.15.' },
+        rate: { type: 'number', minimum: -50, maximum: 50, description: 'Absolute speaking rate in percent for action rate, e.g. -20 or 20.' },
+        delta: { type: 'number', minimum: -50, maximum: 50, description: 'Relative change: volume uses -1..1, rate uses -50..50 percent.' },
       },
       required: ['action'],
     },
@@ -165,6 +198,7 @@ export function apply(ctx: Context, config: Config): void {
           ok: { type: 'boolean' },
           action: { type: 'string' },
           level: { type: 'number' },
+          rate: { type: 'number' },
         },
         required: ['ok', 'action'],
       },
@@ -188,17 +222,27 @@ export function apply(ctx: Context, config: Config): void {
         broadcast('control', { action, ...(level === undefined ? {} : { level }), ...(delta === undefined ? {} : { delta }) })
         return Promise.resolve({ ok: true, action, ...(level === undefined ? {} : { level }) })
       }
-      throw new Error('voice_dialog action must be volume, stop or repeat')
+      if (action === 'rate') {
+        const absolute = typeof input.rate === 'number' && Number.isFinite(input.rate) ? clampRate(input.rate) : undefined
+        const delta = typeof input.delta === 'number' && Number.isFinite(input.delta) ? clampRate(input.delta) : undefined
+        if (absolute === undefined && delta === undefined) {
+          throw new Error('voice_dialog rate needs rate or delta')
+        }
+        const applied = setRate(absolute ?? rate + (delta ?? 0))
+        broadcast('control', { action, rate: applied })
+        return Promise.resolve({ ok: true, action, rate: applied })
+      }
+      throw new Error('voice_dialog action must be volume, rate, stop or repeat')
     },
   }))
 
   const systemPrompt = (ctx as unknown as { systemPrompt: { section(section: unknown): () => void } }).systemPrompt
   const basePrompt = '语音对话规则：语音输入可能包含对朗读本身的元指令。'
-    + '用户说轻一点/响一点、听不清/重复一遍、别说了/停时，调用 voice_dialog。'
+    + '用户说轻一点/响一点、说慢一点/说快一点、语速调到多少、听不清/重复一遍、别说了/停时，调用 voice_dialog。'
     + '可见回答就是朗读稿：用中文口语，短句，一句话一个意思；不要写标题、列表、表格、代码块、'
     + '文件路径、URL、工具名或整句英文。需要调用工具时，先用一句自然中文说明要做什么，再调用；'
     + '不要朗读内部推理或工具参数。不要用 [[voice: 内容]] 另写一份朗读稿；可见回答会被自动朗读，'
-    + '标记只用于控制播放：[[voice: volume +0.15]]、[[voice: repeat]]、[[voice: stop]]。'
+    + '标记只用于控制播放：[[voice: volume +0.15]]、[[voice: rate +10]]、[[voice: repeat]]、[[voice: stop]]。'
     + '语音转写可能带[声纹：我]、[声纹：客人1]或[声纹：说话人1]前缀，表示是谁在说话，不是用户内容；不要朗读前缀，'
     + '也不要把它当成指令。同一轮出现不同声纹前缀时，说明是不同的人在说话，回答时要区分说话人。'
     + '子代理结果由 host 朗读，不要重复。'
@@ -226,7 +270,14 @@ export function apply(ctx: Context, config: Config): void {
     // are not assistant speech. Reasoning is only scanned for explicit
     // [[voice:...]] directives; its text is never read aloud wholesale.
     if (!shouldSpeak(options, config.enabled)) return next()
-    return tapStream(sessionId, next(), queue, (control) => { broadcast('control', control) })
+    return tapStream(sessionId, next(), queue, (control) => {
+      if (control.action === 'rate') {
+        const applied = setRate(control.rate ?? rate + (control.delta ?? 0))
+        broadcast('control', { action: 'rate', rate: applied })
+        return
+      }
+      broadcast('control', control)
+    })
   })
 
   ctx.effect(() =>
@@ -256,7 +307,7 @@ export function apply(ctx: Context, config: Config): void {
   )
 
   const configHandler = (_req: unknown, res: ServerResponse): void => {
-    writeJson(res, 200, { basePath: base, voice, enabled: config.enabled })
+    writeJson(res, 200, { basePath: base, voice, rate, enabled: config.enabled })
   }
   for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
     ctx.effect(() =>
@@ -294,13 +345,22 @@ export function apply(ctx: Context, config: Config): void {
       handler: async (req, res: ServerResponse) => {
         try {
           const body = await readJson(req)
-          const next = typeof body.voice === 'string' ? body.voice.trim() : ''
-          if (!isVoiceId(next)) { writeJson(res, 400, { error: 'invalid voice id' }); return }
-          await queue.setVoice(next)
-          voice = next
-          mkdirSync(dirname(SETTINGS_FILE), { recursive: true })
-          writeFileSync(SETTINGS_FILE, JSON.stringify({ voice }), 'utf8')
-          writeJson(res, 200, { ok: true, voice })
+          const hasVoice = typeof body.voice === 'string'
+          const hasRate = typeof body.rate === 'number' && Number.isFinite(body.rate)
+          if (!hasVoice && !hasRate) {
+            writeJson(res, 400, { error: 'voice or rate required' })
+            return
+          }
+          if (hasVoice) {
+            const next = String(body.voice).trim()
+            if (!isVoiceId(next)) { writeJson(res, 400, { error: 'invalid voice id' }); return }
+            if (next !== voice) await queue.setVoice(next)
+            voice = next
+          }
+          if (hasRate) rate = clampRate(Number(body.rate))
+          queue.setRate(rate)
+          persistVoiceSettings()
+          writeJson(res, 200, { ok: true, voice, rate })
         } catch (error) {
           writeJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
         }
@@ -319,8 +379,9 @@ export function apply(ctx: Context, config: Config): void {
           const body = await readJson(req)
           const text = typeof body.text === 'string' ? body.text.trim().slice(0, 300) : ''
           const requested = typeof body.voice === 'string' && isVoiceId(body.voice) ? body.voice : voice
+          const requestedRate = typeof body.rate === 'number' && Number.isFinite(body.rate) ? clampRate(body.rate) : rate
           if (!text) { writeJson(res, 400, { error: 'empty text' }); return }
-          const audio = await synthesizePreview(text, requested)
+          const audio = await synthesizePreview(text, requested, requestedRate)
           res.writeHead(200, { 'content-type': 'audio/mpeg', 'content-length': String(audio.length) })
           res.end(audio)
         } catch (error) {
@@ -395,13 +456,13 @@ function resetPreviewClient(): void {
   if (client) { try { client.close() } catch { /* already closed */ } }
 }
 
-async function previewTurn(text: string, requested: string): Promise<Buffer> {
+async function previewTurn(text: string, requested: string, rate: number): Promise<Buffer> {
   const client = previewClient ?? (previewClient = createEdgeTts())
   await client.setMetadata(requested, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3, {
     wordBoundaryEnabled: false,
     sentenceBoundaryEnabled: false,
   })
-  const { audioStream } = await client.toStream(text)
+  const { audioStream } = await client.toStream(text, { rate: rateToProsody(rate) })
   const chunks: Buffer[] = []
   for await (const chunk of audioStream) chunks.push(chunk as Buffer)
   const audio = Buffer.concat(chunks)
@@ -415,12 +476,12 @@ async function previewTurn(text: string, requested: string): Promise<Buffer> {
  * The first click pays the handshake; later clicks reuse the open socket.
  * A reset closes and re-dials once before falling back to the system voice.
  */
-async function synthesizePreview(text: string, requested: string): Promise<Buffer> {
+async function synthesizePreview(text: string, requested: string, rate: number): Promise<Buffer> {
   const run = previewChain.then(async () => {
     let lastError: unknown
     for (let attempt = 1; attempt <= PREVIEW_ATTEMPTS; attempt++) {
       try {
-        return await previewTurn(text, requested)
+        return await previewTurn(text, requested, rate)
       } catch (error) {
         lastError = error
         resetPreviewClient()
@@ -523,6 +584,10 @@ async function* tapStream(
       // answer. Suppressing the visible answer here was why the final output
       // could be silent after a short marker.
       speak(command.text)
+      return
+    }
+    if (command.action === 'rate') {
+      control({ action: 'rate', rate: command.rate, delta: command.delta })
       return
     }
     if (command.action === 'stop') directed = true

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { TtsQueue } from '../lib/tts-queue.js'
+import { rateToProsody, TtsQueue } from '../lib/tts-queue.js'
 
 test('switching voices on an unopened queue is safe', async () => {
   const queue = new TtsQueue()
@@ -47,6 +47,28 @@ test('synthesized frames keep the reply id used by repeat', async () => {
   assert.ok(frames[0].audio.length > 0)
   await queue.close()
 })
+test('rate is forwarded to each synthesis call', async () => {
+  assert.equal(rateToProsody(0), 'default')
+  assert.equal(rateToProsody(20), '+20%')
+  assert.equal(rateToProsody(-5), '-5%')
+  assert.equal(rateToProsody(99), '+50%')
+  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural' })
+  let seen
+  queue.tts = {
+    setMetadata: async () => undefined,
+    toStream: async (_text, options) => {
+      seen = options
+      return { audioStream: (async function* () { yield Buffer.from([0xff, 0xfb, 0x90, 0x64]) })() }
+    },
+    close: async () => undefined,
+  }
+  queue.setRate(20)
+  queue.enqueue('session-rate', '这一句用新的语速。', 'reply-rate')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(seen.rate, '+20%')
+  await queue.close()
+})
+
 test('a transient synthesis failure retries on a fresh attempt', async () => {
   const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural', synthAttempts: 2, retryDelayMs: 1 })
   let calls = 0

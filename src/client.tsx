@@ -24,14 +24,16 @@ interface VoiceFrame {
 }
 
 interface VoiceControl {
-  action: 'volume' | 'stop' | 'repeat'
+  action: 'volume' | 'rate' | 'stop' | 'repeat'
   level?: number
+  rate?: number
   delta?: number
 }
 
 interface HostConfig {
   basePath: string
   voice: string
+  rate: number
   enabled: boolean
 }
 
@@ -240,6 +242,9 @@ class TtsPlayer {
       this.volumeOverride = Math.max(0, Math.min(1, next))
       this.applyGain()
     }
+    // Rate is applied by the host TTS queue for subsequent sentences; the
+    // player only needs to ignore the broadcast.
+    if (control.action === 'rate') return
   }
 
   /** Remember one frame for "repeat that" even when it used the system voice. */
@@ -843,19 +848,26 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   }
 
   const [voice, setVoice] = useState('')
+  const [rate, setRate] = useState(0)
+  const rateTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [previewText, setPreviewText] = useState('你好，我是你的语音助手。')
   const [previewing, setPreviewing] = useState(false)
   const previewRef = useRef<HTMLAudioElement | null>(null)
   const previewUrl = useRef('')
   const previewFallback = useRef(false)
   const previewToken = useRef(0)
-  useEffect(() => { if (host) setVoice(host.voice) }, [host])
+  useEffect(() => {
+    if (!host) return
+    setVoice(host.voice)
+    setRate(host.rate ?? 0)
+  }, [host])
   useEffect(() => () => {
     previewRef.current?.pause()
     previewRef.current = null
     if (previewUrl.current) URL.revokeObjectURL(previewUrl.current)
     previewUrl.current = ''
     previewToken.current++
+    if (rateTimer.current) { clearTimeout(rateTimer.current); rateTimer.current = null }
     if (previewFallback.current) window.speechSynthesis?.cancel()
     previewFallback.current = false
   }, [])
@@ -914,13 +926,35 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     } finally { setBusy(false) }
   }
 
+  const persistRate = async (next: number): Promise<void> => {
+    try {
+      const response = await fetch(apiUrl('/settings'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ rate: next }),
+      })
+      if (!response.ok) throw new Error(`保存语速失败（HTTP ${response.status}）`)
+      const saved = await response.json() as { rate?: number }
+      setHost((current) => current ? { ...current, rate: saved.rate ?? next } : current)
+    } catch (failure) {
+      setActionError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }
+
+  const changeRate = (next: number): void => {
+    setRate(next)
+    if (rateTimer.current) clearTimeout(rateTimer.current)
+    rateTimer.current = setTimeout(() => {
+      rateTimer.current = null
+      void persistRate(next)
+    }, 300)
+  }
+
   const playPreview = async (): Promise<void> => {
     if (previewing) { stopPreview(); return }
     setBusy(true); setActionError('')
     try {
       const response = await fetch(apiUrl('/preview'), {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text: previewText, voice }),
+        body: JSON.stringify({ text: previewText, voice, rate }),
       })
       if (!response.ok) {
         const detail = await response.json().catch(() => null) as { error?: string } | null
@@ -975,6 +1009,8 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
         onChange={(event) => { save({ volume: Number(event.target.value) }) }} /><span>{Math.round(prefs.volume * 100)}%</span></label>
       <label>说话时压低到<input type="range" min="0" max="0.6" step="0.02" value={prefs.duckLevel}
         onChange={(event) => { save({ duckLevel: Number(event.target.value) }) }} /><span>{Math.round(prefs.duckLevel * 100)}%</span></label>
+      <label>语速<input type="range" min="-50" max="50" step="5" value={rate} disabled={!host}
+        onChange={(event) => { changeRate(Number(event.target.value)) }} /><span>{rate > 0 ? '+' : ''}{rate}%</span></label>
       <label>朗读音色<select value={voice} disabled={busy || !host}
         onChange={(event) => { void changeVoice(event.target.value) }}>
         {VOICES.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
@@ -987,7 +1023,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       </div>
       {actionError && <p className="dsh-vd-error" role="alert">{actionError}</p>}
       <p className="dsh-vd-muted">说话只会压低朗读，不会切断回答；识别出的文字作为插话交给正在运行的模型，模型可以说完再回应。</p>
-      {host && <p className="dsh-vd-muted">音色保存在本机（重启后仍生效），朗读偏好保存在这个浏览器。</p>}
+      {host && <p className="dsh-vd-muted">音色和语速保存在本机（重启后仍生效），朗读偏好保存在这个浏览器。</p>}
     </section>
 
     <section>
@@ -1051,7 +1087,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
         <p className="dsh-vd-muted">请用平常音量说一句话，例如：今天天气不错，我在和你说话。录音六秒后自动保存。</p>
       </>}
       {voiceprintError && <p className="dsh-vd-error" role="alert">{voiceprintError}</p>}
-      <p className="dsh-vd-muted">带「客人」前缀的是其他人；只有登记过我的声纹，才能启用「只回应我的声音」。</p>
+      <p className="dsh-vd-muted">带「客人」前缀的是其他人；只有登记过我的声纹，才能启用「只回应我的声音」。每次判定是你的声音，会用它慢慢强化声纹；其他人的声音不会写进去。</p>
     </section>
 
     <section>

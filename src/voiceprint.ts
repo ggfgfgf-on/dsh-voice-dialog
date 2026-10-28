@@ -22,6 +22,15 @@ const MIN_IDENTIFY_SAMPLES = Math.floor(SAMPLE_RATE * 0.35)
 const DEFAULT_THRESHOLD = 0.52
 const CLUSTER_THRESHOLD = 0.5
 const MAX_CLUSTERS = 4
+/** Conservative EWMA weights: one unusual segment cannot dominate the owner template. */
+const OWNER_ADAPT_WEIGHT = 0.1
+const OWNER_SOFT_ADAPT_WEIGHT = 0.03
+/** Soft owner floors, with a small relaxation after a preceding owner turn. */
+const OWNER_SOFT_FLOOR = 0.4
+const OWNER_SOFT_FLOOR_AFTER_OWNER = 0.35
+const OWNER_GUEST_MARGIN = 0.06
+const OWNER_HISTORY_FLOOR = 0.45
+const MAX_SESSION_LABELS = 128
 
 export interface VoiceprintStatus {
   addonAvailable: boolean
@@ -43,6 +52,8 @@ export interface IdentifyResult {
 
 interface StoredVoiceprint {
   embedding: number[]
+  /** Optional for compatibility with files written before adaptive updates. */
+  updates?: number
   updatedAt: string
 }
 
@@ -161,7 +172,9 @@ export class VoiceprintService {
   private extractor: Extractor | undefined
   private extractorError: string | undefined
   private owner: Float32Array | null | undefined
+  private ownerUpdates = 0
   private readonly clusters = new Map<string, SpeakerCluster[]>()
+  private readonly lastSpeakerLabels = new Map<string, string>()
   private chain: Promise<unknown> = Promise.resolve()
 
   constructor(options: { dataDir?: string; modelPath?: string } = {}) {
@@ -254,12 +267,84 @@ export class VoiceprintService {
     if (this.owner !== undefined) return this.owner
     try {
       const raw = JSON.parse(readFileSync(this.storePath, 'utf8')) as StoredVoiceprint
-      if (!Array.isArray(raw.embedding) || raw.embedding.length < 64) { this.owner = null; return null }
+      if (!Array.isArray(raw.embedding) || raw.embedding.length < 64) {
+        this.owner = null
+        this.ownerUpdates = 0
+        return null
+      }
+      this.ownerUpdates = typeof raw.updates === 'number' && Number.isInteger(raw.updates) && raw.updates >= 0
+        ? raw.updates
+        : 0
       this.owner = normalize(Float32Array.from(raw.embedding))
       return this.owner
     } catch {
       this.owner = null
+      this.ownerUpdates = 0
       return null
+    }
+  }
+
+  private saveOwner(): void {
+    const owner = this.owner
+    if (!owner) return
+    try {
+      mkdirSync(this.dataDir, { recursive: true })
+      const stored: StoredVoiceprint = {
+        embedding: Array.from(owner),
+        updates: this.ownerUpdates,
+        updatedAt: new Date().toISOString(),
+      }
+      writeFileSync(this.storePath, JSON.stringify(stored), 'utf8')
+    } catch {
+      // Identification should remain usable if the data directory is temporarily unwritable.
+    }
+  }
+
+  /** Update the normalized owner template with a deliberately small EWMA step. */
+  private adaptOwner(embedding: Float32Array, weight: number): void {
+    const owner = this.ownerEmbedding()
+    if (!owner || owner.length !== embedding.length) return
+    const merged = new Float32Array(owner.length)
+    for (let i = 0; i < owner.length; i++) {
+      merged[i] = owner[i] * (1 - weight) + embedding[i] * weight
+    }
+    this.owner = normalize(merged)
+    this.ownerUpdates += 1
+    this.saveOwner()
+  }
+
+  private bestGuest(sessionId: string, embedding: Float32Array): { cluster?: SpeakerCluster; similarity: number } {
+    let best: SpeakerCluster | undefined
+    let bestSimilarity = -1
+    for (const cluster of this.clusters.get(sessionId) ?? []) {
+      const similarity = cosineSimilarity(embedding, cluster.centroid)
+      if (similarity > bestSimilarity) {
+        best = cluster
+        bestSimilarity = similarity
+      }
+    }
+    return { cluster: best, similarity: bestSimilarity }
+  }
+
+  private sessionClusters(sessionId: string): SpeakerCluster[] {
+    let list = this.clusters.get(sessionId)
+    if (!list) {
+      list = []
+      this.clusters.set(sessionId, list)
+      if (this.clusters.size > 64) {
+        const oldest = this.clusters.keys().next().value
+        if (oldest !== undefined) this.clusters.delete(oldest)
+      }
+    }
+    return list
+  }
+
+  private rememberLabel(sessionId: string, label: string): void {
+    this.lastSpeakerLabels.delete(sessionId)
+    this.lastSpeakerLabels.set(sessionId, label)
+    if (this.lastSpeakerLabels.size > MAX_SESSION_LABELS) {
+      const oldest = this.lastSpeakerLabels.keys().next().value
+      if (oldest !== undefined) this.lastSpeakerLabels.delete(oldest)
     }
   }
 
@@ -278,16 +363,24 @@ export class VoiceprintService {
     if (samples.length < MIN_ENROLL_SAMPLES) throw new Error('录音太短，请说满两秒再试')
     const embedding = await this.compute(samples)
     mkdirSync(this.dataDir, { recursive: true })
-    const stored: StoredVoiceprint = { embedding: Array.from(embedding), updatedAt: new Date().toISOString() }
+    const stored: StoredVoiceprint = {
+      embedding: Array.from(embedding),
+      updates: 0,
+      updatedAt: new Date().toISOString(),
+    }
     writeFileSync(this.storePath, JSON.stringify(stored), 'utf8')
     this.owner = embedding
+    this.ownerUpdates = 0
     this.clusters.clear()
+    this.lastSpeakerLabels.clear()
     return { dim: embedding.length }
   }
 
   forget(): void {
     this.owner = null
+    this.ownerUpdates = 0
     this.clusters.clear()
+    this.lastSpeakerLabels.clear()
     try { unlinkSync(this.storePath) } catch { /* already absent */ }
   }
 
@@ -299,28 +392,37 @@ export class VoiceprintService {
     const embedding = await this.compute(samples)
     const owner = this.ownerEmbedding()
     const threshold = Math.min(0.85, Math.max(0.3, options.threshold ?? DEFAULT_THRESHOLD))
+    const sessionId = (options.sessionId ?? '').trim() || 'default'
+    const previousLabel = this.lastSpeakerLabels.get(sessionId)
+    const guest = this.bestGuest(sessionId, embedding)
+
     if (owner) {
       const similarity = cosineSimilarity(embedding, owner)
-      if (similarity >= threshold) return { enrolled: true, owner: true, label: '我', similarity }
-    }
+      if (similarity >= threshold) {
+        this.adaptOwner(embedding, OWNER_ADAPT_WEIGHT)
+        this.rememberLabel(sessionId, '我')
+        return { enrolled: true, owner: true, label: '我', similarity }
+      }
 
-    const sessionId = (options.sessionId ?? '').trim() || 'default'
-    let list = this.clusters.get(sessionId)
-    if (!list) {
-      list = []
-      this.clusters.set(sessionId, list)
-      if (this.clusters.size > 64) {
-        const oldest = this.clusters.keys().next().value
-        if (oldest !== undefined) this.clusters.delete(oldest)
+      // A lower match can still be the owner when no guest cluster is clearly
+      // closer. A preceding owner turn lowers the floor slightly because
+      // dialogue continuity is useful evidence for short utterances.
+      const softFloor = previousLabel === '我'
+        ? OWNER_SOFT_FLOOR_AFTER_OWNER
+        : OWNER_SOFT_FLOOR
+      const guestIsClearlyStronger = guest.cluster !== undefined
+        && guest.similarity > similarity + OWNER_GUEST_MARGIN
+      const priorOwnerException = previousLabel === '我' && similarity >= OWNER_HISTORY_FLOOR
+      if (similarity >= softFloor && (!guestIsClearlyStronger || priorOwnerException)) {
+        this.adaptOwner(embedding, OWNER_SOFT_ADAPT_WEIGHT)
+        this.rememberLabel(sessionId, '我')
+        return { enrolled: true, owner: true, label: '我', similarity }
       }
     }
-    let best: SpeakerCluster | undefined
-    let bestSimilarity = -1
-    for (const cluster of list) {
-      const similarity = cosineSimilarity(embedding, cluster.centroid)
-      if (similarity > bestSimilarity) { bestSimilarity = similarity; best = cluster }
-    }
-    if (best && bestSimilarity >= CLUSTER_THRESHOLD) {
+
+    const list = this.sessionClusters(sessionId)
+    if (guest.cluster && guest.similarity >= CLUSTER_THRESHOLD) {
+      const best = guest.cluster
       const count = best.count + 1
       const merged = new Float32Array(embedding.length)
       for (let i = 0; i < embedding.length; i++) {
@@ -328,14 +430,18 @@ export class VoiceprintService {
       }
       best.centroid = normalize(merged)
       best.count = count
-      return { enrolled: owner !== null, owner: false, label: best.label, similarity: bestSimilarity }
+      this.rememberLabel(sessionId, best.label)
+      return { enrolled: owner !== null, owner: false, label: best.label, similarity: guest.similarity }
     }
     const prefix = owner ? '客人' : '说话人'
     if (list.length < MAX_CLUSTERS) {
       const label = prefix + (list.length + 1)
       list.push({ label, centroid: embedding, count: 1 })
-      return { enrolled: owner !== null, owner: false, label, similarity: Math.max(0, bestSimilarity) }
+      this.rememberLabel(sessionId, label)
+      return { enrolled: owner !== null, owner: false, label, similarity: Math.max(0, guest.similarity) }
     }
-    return { enrolled: owner !== null, owner: false, label: owner ? '其他客人' : '其他说话人', similarity: bestSimilarity }
+    const label = owner ? '其他客人' : '其他说话人'
+    this.rememberLabel(sessionId, label)
+    return { enrolled: owner !== null, owner: false, label, similarity: guest.similarity }
   }
 }

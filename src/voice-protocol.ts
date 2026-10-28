@@ -3,6 +3,7 @@
 export type VoiceCommand =
   | { action: 'say'; text: string }
   | { action: 'volume'; level?: number; delta?: number }
+  | { action: 'rate'; rate?: number; delta?: number }
   | { action: 'repeat' }
   | { action: 'stop' }
 
@@ -24,6 +25,18 @@ export function parseVoiceCommand(raw: string): VoiceCommand | null {
     const clamped = Math.max(-1, Math.min(1, value))
     if (argument.startsWith('+') || value < 0) return { action: 'volume', delta: clamped }
     return { action: 'volume', level: clamped }
+  }
+  const rate = /^rate\b([\s\S]*)$/i.exec(text)
+  if (rate) {
+    const argument = rate[1].trim().replace(/^[=:]\s*/, '').replace(/%$/, '')
+    const word = argument.toLowerCase()
+    if (word === 'up' || word === 'fast') return { action: 'rate', delta: 10 }
+    if (word === 'down' || word === 'slow') return { action: 'rate', delta: -10 }
+    const value = Number(argument)
+    if (!Number.isFinite(value)) return null
+    const clamped = Math.max(-50, Math.min(50, value))
+    if (argument.startsWith('+') || value < 0) return { action: 'rate', delta: clamped }
+    return { action: 'rate', rate: clamped }
   }
   return { action: 'say', text }
 }

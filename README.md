@@ -9,10 +9,10 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 - **Read-aloud while listening.** The host taps `llm/stream`, segments assistant text into sentences, synthesizes Edge TTS audio, and streams it over SSE. Playback is gated by the microphone: starting the mic enables it, stopping the mic stops accepting new sentences but drains the audio already queued. If Edge is unreachable, sentences use the platform speech voice instead of disappearing.
 - **Soft barge-in.** When you start speaking, the reply is ducked (not stopped). The transcript is steered into the model. The assistant may finish its current thought, and its remaining audio is not cancelled.
 - **No chain-of-thought reading.** Compaction and session-title calls are filtered by `GenerateOptions.purpose`. Reasoning is scanned only for explicit `[[voice: ...]]` directives; its text is never spoken wholesale. Tool arguments never reach TTS.
-- **Model-directed speech.** The model can choose the exact spoken words from reasoning: `[[voice: 要说的内容]]`, `[[voice: volume +0.15]]`, `[[voice: repeat]]`, `[[voice: stop]]`. A say marker suppresses automatic reading of the visible answer; without one, the final answer is read.
+- **Model-directed speech.** The model can choose the exact spoken words from reasoning: `[[voice: 要说的内容]]`, `[[voice: volume +0.15]]`, `[[voice: rate +10]]`, `[[voice: repeat]]`, `[[voice: stop]]`. A say marker adds a spoken prefix rather than replacing the visible answer. The same rate control is exposed to the model through the `voice_dialog` tool, so “说慢一点/说快一点/语速调到…” adjusts following sentences immediately.
 - **Model-facing voice control.** A `voice_dialog` tool lets the model react to spoken meta-commands: 轻一点/响一点 (`volume`), 听不清/什么/重复一遍 (`repeat`), 别说了/闭嘴/停 (`stop`). The host broadcasts the action to the browser over the same SSE stream. `stop` also mutes new sentences until the user speaks again. The same actions and exact speech are available as reasoning markers, so the model can decide naturally without a tool call.
 - **Background subagents.** While the microphone is active, the host records that parent session's voice state. When a subagent finishes, its final assistant text is summarized and queued straight into the parent's TTS stream, so the result is spoken without starting another main-model turn. A short heartbeat expires the state if the tab disappears.
-- **Speaker labels.** A local CAM++ voiceprint model (run by `sherpa-onnx-node`, no cloud call) identifies the enrolled owner and clusters other voices. Each transcript is prefixed with `[声纹：我]` or `[声纹：客人1]`, so the model can tell who is speaking. The settings page records the owner's voice; the optional **只回应我的声音** switch drops utterances that do not match.
+- **Speaker labels.** A local CAM++ voiceprint model (run by `sherpa-onnx-node`, no cloud call) identifies the enrolled owner and clusters other voices. Each transcript is prefixed with `[声纹：我]` or `[声纹：客人1]`, so the model can tell who is speaking. The settings page records the owner's voice; confirmed owner utterances slowly reinforce the template, and the optional **只回应我的声音** switch drops utterances that do not match.
 - **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation and input device all live in the plugin page under **Plugins → dsh-voice-dialog**. The active microphone expands into the built-in capture-row style with a live waveform, cancel and stop controls.
 
 ## Requirements
@@ -69,9 +69,10 @@ All preferences are in **Plugins → dsh-voice-dialog**:
 | Setting | Storage | Notes |
 | --- | --- | --- |
 | Auto-read, volume, duck level, input device | Browser `localStorage` | Per browser/device |
-| Edge TTS voice | Host `~/.dsh/voice-dialog/settings.json` | Applies immediately; survives restart |
+| Edge TTS voice, speech rate | Host `~/.dsh/voice-dialog/settings.json` | Applies immediately; survives restart |
 | ASR provider, language | DSH speech selection | Shared with other speech clients |
 | Model preparation | DSH speech host | Download / cancel / retry |
+| Speech rate | Host `~/.dsh/voice-dialog/settings.json` | -50%..+50%; the model can change it too |
 | Speaker prefix, only-my-voice, threshold | Browser `localStorage` | Prefix / gate behavior |
 | Owner voiceprint | Host `~/.dsh/voice-dialog/voiceprint.json` | Embedding only; original audio is not stored |
 | Voiceprint model | Host `~/.dsh/voice-dialog/models/` | Downloaded from the settings page |
