@@ -11,7 +11,7 @@ test('switching voices on an unopened queue is safe', async () => {
 })
 
 test('a failed synthesis emits a text frame for the system-voice fallback', async () => {
-  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural' })
+  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural', synthAttempts: 1 })
   queue.tts = {
     setMetadata: async () => undefined,
     toStream: async () => { throw new Error('edge offline') },
@@ -45,5 +45,29 @@ test('synthesized frames keep the reply id used by repeat', async () => {
   assert.equal(frames.length, 1)
   assert.equal(frames[0].replyId, 'reply-ok')
   assert.ok(frames[0].audio.length > 0)
+  await queue.close()
+})
+test('a transient synthesis failure retries on a fresh attempt', async () => {
+  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural', synthAttempts: 2, retryDelayMs: 1 })
+  let calls = 0
+  queue.tts = {
+    setMetadata: async () => undefined,
+    toStream: async () => {
+      calls++
+      if (calls === 1) throw new Error('read ECONNRESET')
+      return { audioStream: (async function* () { yield Buffer.from([0xff, 0xfb, 0x90, 0x64]) })() }
+    },
+    close: async () => undefined,
+  }
+  // Keep the mock in place: the production reset replaces this.tts with a real client.
+  queue.resetConnection = () => undefined
+  const frames = []
+  queue.subscribe((frame) => frames.push(frame))
+  queue.enqueue('session-retry', '第一次断线，第二次应该成功。', 'reply-retry')
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(calls, 2)
+  assert.equal(frames.length, 1)
+  assert.ok(frames[0].audio.length > 0)
+  assert.equal(frames[0].error, undefined)
   await queue.close()
 })

@@ -19,7 +19,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 - Node.js 22+ (DSH requirement).
 - A working DSH speech-to-text provider. This bundle composes the host rows itself:
   `speech-to-text`, `speech-to-text-sensevoice`, `api-speech-to-text`.
-- Network access to Microsoft Edge TTS for the selected voice; without it, read-aloud falls back to the browser's system voice. The first SenseVoice use may need a model download.
+- Network access to Microsoft Edge TTS for the selected voice; without it, read-aloud falls back to the browser's system voice. The first SenseVoice use may need a model download. When Edge needs a proxy, the plugin reads `HTTPS_PROXY` / `HTTP_PROXY` and tunnels the WebSocket with CONNECT; `DSH_VOICE_TTS_PROXY` overrides it and `NO_PROXY` can exempt Edge.
 - A secure browser context for the microphone: `https://` or `http://localhost` / `http://127.0.0.1`.
 
 ## Install
@@ -96,7 +96,7 @@ SSE ──► TtsPlayer(Web Audio gain) ◄── duck on speech start ───
 
 - **Microphone error / no permission**: use HTTPS or localhost. On Android Edge you can temporarily allow an insecure origin via `edge://flags/#unsafely-treat-insecure-origin-as-secure`.
 - **No sound**: click once anywhere on the page to unlock Web Audio; check the auto-read toggle and volume.
-- **Voice preview fails**: Edge TTS needs network access; check the host log for `[dsh-voice-dialog]`.
+- **Voice preview fails / `read ECONNRESET` in the log**: direct egress to `speech.platform.bing.com` is usually being reset. Set `HTTPS_PROXY` and restart DSH; the host log then prints `Edge TTS via proxy http://…`.
 - **Settings page says speech service unavailable**: both voice bundles may be enabled, or the host rows did not mount. Keep only `dsh-voice-dialog`.
 - **Model not ready**: open the plugin page and click **准备语音模型**.
 

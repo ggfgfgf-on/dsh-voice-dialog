@@ -11,6 +11,7 @@
  * naturally. `cancel()` remains for an explicit stop.
  */
 
+import httpsProxyAgent from 'https-proxy-agent'
 import { MsEdgeTTS, OUTPUT_FORMAT, type ProsodyOptions } from 'msedge-tts'
 
 export interface VoiceFrame {
@@ -35,6 +36,79 @@ const RETRY_BASE_MS = 1000
 const RETRY_MAX_MS = 30_000
 /** Give up (and drop the pending sentences) after this many consecutive fails. */
 const MAX_RETRIES = 5
+/** Per-sentence WebSocket attempts; a fresh socket is opened between attempts. */
+const SYNTH_ATTEMPTS = 3
+/** Short pause before re-dialing Edge TTS after a reset. */
+const SYNTH_RETRY_DELAY_MS = 250
+/** The WebSocket host whose traffic should follow the configured proxy. */
+const EDGE_TTS_HOST = 'speech.platform.bing.com'
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+let proxyNoticePrinted = false
+
+/** Only HTTP(S) CONNECT proxies are supported by https-proxy-agent. */
+export function resolveProxyUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = env.DSH_VOICE_TTS_PROXY
+    ?? env.HTTPS_PROXY ?? env.https_proxy
+    ?? env.HTTP_PROXY ?? env.http_proxy
+    ?? env.ALL_PROXY ?? env.all_proxy
+  if (!raw) return undefined
+  const value = raw.trim()
+  if (!/^https?:\/\//i.test(value)) return undefined
+  try {
+    const parsed = new URL(value)
+    return parsed.hostname ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Minimal NO_PROXY matcher for host names (the Edge endpoint has no CIDR needs). */
+export function bypassProxy(host: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.NO_PROXY ?? env.no_proxy
+  if (!raw) return false
+  const target = host.toLowerCase()
+  for (const entry of raw.split(',')) {
+    let rule = entry.trim().toLowerCase()
+    if (!rule) continue
+    if (rule === '*') return true
+    rule = rule.replace(/^\*\./, '').replace(/^\./, '')
+    rule = rule.replace(/:\d+$/, '')
+    if (target === rule || target.endsWith('.' + rule)) return true
+  }
+  return false
+}
+
+function redactProxy(value: string): string {
+  return value.replace(/\/\/[^/@]+@/, '//***@')
+}
+
+/**
+ * Create an Edge TTS client that follows the host's HTTPS proxy.
+ *
+ * ws (used by msedge-tts) does not honor HTTP(S)_PROXY itself. On networks
+ * where direct egress to speech.platform.bing.com is reset but the system
+ * proxy works, the WebSocket handshake fails with ECONNRESET unless an agent
+ * is supplied explicitly.
+ */
+export function createEdgeTts(): MsEdgeTTS {
+  const proxy = resolveProxyUrl()
+  const useProxy = proxy !== undefined && !bypassProxy(EDGE_TTS_HOST)
+  const agent = useProxy
+    ? new (httpsProxyAgent as unknown as { HttpsProxyAgent: new (url: string) => object }).HttpsProxyAgent(proxy)
+    : undefined
+  if (agent && !proxyNoticePrinted) {
+    proxyNoticePrinted = true
+    // eslint-disable-next-line no-console
+    console.log('[dsh-voice-dialog] Edge TTS via proxy ' + redactProxy(proxy as string))
+  }
+  return new MsEdgeTTS({
+    agent,
+    connectionTimeoutMs: 15_000,
+    synthesisTimeoutMs: 30_000,
+  })
+}
 
 interface QueuedSentence {
   text: string
@@ -55,16 +129,30 @@ interface SessionQueue {
 }
 
 export class TtsQueue {
-  private tts = new MsEdgeTTS()
+  private tts = createEdgeTts()
   private readonly queues = new Map<string, SessionQueue>()
   private readonly listeners = new Set<FrameListener>()
   private voice: string
   private readonly prosody?: ProsodyOptions
+  private readonly synthAttempts: number
+  private readonly retryDelayMs: number
   private ready: Promise<void> | null = null
 
-  constructor(options: { voice?: string; prosody?: ProsodyOptions } = {}) {
+  constructor(options: {
+    voice?: string
+    prosody?: ProsodyOptions
+    /** Per-sentence attempts; exposed for deterministic tests. */
+    synthAttempts?: number
+    retryDelayMs?: number
+  } = {}) {
     this.voice = options.voice ?? 'zh-CN-XiaoxiaoNeural'
     this.prosody = options.prosody
+    this.synthAttempts = Number.isFinite(options.synthAttempts)
+      ? Math.max(1, Math.floor(options.synthAttempts as number))
+      : SYNTH_ATTEMPTS
+    this.retryDelayMs = Number.isFinite(options.retryDelayMs)
+      ? Math.max(0, Math.floor(options.retryDelayMs as number))
+      : SYNTH_RETRY_DELAY_MS
   }
 
   /** Switch the Edge voice and drop the old handshake; queued text uses the new voice. */
@@ -74,7 +162,7 @@ export class TtsQueue {
     this.voice = next
     this.ready = null
     const previous = this.tts
-    this.tts = new MsEdgeTTS()
+    this.tts = createEdgeTts()
     try { await previous.close() } catch { /* already closed */ }
   }
 
@@ -91,6 +179,14 @@ export class TtsQueue {
         throw e
       })
     return this.ready
+  }
+
+  /** Drop a possibly dead socket; the next stream opens a fresh connection. */
+  private resetConnection(): void {
+    this.ready = null
+    const previous = this.tts
+    this.tts = createEdgeTts()
+    try { previous.close() } catch { /* already closed */ }
   }
 
   subscribe(listener: FrameListener): () => void {
@@ -178,13 +274,33 @@ export class TtsQueue {
       q.failures = 0
       while (q.pending.length > 0) {
         const item = q.pending.shift()!
-        try {
-          const { audioStream } = await this.tts.toStream(item.text)
-          const chunks: Buffer[] = []
-          for await (const chunk of audioStream) {
-            chunks.push(chunk as Buffer)
+        let buf: Buffer | undefined
+        let lastError: unknown
+        for (let attempt = 1; attempt <= this.synthAttempts; attempt++) {
+          try {
+            // A reset cleared the handshake, so later attempts dial again.
+            if (attempt > 1) await this.ensureReady()
+            const { audioStream } = await this.tts.toStream(item.text)
+            const chunks: Buffer[] = []
+            for await (const chunk of audioStream) {
+              chunks.push(chunk as Buffer)
+            }
+            buf = Buffer.concat(chunks)
+            break
+          } catch (e) {
+            lastError = e
+            const message = e instanceof Error ? e.message : String(e)
+            if (attempt === this.synthAttempts) break
+            // The socket may still look open after a reset. Re-dial instead of
+            // sending every remaining sentence through a dead connection.
+            // eslint-disable-next-line no-console
+            console.warn('[dsh-voice-dialog] synthesis attempt ' + attempt + ' failed (' + message + '), retrying on a fresh socket')
+            this.resetConnection()
+            await sleep(this.retryDelayMs)
           }
-          const buf = Buffer.concat(chunks)
+        }
+        try {
+          if (!buf) throw lastError instanceof Error ? lastError : new Error(String(lastError))
           // A valid MP3 frame starts with a sync word; drop metadata garbage.
           if (buf.length === 0 || buf[0] !== MP3_MAGIC) continue
           // Barge-in happened while this sentence was synthesizing: drop it.
@@ -208,7 +324,7 @@ export class TtsQueue {
           // browser read that sentence with the system voice instead.
           const message = e instanceof Error ? e.message : String(e)
           // eslint-disable-next-line no-console
-          console.warn(`[dsh-voice-dialog] synthesis failed: ${message}`)
+          console.warn('[dsh-voice-dialog] synthesis failed: ' + message)
           if (item.epoch === q.epoch) this.emitFailure(sessionId, q, item.text, item.replyId, message)
         }
       }

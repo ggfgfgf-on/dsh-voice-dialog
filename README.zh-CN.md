@@ -19,6 +19,7 @@
 - Node.js 22+。
 - DSH 语音识别服务。本插件的 bundle 自己组合了三条 host 行：`speech-to-text`、`speech-to-text-sensevoice`、`api-speech-to-text`。
 - 朗读需要能访问 Microsoft Edge TTS（用于所选音色）；访问不了会自动退到浏览器系统语音。首次使用 SenseVoice 可能需要下载模型。
+- 需要代理才能访问 Edge 时，插件自动读取 `HTTPS_PROXY` / `HTTP_PROXY`，WebSocket 通过 CONNECT 隧道；可用 `DSH_VOICE_TTS_PROXY` 覆盖，`NO_PROXY` 可让 Edge 直连。
 - 麦克风需要安全上下文：`https://` 或 `http://localhost` / `http://127.0.0.1`。
 
 ## 安装
@@ -93,7 +94,7 @@ SSE ──► TtsPlayer(Web Audio gain) ◄── 开口时 duck ─────
 
 - **麦克风没权限**：必须 HTTPS 或 localhost；Android Edge 可临时用 `edge://flags/#unsafely-treat-insecure-origin-as-secure` 放行局域网地址。
 - **没有声音**：先在页面上点一下以解锁 Web Audio；检查自动朗读开关和音量。
-- **试听失败**：Edge TTS 需要网络；当前会自动退到系统语音。若系统语音也失败，检查浏览器是否允许语音合成。
+- **试听失败 / 日志出现 `read ECONNRESET`**：通常是直连 `speech.platform.bing.com` 被网络重置。设置 `HTTPS_PROXY` 后重启 DSH；host 日志会打印 `Edge TTS via proxy http://…`。若系统语音也失败，检查浏览器是否允许语音合成。
 - **设置页提示语音服务不可用**：可能同时启用了两个语音 bundle，或 host 行没挂载。只保留 `dsh-voice-dialog`。
 - **模型未就绪**：打开插件页点“准备语音模型”。
 

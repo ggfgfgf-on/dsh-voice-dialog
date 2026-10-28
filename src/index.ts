@@ -7,10 +7,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts'
+import { OUTPUT_FORMAT } from 'msedge-tts'
 import { SentenceSegmenter } from './segmenter.ts'
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
-import { TtsQueue, type VoiceFrame } from './tts-queue.ts'
+import { createEdgeTts, TtsQueue, type VoiceFrame } from './tts-queue.ts'
 import { VoiceProtocol, type VoiceCommand } from './voice-protocol.ts'
 
 export const name = 'voice-dialog'
@@ -224,32 +224,50 @@ export function apply(ctx: Context, config: Config): void {
       kind: 'exact',
       path: `${base}/preview`,
       handler: async (req, res: ServerResponse) => {
-        let preview: MsEdgeTTS | undefined
         try {
           const body = await readJson(req)
           const text = typeof body.text === 'string' ? body.text.trim().slice(0, 300) : ''
           const requested = typeof body.voice === 'string' && isVoiceId(body.voice) ? body.voice : voice
           if (!text) { writeJson(res, 400, { error: 'empty text' }); return }
-          preview = new MsEdgeTTS()
-          await preview.setMetadata(requested, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3, {
-            wordBoundaryEnabled: false,
-            sentenceBoundaryEnabled: false,
-          })
-          const { audioStream } = await preview.toStream(text)
-          const chunks: Buffer[] = []
-          for await (const chunk of audioStream) chunks.push(chunk as Buffer)
-          const audio = Buffer.concat(chunks)
-          if (audio.length === 0) { writeJson(res, 502, { error: 'empty synthesis' }); return }
+          const audio = await synthesizePreview(text, requested)
           res.writeHead(200, { 'content-type': 'audio/mpeg', 'content-length': String(audio.length) })
           res.end(audio)
         } catch (error) {
           writeJson(res, 502, { error: error instanceof Error ? error.message : String(error) })
-        } finally {
-          if (preview) { try { await preview.close() } catch { /* already closed */ } }
         }
       },
     }),
   )
+}
+
+const PREVIEW_ATTEMPTS = 2
+
+/** One-shot audition with a fresh socket, so a stale live connection cannot poison it. */
+async function synthesizePreview(text: string, requested: string): Promise<Buffer> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= PREVIEW_ATTEMPTS; attempt++) {
+    const preview = createEdgeTts()
+    try {
+      await preview.setMetadata(requested, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3, {
+        wordBoundaryEnabled: false,
+        sentenceBoundaryEnabled: false,
+      })
+      const { audioStream } = await preview.toStream(text)
+      const chunks: Buffer[] = []
+      for await (const chunk of audioStream) chunks.push(chunk as Buffer)
+      const audio = Buffer.concat(chunks)
+      if (audio.length === 0) throw new Error('empty synthesis')
+      return audio
+    } catch (error) {
+      lastError = error
+      if (attempt < PREVIEW_ATTEMPTS) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 250))
+      }
+    } finally {
+      try { await preview.close() } catch { /* already closed */ }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
 }
 
 function writeJson(res: ServerResponse, status: number, value: unknown): void {
