@@ -716,6 +716,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       const sent = await session.prompt([{ type: 'text', text }], mode)
       if (!sent.ok) throw new Error(sent.error?.message ?? '发送失败')
     },
+    ownerMode: () => getPreferences().ownerMode,
     guestMode: (label) => effectiveGuestMode(sessionId, label),
     batchMs: 900,
     onStatus: ({ active, queued }) => {
@@ -1096,7 +1097,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   return <div className="dsh-vd-settings">
     <style>{SETTINGS_CSS}</style>
     <h2>语音对话</h2>
-    <p className="dsh-vd-muted">一个麦克风完成连续对话：停顿后自动识别，我直接插话，其他人按优先级排队；助手回复自动朗读。设置只保存在这个浏览器。</p>
+    <p className="dsh-vd-muted">一个麦克风完成连续对话：停顿后自动识别，我说话默认等当前回答说完，其他人按优先级排队；助手回复自动朗读。设置只保存在这个浏览器。</p>
 
     <section>
       <h3>朗读</h3>
@@ -1119,7 +1120,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
           onClick={() => { void playPreview() }}>{previewing ? '停止试听' : busy ? '合成中…' : '试听'}</button>
       </div>
       {actionError && <p className="dsh-vd-error" role="alert">{actionError}</p>}
-      <p className="dsh-vd-muted">说话只会压低朗读，不会切断回答；我直接插话，其他人默认排队，等这一轮说完再交给模型。</p>
+      <p className="dsh-vd-muted">说话只会压低朗读，不会切断回答；我默认排队，其他人也默认排队，等这一轮说完再交给模型。</p>
       {host && <p className="dsh-vd-muted">音色和语速保存在本机（重启后仍生效），朗读偏好保存在这个浏览器。</p>}
     </section>
 
@@ -1190,7 +1191,12 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
 
     <section>
       <h3>多人插话</h3>
-      <p className="dsh-vd-muted">主人优先，其他人可以排队，不抢当前回答。排队的内容会合成一条低优先级消息，等模型这一轮结束再送进去。</p>
+      <p className="dsh-vd-muted">主人优先，默认不抢当前回答。排队的内容会合成一条低优先级消息，等模型这一轮结束再送进去。</p>
+      <label>我说话时<select value={prefs.ownerMode} disabled={busy}
+        onChange={(event) => { save({ ownerMode: event.target.value as VoiceDialogPreferences['ownerMode'] }) }}>
+        <option value="queue">等当前回答说完（默认）</option>
+        <option value="steer">立即插话，打断当前回答</option>
+      </select></label>
       <label>其他人插话<select value={prefs.guestMode} disabled={busy}
         onChange={(event) => { save({ guestMode: event.target.value as VoiceDialogPreferences['guestMode'] }) }}>
         <option value="queue">排队，等当前回答说完</option>

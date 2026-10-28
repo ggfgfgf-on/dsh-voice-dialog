@@ -1,5 +1,5 @@
 /** Browser-local voice-dialog preferences; no host restart needed. */
-import type { GuestMode } from './scheduler.ts'
+import type { GuestMode, PromptMode } from './scheduler.ts'
 
 export interface VoiceDialogPreferences {
   /** Read assistant replies aloud. */
@@ -18,6 +18,8 @@ export interface VoiceDialogPreferences {
   speakerGate: boolean
   /** Cosine similarity at which an utterance counts as the enrolled speaker. */
   speakerThreshold: number
+  /** How the owner's own speech is delivered: soft queue or hard steer. */
+  ownerMode: PromptMode
   /** What to do when someone other than the enrolled owner speaks. */
   guestMode: GuestMode
   /** Allow several utterances to be transcribed at the same time. */
@@ -34,6 +36,7 @@ const DEFAULTS: VoiceDialogPreferences = {
   speakerPrefix: true,
   speakerGate: false,
   speakerThreshold: 0.52,
+  ownerMode: 'queue',
   guestMode: 'queue',
   parallelAsr: true,
 }
@@ -51,6 +54,11 @@ function clampThreshold(value: unknown, fallback: number): number {
 function parseGuestMode(value: unknown, fallback: GuestMode): GuestMode {
   return value === 'queue' || value === 'steer' || value === 'ignore' ? value : fallback
 }
+
+function parseOwnerMode(value: unknown, fallback: PromptMode): PromptMode {
+  return value === 'queue' || value === 'steer' ? value : fallback
+}
+
 const listeners = new Set<(value: VoiceDialogPreferences) => void>()
 
 function clamp(value: unknown, fallback: number): number {
@@ -71,6 +79,7 @@ function parse(raw: string | null): VoiceDialogPreferences {
       speakerPrefix: typeof value.speakerPrefix === 'boolean' ? value.speakerPrefix : DEFAULTS.speakerPrefix,
       speakerGate: typeof value.speakerGate === 'boolean' ? value.speakerGate : DEFAULTS.speakerGate,
       speakerThreshold: clampThreshold(value.speakerThreshold, DEFAULTS.speakerThreshold),
+      ownerMode: parseOwnerMode(value.ownerMode, DEFAULTS.ownerMode),
       guestMode: parseGuestMode(value.guestMode, DEFAULTS.guestMode),
       parallelAsr: typeof value.parallelAsr === 'boolean' ? value.parallelAsr : DEFAULTS.parallelAsr,
     }
@@ -95,6 +104,7 @@ export function setPreferences(patch: Partial<VoiceDialogPreferences>): VoiceDia
   next.duckLevel = clamp(next.duckLevel, DEFAULTS.duckLevel)
   next.pauseMs = clampPause(next.pauseMs, DEFAULTS.pauseMs)
   next.speakerThreshold = clampThreshold(next.speakerThreshold, DEFAULTS.speakerThreshold)
+  next.ownerMode = parseOwnerMode(next.ownerMode, DEFAULTS.ownerMode)
   next.guestMode = parseGuestMode(next.guestMode, DEFAULTS.guestMode)
   next.parallelAsr = typeof next.parallelAsr === 'boolean' ? next.parallelAsr : DEFAULTS.parallelAsr
   current = next

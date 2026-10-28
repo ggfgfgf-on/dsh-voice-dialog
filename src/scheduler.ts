@@ -13,6 +13,8 @@ export interface SchedulerStatus {
 
 export interface SpeechSchedulerOptions {
   deliver: (text: string, mode: PromptMode) => Promise<void>
+  /** Owner delivery. Defaults to "steer" for backward compatibility. */
+  ownerMode?: () => PromptMode
   guestMode: (label: string) => GuestMode
   /** How long to gather consecutive guest lines into one queued prompt. */
   batchMs?: number
@@ -23,7 +25,8 @@ export interface SpeechSchedulerOptions {
 /**
  * Two ordered lanes share one model turn:
  *
- * - owner speech is delivered immediately with prompt mode "steer";
+ * - owner speech is delivered by `ownerMode`: "queue" waits for the running
+ *   reply (the default in the app), "steer" interrupts it immediately;
  * - guest speech is either batched behind the running reply ("queue"), sent
  *   immediately ("steer"), or dropped ("ignore").
  *
@@ -63,7 +66,7 @@ export class SpeechScheduler {
       this.ownerChain = this.ownerChain.then(async () => {
         try {
           const text = await resolve()
-          if (text) await this.options.deliver(text, 'steer')
+          if (text) await this.options.deliver(text, this.options.ownerMode?.() ?? 'steer')
         } catch (error) {
           this.options.onError?.(error)
         } finally {

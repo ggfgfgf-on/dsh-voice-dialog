@@ -29,6 +29,25 @@ test('owner steers immediately while guests batch into one queued prompt', async
   assert.deepEqual(scheduler.status(), { active: 0, queued: 0 })
 })
 
+test('owner queue mode appends without interrupting the running reply', async () => {
+  const deliveries = []
+  let ownerMode = 'queue'
+  const scheduler = new SpeechScheduler({
+    deliver: async (text, mode) => { deliveries.push({ text, mode }) },
+    ownerMode: () => ownerMode,
+    guestMode: () => 'queue',
+    batchMs: 5,
+  })
+  scheduler.enqueue('owner', '我', Promise.resolve('[声纹：我] 我说一句'))
+  await tick()
+  assert.deepEqual(deliveries, [{ text: '[声纹：我] 我说一句', mode: 'queue' }])
+
+  ownerMode = 'steer'
+  scheduler.enqueue('owner', '我', Promise.resolve('[声纹：我] 急事'))
+  await tick()
+  assert.deepEqual(deliveries.at(-1), { text: '[声纹：我] 急事', mode: 'steer' })
+})
+
 test('owner lane preserves utterance order even when later ASR finishes first', async () => {
   const first = deferred()
   const second = deferred()
