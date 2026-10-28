@@ -62,6 +62,28 @@ function apiUrl(path: string): string {
   return `${apiBase}${path}`
 }
 
+/**
+ * Tell the host whether this session's microphone is open. Background
+ * subagent results are spoken only for sessions that report active.
+ */
+function reportVoiceState(sessionId: string, active: boolean, unloading = false): void {
+  const body = JSON.stringify({ sessionId, active })
+  try {
+    if (unloading && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      navigator.sendBeacon(apiUrl('/voice-state'), new Blob([body], { type: 'application/json' }))
+      return
+    }
+  } catch {
+    // Fall through to fetch when Beacon is unavailable.
+  }
+  void fetch(apiUrl('/voice-state'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+    keepalive: !active,
+  }).catch(() => undefined)
+}
+
 function loadConfig(): Promise<HostConfig> {
   if (configPromise === null) {
     configPromise = fetch(`${BOOTSTRAP_BASE}/config`)
@@ -107,6 +129,7 @@ class TtsPlayer {
   private blocked = false
   private active = false
   private muted = false
+  private sessionId: string | undefined
   private volumeOverride: number | undefined
   private lastReplyId: string | undefined
   private lastTexts: string[] = []
@@ -127,7 +150,8 @@ class TtsPlayer {
   }
 
   /** Read-aloud is only live while the microphone is listening. */
-  beginSession(): void {
+  beginSession(sessionId: string): void {
+    this.sessionId = sessionId
     this.active = true
     this.muted = false
     void this.enable()
@@ -228,6 +252,9 @@ class TtsPlayer {
 
   enqueue(frame: VoiceFrame): void {
     if (!this.active || this.muted || !this.prefs.autoRead) return
+    // A second tab can share the same SSE broadcast; only the session whose
+    // microphone is open may speak.
+    if (this.sessionId !== undefined && frame.sessionId !== this.sessionId) return
     this.note(frame)
     this.queue.push(frame)
     if (!this.playing) this.playNext()
@@ -412,6 +439,19 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     return () => { onActiveChange?.(false) }
   }, [active, onActiveChange])
 
+  useEffect(() => {
+    if (!active) return
+    reportVoiceState(sessionId, true)
+    const heartbeat = setInterval(() => { reportVoiceState(sessionId, true) }, 45_000)
+    return () => { clearInterval(heartbeat) }
+  }, [active, sessionId])
+
+  useEffect(() => {
+    const onPageHide = (): void => { reportVoiceState(sessionId, false, true) }
+    window.addEventListener('pagehide', onPageHide)
+    return () => { window.removeEventListener('pagehide', onPageHide) }
+  }, [sessionId])
+
   const stop = async (): Promise<void> => {
     cancelRetainedStop()
     retainedMic = null
@@ -420,6 +460,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     micRef.current = null
     // Keep already captured segments: stopping the microphone must not lose
     // the last sentence the user just spoke.
+    reportVoiceState(sessionId, false)
     setActive(false)
     setPhase('idle')
     setLevel(0)
@@ -432,6 +473,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       // The composer remounted while listening. Reattach instead of stopping.
       cancelRetainedStop()
       micRef.current = retainedMic
+      sharedPlayer.beginSession(sessionId)
       setActive(true)
       setPhase('listening')
       return
@@ -459,6 +501,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         retainedSession = null
         retainedStopTimer = null
         void mic.stop()
+        reportVoiceState(sessionId, false)
         sharedPlayer.endSession()
         sharedPlayer.restore()
       }, 1200)
@@ -539,7 +582,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       cancelRetainedStop()
       retainedMic = mic
       retainedSession = sessionId
-      sharedPlayer.beginSession()
+      sharedPlayer.beginSession(sessionId)
+      reportVoiceState(sessionId, true)
       setActive(true)
       setPhase('listening')
     } catch (failure) {

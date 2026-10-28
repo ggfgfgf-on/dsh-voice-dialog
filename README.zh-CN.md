@@ -11,6 +11,7 @@
 - **不整段读思维链。** 通过 `GenerateOptions.purpose` 过滤 compaction / 会话标题等内部调用；reasoning 只扫描显式的 `[[voice: ...]]` 指令，不会把整段思维链读出来。工具参数永远不会进入 TTS。
 - **模型决定说什么。** 模型可以在 reasoning 里写 `[[voice: 要说的内容]]` 指定朗读文本，或用 `[[voice: volume +0.15]]`、`[[voice: repeat]]`、`[[voice: stop]]` 控制。出现 say 指令时不再自动读可见回复；没有指令时读最终回复。
 - **模型语音控制。** 新增 `voice_dialog` 工具：轻一点/响一点（`volume`）、听不清/什么/重复一遍（`repeat`）、别说了/闭嘴/停（`stop`）。Host 通过同一条 SSE 把动作广播给浏览器；`stop` 会静音后续句子，直到用户再次开口。同样的动作和指定朗读文本也可以直接用 reasoning 标记表达，模型不必每次走工具调用。
+- **后台子代理直接播报。** 开麦时客户端把当前会话标记为语音活跃；子代理结束时 host 读取它的最终文本，压成一句摘要直接排进父会话的 TTS，不需要主模型再开一轮。客户端用心跳续期，标签页消失后状态自动过期。
 - **插件设置页。** 自动朗读、音量、压低比例、朗读音色与试听、识别服务/语言、模型准备、输入麦克风都在 **插件 → dsh-voice-dialog** 页面里。麦克风激活后，输入框会展开成内置语音输入插件风格的整行：波形、取消和停止按钮。
 
 ## 要求
@@ -74,6 +75,8 @@ dsh plugin --profile web add file:D:/path/to/dsh-voice-dialog
 
 ```text
 llm/stream ──过滤(purpose, text-delta)──► 句子切分 ──► TtsQueue(Edge) ──► SSE
+                                                                       ▲
+subagent/end ──父会话语音状态──► 摘要 ──────────────────────────────────┘
                                                                        │
 输入框麦克风 ──► MicrophoneLoop(VAD) ──► speech.transcribe ──► session.prompt(steer)
                                                                        │

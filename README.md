@@ -11,6 +11,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 - **No chain-of-thought reading.** Compaction and session-title calls are filtered by `GenerateOptions.purpose`. Reasoning is scanned only for explicit `[[voice: ...]]` directives; its text is never spoken wholesale. Tool arguments never reach TTS.
 - **Model-directed speech.** The model can choose the exact spoken words from reasoning: `[[voice: 要说的内容]]`, `[[voice: volume +0.15]]`, `[[voice: repeat]]`, `[[voice: stop]]`. A say marker suppresses automatic reading of the visible answer; without one, the final answer is read.
 - **Model-facing voice control.** A `voice_dialog` tool lets the model react to spoken meta-commands: 轻一点/响一点 (`volume`), 听不清/什么/重复一遍 (`repeat`), 别说了/闭嘴/停 (`stop`). The host broadcasts the action to the browser over the same SSE stream. `stop` also mutes new sentences until the user speaks again. The same actions and exact speech are available as reasoning markers, so the model can decide naturally without a tool call.
+- **Background subagents.** While the microphone is active, the host records that parent session's voice state. When a subagent finishes, its final assistant text is summarized and queued straight into the parent's TTS stream, so the result is spoken without starting another main-model turn. A short heartbeat expires the state if the tab disappears.
 - **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation and input device all live in the plugin page under **Plugins → dsh-voice-dialog**. The active microphone expands into the built-in capture-row style with a live waveform, cancel and stop controls.
 
 ## Requirements
@@ -76,6 +77,8 @@ The voice selector includes Mandarin, Cantonese, Taiwanese, English and Japanese
 
 ```text
 llm/stream ──filter(purpose, text-delta)──► SentenceSegmenter ──► TtsQueue(Edge) ──► SSE
+                                                                                   ▲
+subagent/end ──parent voice-state──► summary ───────────────────────────────────────┘
                                                                                    │
 composer microphone ──► MicrophoneLoop(VAD) ──► speech.transcribe ──► session.prompt(steer)
                                                                                    │

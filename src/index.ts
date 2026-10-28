@@ -8,7 +8,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { OUTPUT_FORMAT } from 'msedge-tts'
-import { SentenceSegmenter } from './segmenter.ts'
+import { plainText, SentenceSegmenter } from './segmenter.ts'
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { createEdgeTts, TtsQueue, type VoiceFrame } from './tts-queue.ts'
 import { VoiceProtocol, type VoiceCommand } from './voice-protocol.ts'
@@ -82,6 +82,47 @@ export function apply(ctx: Context, config: Config): void {
     console.warn('[dsh-voice-dialog] TTS warmup failed: ' + String(error))
   })
 
+  // A subagent runs in its own session. The plugin speaks its final summary
+  // straight into the parent's queue instead of waiting for the main model to
+  // start another turn. Parentage is recorded at session creation; looking it
+  // up on subagent/end can race the child's disposal.
+  const activeVoice = new Map<string, number>()
+  const childParents = new Map<string, string>()
+  const announcedRuns = new Set<string>()
+  ctx.on('session/created', (session: any) => {
+    try {
+      const parent = session?.header?.parentSession
+      if (parent !== undefined && parent !== null) {
+        childParents.set(String(session.id), String(parent))
+      }
+    } catch {
+      // A session without a readable header is not a voice child.
+    }
+  })
+  ctx.on('subagent/end', (info: any) => {
+    try {
+      if (info?.local !== true) return
+      const runId = String(info?.runId ?? info?.id ?? '')
+      if (!runId || announcedRuns.has(runId)) return
+      const childId = String(info?.id ?? '')
+      let parent = childParents.get(childId)
+      if (parent === undefined) {
+        const child = (ctx as unknown as { sessions?: { get(id: string): any } }).sessions?.get(childId)
+        const headerParent = child?.header?.parentSession
+        if (headerParent !== undefined && headerParent !== null) parent = String(headerParent)
+      }
+      if (parent === undefined || !voiceSessionActive(activeVoice, parent)) return
+      const summary = summarizeForSpeech(assistantText(info?.lastAssistantMessage))
+      if (!summary) return
+      announcedRuns.add(runId)
+      childParents.delete(childId)
+      queue.enqueue(parent, summary, 'subagent-' + runId)
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn('[dsh-voice-dialog] subagent speech failed: ' + String(error))
+    }
+  })
+
   // Model-facing audio control for spoken meta-commands such as
   // "louder", "repeat that" or "stop talking". The browser applies it
   // immediately over the same SSE connection as the audio frames.
@@ -153,7 +194,9 @@ export function apply(ctx: Context, config: Config): void {
       + '[[voice: ...]] marker, or emit [[voice: volume +0.15]], [[voice: repeat]] or [[voice: stop]]. '
       + 'Markers belong in reasoning, never in the visible answer. A say marker suppresses automatic '
       + 'reading of the visible answer; without one, the final answer is read. Never read reasoning or '
-      + 'tool arguments aloud.',
+      + 'tool arguments aloud. In a voice conversation, when work splits into independent parts, you may '
+      + 'fork subagents and keep listening instead of waiting; the host speaks their final summaries, so '
+      + 'do not repeat those summaries word for word.',
   }))
 
   ctx.on('llm/stream', (options: GenerateOptions, next): AsyncIterable<StreamChunk> => {
@@ -197,6 +240,27 @@ export function apply(ctx: Context, config: Config): void {
   for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
     ctx.effect(() =>
       ctx.webServer.register({ kind: 'exact', path: `${prefix}/config`, handler: configHandler }),
+    )
+  }
+
+  // The browser owns microphone lifetime; the host only needs to know which
+  // parent sessions are currently allowed to speak background results. A
+  // short client heartbeat refreshes the entry so a crashed tab expires.
+  const voiceStateHandler = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req)
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+      if (!sessionId) { writeJson(res, 400, { error: 'missing sessionId' }); return }
+      if (body.active === true) activeVoice.set(sessionId, Date.now())
+      else activeVoice.delete(sessionId)
+      writeJson(res, 200, { ok: true })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
+    ctx.effect(() =>
+      ctx.webServer.register({ kind: 'exact', path: `${prefix}/voice-state`, handler: voiceStateHandler }),
     )
   }
 
@@ -300,6 +364,49 @@ async function synthesizePreview(text: string, requested: string): Promise<Buffe
   })
   previewChain = run.then(() => undefined, () => undefined)
   return run
+}
+
+/** How long a client's voice-state heartbeat keeps its session speakable. */
+const VOICE_STATE_TTL_MS = 120_000
+
+function voiceSessionActive(active: Map<string, number>, sessionId: string): boolean {
+  const seen = active.get(sessionId)
+  if (seen === undefined) return false
+  if (Date.now() - seen > VOICE_STATE_TTL_MS) {
+    active.delete(sessionId)
+    return false
+  }
+  return true
+}
+
+/** Final subagent output is content blocks; only text blocks are speech. */
+function assistantText(blocks: unknown): string {
+  if (!Array.isArray(blocks)) return ''
+  return blocks
+    .map((block) => block !== null && typeof block === 'object'
+      && (block as { type?: unknown }).type === 'text'
+      && typeof (block as { text?: unknown }).text === 'string'
+      ? (block as { text: string }).text
+      : '')
+    .filter((text) => text.length > 0)
+    .join('\n')
+}
+
+/**
+ * A spoken result is a glance, not the report. Strip markdown, collapse
+ * whitespace, and cut at the last sentence boundary before the budget.
+ */
+function summarizeForSpeech(text: string, maxChars = 320): string {
+  const clean = plainText(text).replace(/\s+/g, ' ').trim()
+  if (!clean) return ''
+  if (clean.length <= maxChars) return clean
+  const cut = clean.slice(0, maxChars)
+  const boundary = Math.max(
+    cut.lastIndexOf('。'), cut.lastIndexOf('！'), cut.lastIndexOf('？'),
+    cut.lastIndexOf('；'), cut.lastIndexOf('. '),
+  )
+  const body = boundary >= 80 ? cut.slice(0, boundary + 1) : cut
+  return body.trim() + '…'
 }
 
 function writeJson(res: ServerResponse, status: number, value: unknown): void {
