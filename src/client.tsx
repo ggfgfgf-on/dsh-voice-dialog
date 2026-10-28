@@ -106,6 +106,7 @@ class TtsPlayer {
   private ducked = false
   private blocked = false
   private active = false
+  private muted = false
   private volumeOverride: number | undefined
   private lastReplyId: string | undefined
   private lastTexts: string[] = []
@@ -128,8 +129,12 @@ class TtsPlayer {
   /** Read-aloud is only live while the microphone is listening. */
   beginSession(): void {
     this.active = true
+    this.muted = false
     void this.enable()
   }
+
+  /** A new user utterance ends a previous "stop talking" mute. */
+  unmute(): void { this.muted = false }
 
   /** Stop accepting new sentences; already queued audio keeps playing. */
   endSession(): void {
@@ -178,9 +183,11 @@ class TtsPlayer {
   private stopAll(): void {
     // Keep the last reply in memory: "闭嘴" followed by "重复一遍" is valid.
     this.halt()
+    this.muted = true
   }
 
   private repeatLast(): void {
+    this.muted = false
     const frames = [...this.lastFrames]
     const text = this.lastTexts.join('')
     this.halt()
@@ -207,7 +214,7 @@ class TtsPlayer {
 
   /** Read one sentence with the platform voice when Edge TTS is unavailable. */
   speakFallback(text: string, frame?: VoiceFrame): void {
-    if (!this.active || !this.prefs.autoRead || !text.trim() || typeof SpeechSynthesisUtterance === 'undefined') return
+    if (!this.active || this.muted || !this.prefs.autoRead || !text.trim() || typeof SpeechSynthesisUtterance === 'undefined') return
     if (frame) this.note(frame)
     try {
       const utterance = new SpeechSynthesisUtterance(text)
@@ -220,7 +227,7 @@ class TtsPlayer {
   }
 
   enqueue(frame: VoiceFrame): void {
-    if (!this.active || !this.prefs.autoRead) return
+    if (!this.active || this.muted || !this.prefs.autoRead) return
     this.note(frame)
     this.queue.push(frame)
     if (!this.playing) this.playNext()
@@ -476,7 +483,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
         onLevel: (value) => setLevel(value),
-        onSpeechStart: () => sharedPlayer.duck(),
+        onSpeechStart: () => { sharedPlayer.unmute(); sharedPlayer.duck() },
         onSegment: (samples) => {
           queueRef.current.push(samples)
           void drain()
