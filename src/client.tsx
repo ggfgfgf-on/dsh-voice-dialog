@@ -458,12 +458,15 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   const [previewing, setPreviewing] = useState(false)
   const previewRef = useRef<HTMLAudioElement | null>(null)
   const previewUrl = useRef('')
+  const previewFallback = useRef(false)
   useEffect(() => { if (host) setVoice(host.voice) }, [host])
   useEffect(() => () => {
     previewRef.current?.pause()
     previewRef.current = null
     if (previewUrl.current) URL.revokeObjectURL(previewUrl.current)
     previewUrl.current = ''
+    if (previewFallback.current) window.speechSynthesis?.cancel()
+    previewFallback.current = false
   }, [])
 
   const stopPreview = (): void => {
@@ -471,7 +474,30 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     previewRef.current = null
     if (previewUrl.current) URL.revokeObjectURL(previewUrl.current)
     previewUrl.current = ''
+    if (previewFallback.current) window.speechSynthesis?.cancel()
+    previewFallback.current = false
     setPreviewing(false)
+  }
+
+  const speakPreviewFallback = (): boolean => {
+    if (typeof speechSynthesis === 'undefined' || typeof SpeechSynthesisUtterance === 'undefined') return false
+    const text = previewText.trim()
+    if (!text) return false
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.volume = prefs.volume
+    utterance.lang = /[\u3400-\u9fff]/.test(text) ? 'zh-CN' : 'en-US'
+    utterance.onend = () => { previewFallback.current = false; setPreviewing(false) }
+    utterance.onerror = () => {
+      previewFallback.current = false
+      setPreviewing(false)
+      setActionError('系统语音也无法试听')
+    }
+    window.speechSynthesis.cancel()
+    window.speechSynthesis.speak(utterance)
+    previewFallback.current = true
+    setPreviewing(true)
+    setActionError('Edge TTS 暂时不可达，已改用系统语音试听。')
+    return true
   }
 
   const changeVoice = async (next: string): Promise<void> => {
@@ -511,6 +537,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       await audio.play()
     } catch (failure) {
       stopPreview()
+      if (speakPreviewFallback()) return
       setActionError(failure instanceof Error ? failure.message : String(failure))
     } finally { setBusy(false) }
   }
@@ -624,7 +651,7 @@ const SETTINGS_CSS = `
 .dsh-vd-settings label { display: flex; align-items: center; gap: 10px; }
 .dsh-vd-settings label > input[type='range'] { flex: 1; min-width: 120px; accent-color: var(--dsw-alias-state-business-primary); }
 .dsh-vd-settings label > span { width: 40px; text-align: right; color: var(--dsw-alias-label-tertiary); }
-/* Native option popups ignore `color: inherit`; paint them with the theme surface. */
+/* Native option popups ignore color: inherit; paint them with the theme surface. */
 .dsh-vd-settings select { min-width: 180px; max-width: 100%; border: 1px solid var(--dsw-alias-border-l1); border-radius: 6px; padding: 6px 10px; background-color: var(--dsw-specific-selector); color: var(--dsw-alias-label-primary); font: inherit; }
 .dsh-vd-settings select option { background-color: var(--dsw-specific-selector); color: var(--dsw-alias-label-primary); }
 .dsh-vd-check { justify-content: flex-start; }
