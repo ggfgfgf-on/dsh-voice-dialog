@@ -5,15 +5,16 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 ## What it does
 
 - **One microphone, no mode button.** The composer microphone starts and stops continuous listening. There is no floating panel and no second toolbar control.
-- **Continuous dictation.** A small VAD closes an utterance after ~1.4 s of silence and transcribes it through DSH speech-to-text. Speech from the enrolled owner is sent with `session.prompt(..., "queue")` by default, so it waits for the current reply; a setting switches it to `steer` for immediate barge-in. Other speakers are queued by default. Up to three utterances are transcribed in parallel, in separate owner/guest lanes.
+- **Continuous dictation.** A small VAD closes an utterance after ~1.4 s of silence and transcribes it through DSH speech-to-text. Speech from the enrolled owner is sent with `session.prompt(..., "queue")` by default, so it waits for the current reply; a setting switches it to `steer` for immediate barge-in. Other speakers are queued by default. Up to three utterances are transcribed in parallel; recognition is parallel, while delivery is one strict FIFO queue in speaking order.
 - **Read-aloud while listening.** The host taps `llm/stream`, segments assistant text into sentences, synthesizes Edge TTS audio, and streams it over SSE. Playback is gated by the microphone: starting the mic enables it, stopping the mic stops accepting new sentences but drains the audio already queued. If Edge is unreachable, sentences use the platform speech voice instead of disappearing.
-- **Priority barge-in.** When you start speaking, the reply is ducked (not stopped). Owner speech is queued with `session.prompt(..., "queue")` by default, so the reply you are listening to is not cut off; the setting can switch it to `steer`. Guest speech is batched and queued the same way so a nearby interjection does not derail the current answer; guests can also be made to steer immediately or be ignored.
+- **Priority barge-in.** When you start speaking, the reply is ducked (not stopped). Owner speech is queued with `session.prompt(..., "queue")` by default, so the reply you are listening to is not cut off; the setting can switch it to `steer`. Guest speech enters the same FIFO queue in speaking order, so a nearby interjection does not derail the current answer; guests can also be made to steer immediately or be ignored.
+- **Queue-aware voice commands.** A leading “打断 / 停一下” stops playback, clears the not-yet-sent queue, and steers the remaining request in immediately. “忽略客人1 / 别理老婆” updates the speaker policy on the spot and removes that guest's waiting lines; “恢复” queues them again. Ordinary lines keep strict speaking order.
 - **No chain-of-thought reading.** Compaction and session-title calls are filtered by `GenerateOptions.purpose`. Reasoning is scanned only for explicit `[[voice: ...]]` directives; its text is never spoken wholesale. Tool arguments never reach TTS.
 - **Model-directed speech.** The model can choose the exact spoken words from reasoning: `[[voice: 要说的内容]]`, `[[voice: volume +0.15]]`, `[[voice: rate +10]]`, `[[voice: repeat]]`, `[[voice: stop]]`. A say marker adds a spoken prefix rather than replacing the visible answer. The same rate control is exposed to the model through the `voice_dialog` tool, so “说慢一点/说快一点/语速调到…” adjusts following sentences immediately.
 - **Model-facing voice control.** A `voice_dialog` tool lets the model react to spoken meta-commands: 轻一点/响一点 (`volume`), 听不清/什么/重复一遍 (`repeat`), 别说了/闭嘴/停 (`stop`). The host broadcasts the action to the browser over the same SSE stream. `stop` also mutes new sentences until the user speaks again. The same actions and exact speech are available as reasoning markers, so the model can decide naturally without a tool call.
 - **Background subagents.** While the microphone is active, the host records that parent session's voice state. When a subagent finishes, its final assistant text is summarized and queued straight into the parent's TTS stream, so the result is spoken without starting another main-model turn. A short heartbeat expires the state if the tab disappears.
 - **Speaker labels and priority.** A local CAM++ voiceprint model (run by `sherpa-onnx-node`, no cloud call) identifies the enrolled owner and clusters other voices. Each transcript is prefixed with `[声纹：我]` or `[声纹：客人1]`, so the model can tell who is speaking. The owner is high priority; guests are low priority. Confirmed owner utterances slowly reinforce the template, and the optional **只回应我的声音** switch drops utterances that do not match. The model can also decide per speaker: `voice_dialog` action `speaker` with `speaker: "客人1"` and `policy: "ignore"` drops that guest's future lines, `"queue"` restores queuing, and `speaker: "*"` applies to all guests. A `name` renames the voiceprint (for example `"老婆"`), after which both the canonical label and the new name work for policies and transcripts. The owner `我` cannot be renamed or ignored. One microphone cannot physically separate two voices speaking at the exact same instant; back-to-back interjections are recognized in parallel, while true overlap still needs two microphones or source separation.
-- **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation, guest-interjection policy, parallel recognition and input device all live in the plugin page under **Plugins → dsh-voice-dialog**. The active microphone expands into the built-in capture-row style with a live waveform, cancel and stop controls.
+- **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation, owner/guest delivery policy, parallel recognition and input device all live in the plugin page under **Plugins → dsh-voice-dialog**. The active microphone expands into the built-in capture-row style with a live waveform, cancel and stop controls.
 
 ## Requirements
 
@@ -74,7 +75,7 @@ All preferences are in **Plugins → dsh-voice-dialog**:
 | Model preparation | DSH speech host | Download / cancel / retry |
 | Speech rate | Host `~/.dsh/voice-dialog/settings.json` | -50%..+50%; the model can change it too |
 | Speaker prefix, only-my-voice, threshold | Browser `localStorage` | Prefix / gate behavior |
-| Owner delivery, guest interjection policy, parallel ASR | Browser `localStorage` | Owner queues by default (or steers); guests queue (default), steer, or ignore; up to 3 ASR lanes |
+| Owner delivery, guest interjection policy, parallel ASR | Browser `localStorage` | Owner queues by default (or steers); guests queue (default), steer, or ignore; up to 3 ASR lanes, strict FIFO delivery |
 | Owner voiceprint | Host `~/.dsh/voice-dialog/voiceprint.json` | Embedding only; original audio is not stored |
 | Voiceprint model | Host `~/.dsh/voice-dialog/models/` | Downloaded from the settings page |
 
@@ -87,14 +88,14 @@ llm/stream ──filter(purpose, text-delta)──► SentenceSegmenter ──�
                                                                                    ▲
 subagent/end ──parent voice-state──► summary ───────────────────────────────────────┘
                                                                                    │
-composer microphone ──► MicrophoneLoop(VAD) ──► parallel ASR ──► owner lane: prompt(queue, steer optional)
-                                                              └──► guest lane: prompt(queue)
+composer microphone ──► MicrophoneLoop(VAD) ──► parallel ASR ──► global FIFO queue ──► prompt(queue)
+                                                                  └──► interrupt/ignore controls
                                                                                    │
 SSE ──► TtsPlayer(Web Audio gain) ◄── duck on speech start ────────────────────────┘
 ```
 
 - The host never reads reasoning, tool arguments, compaction summaries or session titles.
-- A reply is **not** cancelled on barge-in. Only playback gain is ducked. Owner speech queues by default and reaches the model after this reply; guest speech waits in a separate queue and is batched into one prompt. Neither lane can overtake the other.
+- A reply is **not** cancelled on barge-in. Only playback gain is ducked. Owner and guest speech share one FIFO queue in speaking order, so a faster ASR result cannot overtake an earlier utterance; only an explicit “打断” command stops playback and clears the unsent queue.
 - The generated speech Remote contribution is vendored in `src/speech-remote.js`, so the client does not need the built-in voice-input UI module to mount it.
 
 ## Privacy
@@ -122,7 +123,7 @@ npm run build
 npm test
 ```
 
-`npm run build` creates the host ESM bundle, the client `__ModuleLoader__` closure, and plain-node test surfaces. `npm test` covers priority-lane delivery, sentence segmentation, Markdown filtering, the no-CoT filter, WAV encoding, voice switching and the voiceprint WAV decoder/cosine helper. The native voiceprint model is exercised separately in development; it is not downloaded by `npm test`.
+`npm run build` creates the host ESM bundle, the client `__ModuleLoader__` closure, and plain-node test surfaces. `npm test` covers strict FIFO delivery, queue-aware voice commands, sentence segmentation, Markdown filtering, the no-CoT filter, WAV encoding, voice switching and the voiceprint WAV decoder/cosine helper. The native voiceprint model is exercised separately in development; it is not downloaded by `npm test`.
 
 ## License
 

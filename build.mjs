@@ -100,6 +100,15 @@ await build({
 })
 
 await build({
+  entryPoints: ['src/queue-control.ts'],
+  outfile: 'lib/queue-control.js',
+  bundle: false,
+  format: 'esm',
+  platform: 'node',
+  logLevel: 'silent',
+})
+
+await build({
   entryPoints: ['src/speaker-policy.ts'],
   outfile: 'lib/speaker-policy.js',
   bundle: false,

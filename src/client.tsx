@@ -718,7 +718,26 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     },
     ownerMode: () => getPreferences().ownerMode,
     guestMode: (label) => effectiveGuestMode(sessionId, label),
-    batchMs: 900,
+    resolveSpeaker: (name) => speakerPolicy.resolve(sessionId, name),
+    onControl: (control) => {
+      if (control.action === 'interrupt') {
+        sharedPlayer.control({ action: 'stop' })
+        sharedPlayer.unmute()
+        // With a follow-up request the scheduler sends it as a steer, which
+        // already interrupts the turn. A bare "打断" needs an explicit cancel.
+        if (!control.rest) {
+          const session = ctx.sessions.binding(sessionId)?.session
+          void session?.cancel().catch((failure: unknown) => {
+            console.warn('[dsh-voice-dialog] cancel after interrupt failed', failure)
+          })
+        }
+        return
+      }
+      if (speakerPolicy.apply(sessionId, { speaker: control.target, policy: control.policy })) {
+        const who = control.target === '*' ? '所有其他人' : displaySpeaker(sessionId, control.target)
+        setSpeaker(control.policy === 'ignore' ? '已忽略' + who : control.policy === 'queue' ? '已恢复' + who : '允许' + who + '直接插话')
+      }
+    },
     onStatus: ({ active, queued }) => {
       setPending(active)
       setQueued(queued)
@@ -792,8 +811,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   }
 
   const activity = pending > 0
-    ? queued > 0 ? `并行识别 ${pending} 段 · ${queued} 条其他人插话排队` : `正在并行识别（${pending}）…`
-    : queued > 0 ? `其他人插话排队（${queued}）…` : ''
+    ? queued > 0 ? `并行识别 ${pending} 段 · ${queued} 条语音排队` : `正在并行识别（${pending}）…`
+    : queued > 0 ? `语音排队（${queued}）…` : ''
   const label = error || (active
     ? activity || (speaker ? `正在听…（${speaker}）` : '正在听…点击结束')
     : '语音对话：点一下开始，多人插话按优先级排队，回答自动朗读')
@@ -1191,7 +1210,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
 
     <section>
       <h3>多人插话</h3>
-      <p className="dsh-vd-muted">主人优先，默认不抢当前回答。排队的内容会合成一条低优先级消息，等模型这一轮结束再送进去。</p>
+      <p className="dsh-vd-muted">主人优先，默认不抢当前回答。所有语音按说话先后排一条队列，后来的话不会因为识别更快就超车。</p>
       <label>我说话时<select value={prefs.ownerMode} disabled={busy}
         onChange={(event) => { save({ ownerMode: event.target.value as VoiceDialogPreferences['ownerMode'] }) }}>
         <option value="queue">等当前回答说完（默认）</option>
@@ -1206,6 +1225,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       <label className="dsh-vd-check"><input type="checkbox" checked={prefs.parallelAsr}
         onChange={(event) => { save({ parallelAsr: event.target.checked }) }} />并行识别多段语音（最多三路）</label>
       <p className="dsh-vd-muted">先后接话的多个人可以同时识别，互不阻塞。同一个瞬间两个人同时开口，仍可能被当成一段音频；完全分离需要双麦克风或额外的声源分离。</p>
+      <p className="dsh-vd-muted">最新一句说“打断 / 停一下”，会立刻停朗读并清掉还没送出的队列；说“忽略客人1 / 别理老婆”，会当场改策略并删掉那个人排队的句子；说“恢复”重新排队。</p>
       <p className="dsh-vd-muted">模型也能按声纹临时调整：如果某个客人总在插无关的话，可以让模型忽略他；也可以让模型给声纹起名，比如“这个是我老婆”，之后就用老婆称呼。主人不会被忽略。这些调整只在当前会话内存里生效，刷新页面就恢复默认。</p>
       <p className="dsh-vd-muted">没登记我的声纹时无法区分主人和客人，所有语音都按主人处理。</p>
     </section>

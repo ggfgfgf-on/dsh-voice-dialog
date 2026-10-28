@@ -1,177 +1,202 @@
-/** Priority-aware delivery for concurrent multi-speaker transcripts. */
+/** Strict FIFO delivery for concurrent multi-speaker transcripts. */
+import { parseQueueControl, type QueueControl } from './queue-control.js'
 
 export type SpeakerLane = 'owner' | 'guest'
 export type GuestMode = 'queue' | 'steer' | 'ignore'
 export type PromptMode = 'steer' | 'queue'
 
 export interface SchedulerStatus {
-  /** Transcripts still being recognized or delivered. */
+  /** Transcripts still being recognized. */
   active: number
-  /** Guest transcripts waiting for the current reply to finish. */
+  /** Captured utterances not yet handed to the model. */
   queued: number
 }
+
+export type QueueControlEvent =
+  | { action: 'interrupt'; rest: string }
+  | { action: 'speaker'; target: string; policy: 'ignore' | 'queue' | 'steer' }
 
 export interface SpeechSchedulerOptions {
   deliver: (text: string, mode: PromptMode) => Promise<void>
   /** Owner delivery. Defaults to "steer" for backward compatibility. */
   ownerMode?: () => PromptMode
   guestMode: (label: string) => GuestMode
-  /** How long to gather consecutive guest lines into one queued prompt. */
-  batchMs?: number
+  /** Resolve a display name such as 老婆 back to the canonical voiceprint label. */
+  resolveSpeaker?: (name: string) => string
+  /** Apply an explicit queue command that must not reach the model as text. */
+  onControl?: (control: QueueControlEvent) => void
   onStatus?: (status: SchedulerStatus) => void
   onError?: (error: unknown) => void
 }
 
+interface Entry {
+  seq: number
+  lane: SpeakerLane
+  label: string
+  ready: boolean
+  text: string | null
+  dropped: boolean
+}
+
 /**
- * Two ordered lanes share one model turn:
- *
- * - owner speech is delivered by `ownerMode`: "queue" waits for the running
- *   reply (the default in the app), "steer" interrupts it immediately;
- * - guest speech is either batched behind the running reply ("queue"), sent
- *   immediately ("steer"), or dropped ("ignore").
- *
- * The caller may launch transcription in parallel; each lane still delivers in
- * utterance order, and a slow guest transcript never holds up the owner.
+ * Every captured utterance gets a sequence number when it is enqueued, and the
+ * scheduler drains them in that order. Recognition may finish out of order, but
+ * a later line cannot overtake an earlier one. Only an explicit owner command
+ * such as "打断" acts immediately; it also drops the still-waiting queue.
  */
 export class SpeechScheduler {
-  private ownerChain: Promise<void> = Promise.resolve()
-  private guestChain: Promise<void> = Promise.resolve()
-  private pending: Array<{ label: string; text: string }> = []
-  private timer: ReturnType<typeof setTimeout> | undefined
+  private entries: Entry[] = []
+  private nextSeq = 0
   private active = 0
   private closed = false
-  private readonly batchMs: number
+  private draining = false
+  private lastGuestLabel = ''
+  private controlChain: Promise<void> = Promise.resolve()
 
-  constructor(private readonly options: SpeechSchedulerOptions) {
-    this.batchMs = Math.max(0, options.batchMs ?? 900)
-  }
+  constructor(private readonly options: SpeechSchedulerOptions) {}
 
   /** Start tracking one utterance whose text will arrive asynchronously. */
   enqueue(lane: SpeakerLane, label: string, work: Promise<string | null>): void {
     if (this.closed) return
+    if (lane === 'guest' && label) this.lastGuestLabel = label
+    const entry: Entry = {
+      seq: this.nextSeq++,
+      lane,
+      label,
+      ready: false,
+      text: null,
+      dropped: false,
+    }
+    this.entries.push(entry)
     this.active += 1
     this.emit()
 
-    const resolve = async (): Promise<string | null> => {
-      try {
-        const text = await work
-        return typeof text === 'string' && text.trim() ? text.trim() : null
-      } catch (error) {
-        this.options.onError?.(error)
-        return null
-      }
-    }
-
-    if (lane === 'owner') {
-      this.ownerChain = this.ownerChain.then(async () => {
-        try {
-          const text = await resolve()
-          if (text) await this.options.deliver(text, this.options.ownerMode?.() ?? 'steer')
-        } catch (error) {
-          this.options.onError?.(error)
-        } finally {
-          this.active = Math.max(0, this.active - 1)
-          this.emit()
-        }
-      })
-      return
-    }
-
-    const mode = this.options.guestMode(label)
-    if (mode === 'ignore') {
-      void work.catch((error: unknown) => { this.options.onError?.(error) })
+    void work.then((value) => {
       this.active = Math.max(0, this.active - 1)
-      this.emit()
-      return
-    }
-
-    if (mode === 'steer') {
-      this.guestChain = this.guestChain.then(async () => {
-        try {
-          const text = await resolve()
-          if (text) await this.options.deliver(text, 'steer')
-        } catch (error) {
-          this.options.onError?.(error)
-        } finally {
-          this.active = Math.max(0, this.active - 1)
+      // A control command may already have dropped this entry.
+      if (!this.entries.includes(entry)) { this.emit(); return }
+      entry.ready = true
+      entry.text = typeof value === 'string' && value.trim() ? value.trim() : null
+      if (entry.lane === 'owner' && entry.text) {
+        const control = parseQueueControl(entry.text)
+        if (control) {
+          entry.dropped = true
+          this.remove(entry)
+          this.applyControl(control, entry)
           this.emit()
+          this.drain()
+          return
         }
-      })
-      return
-    }
-
-    this.guestChain = this.guestChain.then(async () => {
-      try {
-        const text = await resolve()
-        if (text) {
-          this.pending.push({ label, text })
-          this.schedule()
-        }
-      } catch (error) {
-        this.options.onError?.(error)
-      } finally {
-        this.active = Math.max(0, this.active - 1)
-        this.emit()
       }
+      this.emit()
+      this.drain()
+    }, (error: unknown) => {
+      this.active = Math.max(0, this.active - 1)
+      entry.ready = true
+      entry.text = null
+      this.options.onError?.(error)
+      this.emit()
+      this.drain()
     })
   }
 
-  /** Send every waiting guest line immediately as one queued prompt. */
+  /** Send every ready utterance in order. Retained for compatibility. */
   flushGuests(): void {
-    if (this.timer !== undefined) {
-      clearTimeout(this.timer)
-      this.timer = undefined
-    }
-    if (this.pending.length === 0) return
-    const batch = this.pending
-    this.pending = []
-    this.emit()
-    // A model policy may have changed while these lines were waiting. Drop
-    // only the speakers it now ignores; keep the rest in one queued prompt.
-    const allowed = batch.filter((item) => this.options.guestMode(item.label) !== 'ignore')
-    if (allowed.length === 0) return
-    const text = allowed.map((item) => item.text).join('\n')
-    this.guestChain = this.guestChain.then(async () => {
-      try {
-        await this.options.deliver(text, 'queue')
-      } catch (error) {
-        this.options.onError?.(error)
-      }
-    })
+    this.drain()
   }
 
-  /** Stop accepting work, but keep already captured guest lines. */
+  /** Stop accepting work, but keep already captured utterances. */
   dispose(): void {
-    if (this.closed) return
-    this.flushGuests()
     this.closed = true
-    if (this.timer !== undefined) {
-      clearTimeout(this.timer)
-      this.timer = undefined
-    }
+    this.drain()
   }
 
   status(): SchedulerStatus {
-    return { active: this.active, queued: this.pending.length }
+    return { active: this.active, queued: this.entries.length }
   }
 
-  private schedule(): void {
-    // In-flight transcripts may arrive after dispose(); they are already
-    // captured speech, so still deliver them as one final batch.
-    if (this.timer !== undefined || this.pending.length === 0) return
-    if (this.batchMs === 0) {
-      this.flushGuests()
+  private remove(entry: Entry): void {
+    this.entries = this.entries.filter((item) => item !== entry)
+  }
+
+  private applyControl(control: QueueControl, entry: Entry): void {
+    if (control.action === 'interrupt') {
+      const prefix = entry.text?.match(/^\s*\[声纹：[^\]]*\]\s*/u)?.[0] ?? ''
+      this.dropAll()
+      this.options.onControl?.({ action: 'interrupt', rest: control.rest })
+      if (control.rest) {
+        const rest = prefix + control.rest
+        this.controlChain = this.controlChain.then(async () => {
+          try {
+            await this.options.deliver(rest, 'steer')
+          } catch (error) {
+            this.options.onError?.(error)
+          }
+        })
+      }
       return
     }
-    this.timer = setTimeout(() => {
-      this.timer = undefined
-      this.flushGuests()
-    }, this.batchMs)
+
+    let target = control.target
+    if (!target || /^(?:他|她|它|这个|那个|这个人|那个人)$/u.test(target)) target = this.lastGuestLabel
+    if (!target) target = '*'
+    const canonical = target === '*' ? '*' : (this.options.resolveSpeaker?.(target) ?? target)
+    if (canonical === '我') return
+
+    this.entries = this.entries.filter((item) => {
+      if (item.lane !== 'guest') return true
+      return !(canonical === '*' || item.label === canonical)
+    })
+    this.options.onControl?.({ action: 'speaker', target: canonical, policy: control.policy })
+  }
+
+  private dropAll(): void {
+    this.entries = []
+  }
+
+  private drain(): void {
+    if (this.draining) return
+    this.draining = true
+    void this.pump().finally(() => {
+      this.draining = false
+      if (this.entries[0]?.ready) this.drain()
+    })
+  }
+
+  private async pump(): Promise<void> {
+    while (this.entries.length > 0) {
+      const entry = this.entries[0]!
+      if (!entry.ready) return
+      this.entries.shift()
+      if (entry.dropped || !entry.text) {
+        this.emit()
+        continue
+      }
+
+      let mode: PromptMode
+      if (entry.lane === 'owner') {
+        mode = this.options.ownerMode?.() ?? 'steer'
+      } else {
+        const guest = this.options.guestMode(entry.label)
+        if (guest === 'ignore') {
+          this.emit()
+          continue
+        }
+        mode = guest === 'steer' ? 'steer' : 'queue'
+      }
+
+      try {
+        await this.options.deliver(entry.text, mode)
+      } catch (error) {
+        this.options.onError?.(error)
+      }
+      this.emit()
+    }
   }
 
   private emit(): void {
     try {
-      this.options.onStatus?.({ active: this.active, queued: this.pending.length })
+      this.options.onStatus?.({ active: this.active, queued: this.entries.length })
     } catch {
       // Status UI must never break delivery.
     }
