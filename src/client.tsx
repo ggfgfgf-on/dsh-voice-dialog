@@ -1,8 +1,8 @@
 /** dsh-voice-dialog client half: one microphone, continuous ASR steering, auto-read. */
 import * as React from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
-  Button, IconMicrophoneOutlineRegular, IconStopFillRegular, Tooltip,
+  Button, IconCloseOutlineRegular, IconMicrophoneOutlineRegular, IconStopFillRegular, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import speechRemote from './speech-remote.js'
 import { MicrophoneLoop } from './mic.ts'
@@ -17,9 +17,16 @@ const BUNDLE_ID = 'dsh-voice-dialog'
 interface VoiceFrame {
   sessionId: string
   seq: number
+  replyId?: string
   text: string
   audio: string
   error?: string
+}
+
+interface VoiceControl {
+  action: 'volume' | 'stop' | 'repeat'
+  level?: number
+  delta?: number
 }
 
 interface HostConfig {
@@ -98,6 +105,11 @@ class TtsPlayer {
   private playing = false
   private ducked = false
   private blocked = false
+  private active = false
+  private volumeOverride: number | undefined
+  private lastReplyId: string | undefined
+  private lastTexts: string[] = []
+  private lastFrames: VoiceFrame[] = []
   private readonly unsubscribe = subscribePreferences((value) => {
     this.prefs = value
     if (!value.autoRead) this.clear()
@@ -110,6 +122,73 @@ class TtsPlayer {
     if (this.blocked && this.queue.length > 0) {
       this.blocked = false
       this.playNext()
+    }
+  }
+
+  /** Read-aloud is only live while the microphone is listening. */
+  beginSession(): void {
+    this.active = true
+    void this.enable()
+  }
+
+  /** Stop accepting new sentences; already queued audio keeps playing. */
+  endSession(): void {
+    this.active = false
+  }
+
+  /** Apply a control broadcast from the model-facing voice_dialog tool. */
+  control(control: VoiceControl): void {
+    if (control.action === 'stop') { this.stopAll(); return }
+    if (control.action === 'repeat') { this.repeatLast(); return }
+    if (control.action === 'volume') {
+      const base = this.currentVolume()
+      const next = typeof control.level === 'number' ? control.level : base + (control.delta ?? 0)
+      this.volumeOverride = Math.max(0, Math.min(1, next))
+      this.applyGain()
+    }
+  }
+
+  /** Remember one frame for "repeat that" even when it used the system voice. */
+  note(frame: VoiceFrame): void {
+    if (frame.replyId !== this.lastReplyId) {
+      this.lastReplyId = frame.replyId
+      this.lastTexts = []
+      this.lastFrames = []
+    }
+    this.lastTexts.push(frame.text)
+    if (frame.audio.length > 0 && !frame.error) this.lastFrames.push(frame)
+    if (this.lastTexts.length > 80) this.lastTexts.shift()
+    if (this.lastFrames.length > 80) this.lastFrames.shift()
+  }
+
+  private currentVolume(): number {
+    return Math.max(0, Math.min(1, this.volumeOverride ?? this.prefs.volume))
+  }
+
+  private halt(): void {
+    this.queue.length = 0
+    this.audio.pause()
+    this.cleanupUrl()
+    try { window.speechSynthesis?.cancel() } catch { /* unsupported */ }
+    this.playing = false
+    this.ducked = false
+    this.blocked = false
+  }
+
+  private stopAll(): void {
+    // Keep the last reply in memory: "闭嘴" followed by "重复一遍" is valid.
+    this.halt()
+  }
+
+  private repeatLast(): void {
+    const frames = [...this.lastFrames]
+    const text = this.lastTexts.join('')
+    this.halt()
+    if (frames.length > 0) {
+      this.queue.push(...frames)
+      this.playNext()
+    } else if (text.trim()) {
+      this.speakFallback(text)
     }
   }
 
@@ -127,11 +206,12 @@ class TtsPlayer {
   }
 
   /** Read one sentence with the platform voice when Edge TTS is unavailable. */
-  speakFallback(text: string): void {
-    if (!this.prefs.autoRead || !text.trim() || typeof SpeechSynthesisUtterance === 'undefined') return
+  speakFallback(text: string, frame?: VoiceFrame): void {
+    if (!this.active || !this.prefs.autoRead || !text.trim() || typeof SpeechSynthesisUtterance === 'undefined') return
+    if (frame) this.note(frame)
     try {
       const utterance = new SpeechSynthesisUtterance(text)
-      utterance.volume = this.prefs.volume
+      utterance.volume = this.currentVolume()
       utterance.lang = /[\u3400-\u9fff]/.test(text) ? 'zh-CN' : 'en-US'
       window.speechSynthesis.speak(utterance)
     } catch {
@@ -140,7 +220,8 @@ class TtsPlayer {
   }
 
   enqueue(frame: VoiceFrame): void {
-    if (!this.prefs.autoRead) return
+    if (!this.active || !this.prefs.autoRead) return
+    this.note(frame)
     this.queue.push(frame)
     if (!this.playing) this.playNext()
   }
@@ -153,6 +234,9 @@ class TtsPlayer {
     this.playing = false
     this.ducked = false
     this.blocked = false
+    this.lastTexts = []
+    this.lastFrames = []
+    this.lastReplyId = undefined
   }
 
   private ensureContext(): void {
@@ -169,7 +253,7 @@ class TtsPlayer {
 
   private applyGain(): void {
     if (!this.gain || !this.context) return
-    const target = this.ducked ? this.prefs.volume * this.prefs.duckLevel : this.prefs.volume
+    const target = this.currentVolume() * (this.ducked ? this.prefs.duckLevel : 1)
     this.gain.gain.setTargetAtTime(target, this.context.currentTime, 0.08)
   }
 
@@ -217,10 +301,17 @@ function useAutoRead(sessionId: string): void {
           try {
             const frame = JSON.parse((event as MessageEvent<string>).data) as VoiceFrame
             if (frame.sessionId !== sessionId) return
-            if (frame.error || !frame.audio) sharedPlayer.speakFallback(frame.text)
+            if (frame.error || !frame.audio) sharedPlayer.speakFallback(frame.text, frame)
             else sharedPlayer.enqueue(frame)
           } catch {
             // A malformed frame must not tear down the stream.
+          }
+        })
+        source.addEventListener('control', (event) => {
+          try {
+            sharedPlayer.control(JSON.parse((event as MessageEvent<string>).data) as VoiceControl)
+          } catch {
+            // A malformed control frame must not tear down the stream.
           }
         })
       })
@@ -269,10 +360,27 @@ export async function apply(ctx: any): Promise<() => Promise<void>> {
 interface VoiceMicProps {
   ctx: any
   sessionId: string
+  /** Composer expansion hook used by the built-in voice input row. */
+  onActiveChange?: (active: boolean) => void
 }
 
-function VoiceMic({ ctx, sessionId }: VoiceMicProps) {
+/** Compact live amplitude history in the built-in capture-row style. */
+function LiveWave({ level }: { level: number }) {
+  const [levels, setLevels] = useState<number[]>(() => Array(48).fill(0))
+  useEffect(() => { setLevels((previous) => [...previous.slice(1), level]) }, [level])
+  return <svg className="dsh-vd-wave" viewBox="0 0 640 40" preserveAspectRatio="none" role="img" aria-label="麦克风音量">
+    {levels.map((value, index) => {
+      const height = 1 + Math.min(1, value * 5) * 17
+      return <line key={index} x1={index * 13.2 + 6} x2={index * 13.2 + 6}
+        y1={20 - height} y2={20 + height} stroke="currentColor" strokeWidth="6"
+        strokeLinecap="round" opacity={0.25 + index / 96} />
+    })}
+  </svg>
+}
+
+function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const [active, setActive] = useState(false)
+  const [level, setLevel] = useState(0)
   const [phase, setPhase] = useState<'idle' | 'starting' | 'listening'>('idle')
   const [pending, setPending] = useState(0)
   const [error, setError] = useState('')
@@ -280,13 +388,20 @@ function VoiceMic({ ctx, sessionId }: VoiceMicProps) {
   const queueRef = useRef<Float32Array[]>([])
   const processing = useRef(false)
   useAutoRead(sessionId)
+  useLayoutEffect(() => {
+    onActiveChange?.(active)
+    return () => { onActiveChange?.(false) }
+  }, [active, onActiveChange])
 
   const stop = async (): Promise<void> => {
     await micRef.current?.stop()
     micRef.current = null
-    queueRef.current.length = 0
+    // Keep already captured segments: stopping the microphone must not lose
+    // the last sentence the user just spoke.
     setActive(false)
     setPhase('idle')
+    setLevel(0)
+    sharedPlayer.endSession()
     sharedPlayer.restore()
   }
 
@@ -298,6 +413,7 @@ function VoiceMic({ ctx, sessionId }: VoiceMicProps) {
       void micRef.current?.stop()
       micRef.current = null
       queueRef.current.length = 0
+      sharedPlayer.endSession()
       sharedPlayer.restore()
     }
   }, [sessionId])
@@ -359,6 +475,7 @@ function VoiceMic({ ctx, sessionId }: VoiceMicProps) {
       await sharedPlayer.enable()
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
+        onLevel: (value) => setLevel(value),
         onSpeechStart: () => sharedPlayer.duck(),
         onSegment: (samples) => {
           queueRef.current.push(samples)
@@ -370,6 +487,7 @@ function VoiceMic({ ctx, sessionId }: VoiceMicProps) {
       })
       await mic.start()
       micRef.current = mic
+      sharedPlayer.beginSession()
       setActive(true)
       setPhase('listening')
     } catch (failure) {
@@ -388,17 +506,28 @@ function VoiceMic({ ctx, sessionId }: VoiceMicProps) {
     ? pending > 0 ? `正在识别并插入（${pending}）…` : '正在听…点击结束'
     : '语音对话：点一下开始，停顿后自动插入，回答自动朗读')
 
+  if (active) return <>
+    <style>{MIC_CSS}</style>
+    <div className="dsh-vd-captureRow" data-voice-activity={pending > 0 ? 'transcribing' : 'recording'}>
+      <Button type="button" className="dsh-vd-round" size="sm" aria-label="结束语音对话"
+        onClick={() => { void stop() }}><IconCloseOutlineRegular size={14} /></Button>
+      {pending > 0 || error
+        ? <span className="dsh-vd-activity" role="status">{error || `正在识别并插入（${pending}）…`}</span>
+        : <LiveWave level={level} />}
+      <Button type="button" className="dsh-vd-round" size="sm" aria-label="结束语音对话"
+        onClick={() => { void stop() }}><IconStopFillRegular size={14} /></Button>
+    </div>
+  </>
+
   return <>
     <style>{MIC_CSS}</style>
     <Tooltip label={label} side="top" portal>
       <span className="dsh-vd-anchor">
         <Button className="dsh-vd-mic" size="sm" disabled={phase === 'starting'}
-          aria-label={error ? `语音对话出错：${error}` : active ? '结束语音对话' : '开始语音对话'}
-          aria-pressed={active} onClick={toggle}
-          style={active ? { background: 'var(--dsw-alias-state-error-primary)', color: '#fff' } : undefined}>
-          {active ? <IconStopFillRegular size={16} /> : <IconMicrophoneOutlineRegular size={18} />}
+          aria-label={error ? `语音对话出错：${error}` : '开始语音对话'}
+          aria-busy={phase === 'starting'} onClick={toggle}>
+          <IconMicrophoneOutlineRegular size={18} />
         </Button>
-        {active && <span className={`dsh-vd-pulse${pending > 0 ? ' dsh-vd-busy' : ''}`} />}
       </span>
     </Tooltip>
   </>
@@ -407,12 +536,14 @@ function VoiceMic({ ctx, sessionId }: VoiceMicProps) {
 const MIC_CSS = `
 .dsh-vd-anchor { position: relative; display: inline-flex; flex: none; }
 .dsh-vd-mic { width: 28px; padding: 0; flex: none; }
-.dsh-vd-mic[aria-pressed='true'] { animation: dsh-vd-breathe 2.4s ease-in-out infinite; }
-.dsh-vd-pulse { position: absolute; top: -1px; right: -1px; width: 7px; height: 7px; border-radius: 50%;
-  background: var(--dsw-alias-state-error-primary); pointer-events: none; }
-.dsh-vd-pulse.dsh-vd-busy { animation: dsh-vd-pulse .8s ease-out infinite; }
-@keyframes dsh-vd-pulse { 0% { box-shadow: 0 0 0 0 rgba(220,60,60,.55); } 100% { box-shadow: 0 0 0 5px rgba(220,60,60,0); } }
-@keyframes dsh-vd-breathe { 0%,100% { opacity: 1; } 50% { opacity: .72; } }
+.dsh-vd-captureRow { display: flex; align-items: center; gap: 12px; width: 100%; min-width: 0; min-height: 34px; }
+.dsh-vd-round { width: 32px; height: 32px; padding: 0; border-radius: 50%; flex: none;
+  background: var(--dsw-specific-selector); }
+.dsh-vd-round:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover-solid); }
+.dsh-vd-wave { display: block; flex: 1; width: 0; height: 24px; min-width: 24px;
+  color: var(--dsw-alias-label-secondary); }
+.dsh-vd-activity { display: flex; align-items: center; flex: 1; min-width: 0; font-size: 12px;
+  color: var(--dsw-alias-label-secondary); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 `
 
 interface VoiceSettingsProps {
@@ -459,17 +590,20 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   const previewRef = useRef<HTMLAudioElement | null>(null)
   const previewUrl = useRef('')
   const previewFallback = useRef(false)
+  const previewToken = useRef(0)
   useEffect(() => { if (host) setVoice(host.voice) }, [host])
   useEffect(() => () => {
     previewRef.current?.pause()
     previewRef.current = null
     if (previewUrl.current) URL.revokeObjectURL(previewUrl.current)
     previewUrl.current = ''
+    previewToken.current++
     if (previewFallback.current) window.speechSynthesis?.cancel()
     previewFallback.current = false
   }, [])
 
   const stopPreview = (): void => {
+    previewToken.current++
     previewRef.current?.pause()
     previewRef.current = null
     if (previewUrl.current) URL.revokeObjectURL(previewUrl.current)
@@ -483,16 +617,23 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     if (typeof speechSynthesis === 'undefined' || typeof SpeechSynthesisUtterance === 'undefined') return false
     const text = previewText.trim()
     if (!text) return false
+    const token = ++previewToken.current
     const utterance = new SpeechSynthesisUtterance(text)
     utterance.volume = prefs.volume
     utterance.lang = /[\u3400-\u9fff]/.test(text) ? 'zh-CN' : 'en-US'
-    utterance.onend = () => { previewFallback.current = false; setPreviewing(false) }
-    utterance.onerror = () => {
+    utterance.onend = () => {
+      if (token !== previewToken.current) return
       previewFallback.current = false
       setPreviewing(false)
-      setActionError('系统语音也无法试听')
+    }
+    utterance.onerror = (event) => {
+      if (token !== previewToken.current) return
+      previewFallback.current = false
+      setPreviewing(false)
+      if (event.error !== 'interrupted' && event.error !== 'canceled') setActionError('系统语音也无法试听')
     }
     window.speechSynthesis.cancel()
+    window.speechSynthesis.resume()
     window.speechSynthesis.speak(utterance)
     previewFallback.current = true
     setPreviewing(true)

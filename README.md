@@ -1,15 +1,16 @@
 # dsh-voice-dialog
 
-Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): one microphone in the composer, automatic read-aloud of assistant replies, and soft interruptions that are handed to the running model instead of hard-cancelling it.
+Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): one microphone in the composer, read-aloud while voice input is active, model-controlled voice intents, and soft interruptions that are handed to the running model instead of hard-cancelling it.
 
 ## What it does
 
 - **One microphone, no mode button.** The composer microphone starts and stops continuous listening. There is no floating panel and no second toolbar control.
 - **Continuous dictation.** A small VAD closes an utterance after ~1.4 s of silence, transcribes it through DSH speech-to-text, and sends the text with `session.prompt(..., "steer")`. If the assistant is still talking, the text is delivered at its next step boundary.
-- **Automatic read-aloud.** The host taps `llm/stream`, segments visible assistant text into sentences, synthesizes Edge TTS audio, and streams it over SSE. The browser queues playback. If the Edge endpoint is unreachable, that sentence falls back to the platform speech voice instead of disappearing.
+- **Read-aloud while listening.** The host taps `llm/stream`, segments assistant text into sentences, synthesizes Edge TTS audio, and streams it over SSE. Playback is gated by the microphone: starting the mic enables it, stopping the mic stops accepting new sentences but drains the audio already queued. If Edge is unreachable, sentences use the platform speech voice instead of disappearing.
 - **Soft barge-in.** When you start speaking, the reply is ducked (not stopped). The transcript is steered into the model. The assistant may finish its current thought, and its remaining audio is not cancelled.
 - **No chain-of-thought.** Compaction and session-title calls are filtered by `GenerateOptions.purpose`; only `text-delta` chunks are spoken. `reasoning-delta` and tool arguments never reach TTS.
-- **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation and input device all live in the plugin page under **Plugins → dsh-voice-dialog**.
+- **Model-facing voice control.** A `voice_dialog` tool lets the model react to spoken meta-commands: 轻一点/响一点 (`volume`), 听不清/什么/重复一遍 (`repeat`), 别说了/闭嘴/停 (`stop`). The host broadcasts the action to the browser over the same SSE stream.
+- **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation and input device all live in the plugin page under **Plugins → dsh-voice-dialog**. The active microphone expands into the built-in capture-row style with a live waveform, cancel and stop controls.
 
 ## Requirements
 
@@ -52,8 +53,8 @@ from `dsh.profile.bundles` (or disable it in the Plugins page) before enabling
 
 1. Open a conversation and click the microphone in the composer.
 2. Speak normally. Pauses close an utterance and insert it into the running turn.
-3. Assistant replies are read aloud automatically.
-4. Click the red microphone again to stop listening. Read-aloud can be turned off in the plugin settings.
+3. Assistant replies are read aloud automatically while the microphone is listening.
+4. Click the red microphone (or the stop button in the expanded row) to stop listening. Queued audio finishes; new sentences are not read. Spoken commands such as “轻一点”, “重复一遍” or “别说了” are routed to the model, which calls `voice_dialog`.
 
 If the speech model is not prepared, the microphone opens this plugin page so you can download/prepare it. The page also shows the live provider state and download progress.
 
@@ -68,7 +69,7 @@ All preferences are in **Plugins → dsh-voice-dialog**:
 | ASR provider, language | DSH speech selection | Shared with other speech clients |
 | Model preparation | DSH speech host | Download / cancel / retry |
 
-The voice selector includes Mandarin, Cantonese, Taiwanese, English and Japanese Edge voices. **Audition** synthesizes a short sample through the host without touching the live reply queue.
+The voice selector includes Mandarin, Cantonese, Taiwanese, English and Japanese Edge voices. **Audition** synthesizes a short sample through the host without touching the live reply queue; if Edge is unavailable it reads the sample with the system voice and shows a notice.
 
 ## Architecture
 

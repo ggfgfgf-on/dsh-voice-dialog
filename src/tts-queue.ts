@@ -16,6 +16,8 @@ import { MsEdgeTTS, OUTPUT_FORMAT, type ProsodyOptions } from 'msedge-tts'
 export interface VoiceFrame {
   sessionId: string
   seq: number
+  /** Groups the sentences of one assistant reply for repeat playback. */
+  replyId?: string
   /** Markdown-stripped sentence text (shown as live caption). */
   text: string
   /** Base64 MP3 bytes (24kHz mono); empty when `error` is set. */
@@ -37,6 +39,7 @@ const MAX_RETRIES = 5
 interface QueuedSentence {
   text: string
   epoch: number
+  replyId?: string
 }
 
 interface SessionQueue {
@@ -98,13 +101,13 @@ export class TtsQueue {
   }
 
   /** Enqueue one sentence for a session; starts the pump if idle. */
-  enqueue(sessionId: string, text: string): void {
+  enqueue(sessionId: string, text: string, replyId?: string): void {
     let q = this.queues.get(sessionId)
     if (!q) {
       q = { pending: [], busy: false, seq: 0, epoch: 0, failures: 0, retry: null }
       this.queues.set(sessionId, q)
     }
-    q.pending.push({ text, epoch: q.epoch })
+    q.pending.push({ text, epoch: q.epoch, replyId })
     void this.pump(sessionId, q)
   }
 
@@ -147,7 +150,7 @@ export class TtsQueue {
       console.warn(
         `[dsh-voice-dialog] TTS still unavailable, dropping ${q.pending.length} pending sentence(s)`,
       )
-      for (const item of q.pending) this.emitFailure(sessionId, q, item.text, 'TTS unavailable')
+      for (const item of q.pending) this.emitFailure(sessionId, q, item.text, item.replyId, 'TTS unavailable')
       q.pending.length = 0
       // A later sentence gets a fresh retry budget instead of being dropped
       // on its first failure because the counter was never reset.
@@ -189,6 +192,7 @@ export class TtsQueue {
           const frame: VoiceFrame = {
             sessionId,
             seq: q.seq++,
+            replyId: item.replyId,
             text: item.text,
             audio: buf.toString('base64'),
           }
@@ -205,7 +209,7 @@ export class TtsQueue {
           const message = e instanceof Error ? e.message : String(e)
           // eslint-disable-next-line no-console
           console.warn(`[dsh-voice-dialog] synthesis failed: ${message}`)
-          if (item.epoch === q.epoch) this.emitFailure(sessionId, q, item.text, message)
+          if (item.epoch === q.epoch) this.emitFailure(sessionId, q, item.text, item.replyId, message)
         }
       }
     } catch (e) {
@@ -219,8 +223,8 @@ export class TtsQueue {
     }
   }
 
-  private emitFailure(sessionId: string, q: SessionQueue, text: string, error: string): void {
-    this.emit({ sessionId, seq: q.seq++, text, audio: '', error })
+  private emitFailure(sessionId: string, q: SessionQueue, text: string, replyId: string | undefined, error: string): void {
+    this.emit({ sessionId, seq: q.seq++, replyId, text, audio: '', error })
   }
 
   private emit(frame: VoiceFrame): void {
