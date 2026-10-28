@@ -8,7 +8,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { OUTPUT_FORMAT } from 'msedge-tts'
-import { plainText, SentenceSegmenter } from './segmenter.ts'
+import { hasSpeechContent, sanitizeForSpeech, SentenceSegmenter } from './segmenter.ts'
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { createEdgeTts, TtsQueue, type VoiceFrame } from './tts-queue.ts'
 import { VoiceProtocol, type VoiceCommand } from './voice-protocol.ts'
@@ -116,7 +116,8 @@ export function apply(ctx: Context, config: Config): void {
       if (!summary) return
       announcedRuns.add(runId)
       childParents.delete(childId)
-      queue.enqueue(parent, summary, 'subagent-' + runId)
+      const spoken = /^(另外|还有|补充)/.test(summary) ? summary : '补充一下，' + summary
+      queue.enqueue(parent, spoken, 'subagent-' + runId)
     } catch (error) {
       // eslint-disable-next-line no-console
       console.warn('[dsh-voice-dialog] subagent speech failed: ' + String(error))
@@ -184,19 +185,29 @@ export function apply(ctx: Context, config: Config): void {
   }))
 
   const systemPrompt = (ctx as unknown as { systemPrompt: { section(section: unknown): () => void } }).systemPrompt
+  const basePrompt = '语音对话规则：语音输入可能包含对朗读本身的元指令。'
+    + '用户说轻一点/响一点、听不清/重复一遍、别说了/停时，调用 voice_dialog。'
+    + '可见回答就是朗读稿：用中文口语，短句，一句话一个意思；不要写标题、列表、表格、代码块、'
+    + '文件路径、URL、工具名或整句英文。需要调用工具时，先用一句自然中文说明要做什么，再调用；'
+    + '不要朗读内部推理或工具参数。不要用 [[voice: 内容]] 另写一份朗读稿；可见回答会被自动朗读，'
+    + '标记只用于控制播放：[[voice: volume +0.15]]、[[voice: repeat]]、[[voice: stop]]。'
+    + '子代理结果由 host 朗读，不要重复。'
+  const liveVoicePrompt = '实时语音模式已开启：用户在用麦克风对话，不要在主线做长工具链。'
+    + '只要任务包含互相独立的部分，或预计需要多次工具调用，就立即在同一轮并行 fork 子代理：'
+    + 'subagent 用于自包含任务，subagent_fork 用于需要当前对话上下文的任务；每个独立部分一个，'
+    + '不要串行自己做，也不要等结果。构建、测试、搜索等能后台跑的命令用 run_in_background；'
+    + '先派发再说话。派发后用一两句自然中文说你在处理什么，然后继续听；不要念工具名、参数、路径。'
+    + '只有即时可答的小问题才直接回答。'
   ctx.effect(() => systemPrompt.section({
     name: 'voice-dialog',
     order: 240,
-    text: 'Voice input may contain meta-commands about the speaking itself. When the latest user '
-      + 'utterance asks to change volume (轻一点/响一点), repeat (再说一遍/重复一遍/听不清/什么), or stop '
-      + '(别说了/闭嘴/停), call voice_dialog instead of only replying in text. '
-      + 'You also control the spoken channel from reasoning: put the exact words to speak in a '
-      + '[[voice: ...]] marker, or emit [[voice: volume +0.15]], [[voice: repeat]] or [[voice: stop]]. '
-      + 'Markers belong in reasoning, never in the visible answer. A say marker suppresses automatic '
-      + 'reading of the visible answer; without one, the final answer is read. Never read reasoning or '
-      + 'tool arguments aloud. In a voice conversation, when work splits into independent parts, you may '
-      + 'fork subagents and keep listening instead of waiting; the host speaks their final summaries, so '
-      + 'do not repeat those summaries word for word.',
+    text: () => {
+      let live = false
+      for (const sessionId of activeVoice.keys()) {
+        if (voiceSessionActive(activeVoice, sessionId)) { live = true; break }
+      }
+      return live ? basePrompt + ' ' + liveVoicePrompt : basePrompt
+    },
   }))
 
   ctx.on('llm/stream', (options: GenerateOptions, next): AsyncIterable<StreamChunk> => {
@@ -397,8 +408,8 @@ function assistantText(blocks: unknown): string {
  * whitespace, and cut at the last sentence boundary before the budget.
  */
 function summarizeForSpeech(text: string, maxChars = 320): string {
-  const clean = plainText(text).replace(/\s+/g, ' ').trim()
-  if (!clean) return ''
+  const clean = sanitizeForSpeech(text)
+  if (!clean || !hasSpeechContent(clean)) return ''
   if (clean.length <= maxChars) return clean
   const cut = clean.slice(0, maxChars)
   const boundary = Math.max(
@@ -444,10 +455,16 @@ async function* tapStream(
   const segmenter = new SentenceSegmenter()
   const protocol = new VoiceProtocol()
   let directed = false
+  const speak = (text: string): void => {
+    const clean = sanitizeForSpeech(text)
+    if (clean && hasSpeechContent(clean)) queue.enqueue(sessionId, clean, replyId)
+  }
   const applyVoice = (command: VoiceCommand): void => {
     if (command.action === 'say') {
-      directed = true
-      queue.enqueue(sessionId, command.text, replyId)
+      // A say marker is an extra spoken prefix, not a replacement for the
+      // answer. Suppressing the visible answer here was why the final output
+      // could be silent after a short marker.
+      speak(command.text)
       return
     }
     if (command.action === 'stop') directed = true
@@ -459,15 +476,21 @@ async function* tapStream(
   const flushOnce = (): void => {
     if (flushed) return
     flushed = true
-    for (const sentence of segmenter.flush()) queue.enqueue(sessionId, sentence, replyId)
+    for (const sentence of segmenter.flush()) speak(sentence)
   }
   try {
     for await (const chunk of inner) {
       if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
         for (const command of protocol.feed(chunk.text)) applyVoice(command)
       }
-      if (isSpeakableChunk(chunk) && !directed) {
-        for (const sentence of segmenter.feed(chunk.text)) queue.enqueue(sessionId, sentence, replyId)
+      if (isSpeakableChunk(chunk)) {
+        // The model sometimes writes a directive in the visible answer. The
+        // segmenter strips it from speech; parse it here so its content is
+        // spoken rather than silently discarded.
+        for (const command of protocol.feed(chunk.text)) applyVoice(command)
+        if (!directed) {
+          for (const sentence of segmenter.feed(chunk.text)) speak(sentence)
+        }
       }
       if (chunk.type === 'finish') finishReason = chunk.reason
       yield chunk

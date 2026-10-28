@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { SentenceSegmenter } from '../lib/segmenter.js'
+import { hasSpeechContent, sanitizeForSpeech, SentenceSegmenter } from '../lib/segmenter.js'
+
+test('cleans code, paths and English-only speech', () => {
+  const cleaned = sanitizeForSpeech('看 `src/index.ts`，打开 https://example.com 再运行 npm test。')
+  assert.ok(!cleaned.includes('src/index.ts'))
+  assert.ok(!cleaned.includes('https://'))
+  assert.ok(!cleaned.includes('`'))
+  assert.ok(hasSpeechContent(cleaned))
+  assert.equal(hasSpeechContent(sanitizeForSpeech('Run the full test suite now.')), false)
+})
 
 test('splits Chinese and English terminal punctuation', () => {
   const s = new SentenceSegmenter()

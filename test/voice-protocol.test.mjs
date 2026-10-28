@@ -24,6 +24,12 @@ test('streaming parser tolerates markers split across reasoning deltas', () => {
   parser.flush()
 })
 
+test('accepts a full-width colon in a voice marker', () => {
+  const parser = new VoiceProtocol()
+  assert.deepEqual(parser.feed('[[voice：这句话要读出来]]'), [{ action: 'say', text: '这句话要读出来' }])
+  parser.flush()
+})
+
 test('ordinary chain-of-thought text is not spoken', () => {
   const parser = new VoiceProtocol()
   assert.deepEqual(parser.feed('用户问的是天气，我需要先检查温度。'.repeat(20)), [])

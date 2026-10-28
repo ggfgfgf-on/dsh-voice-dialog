@@ -12,7 +12,7 @@ export interface SegmenterOptions {
 const TERMINAL = /[。！？!?；;…\n]/
 const SKIP_PREFIX = /^[\s.,，、:：;；!?！？)\]）"'”’〉》】]+$/
 /** A voice directive is control data, never speech; strip it if it leaks. */
-const VOICE_DIRECTIVE = /\[\[\s*voice\s*:[\s\S]*?\]\]/gi
+const VOICE_DIRECTIVE = /\[\[\s*voice\s*[:：][\s\S]*?\]\]/gi
 
 function stripVoiceDirectives(text: string): string {
   return text.replace(VOICE_DIRECTIVE, ' ')
@@ -22,7 +22,7 @@ function stripVoiceDirectives(text: string): string {
 export function plainText(text: string): string {
   return stripVoiceDirectives(String(text))
     .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/`([^`]*)`/g, '$1')
+    .replace(/`[^`]*`/g, ' ')
     .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/^#{1,6}\s+/gm, '')
@@ -31,6 +31,22 @@ export function plainText(text: string): string {
     .replace(/^[-*+]\s+/gm, '')
     .replace(/^\d+\.\s+/gm, '')
     .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
+    .replace(/https?:\/\/[^\s]+/g, ' ')
+    .replace(/\b[A-Za-z]:\\[^\s，。！？；：、）】》]+/g, ' ')
+    .replace(/(?:^|[\s(（])\/[A-Za-z0-9_.\-/]{2,}/g, ' ')
+    .replace(/\b[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|json|md|py|sh|ps1|yml|yaml|toml|log)\b/gi, ' ')
+}
+
+const CJK = /[\u3400-\u9fff]/
+
+/** True when a cleaned sentence has Chinese content worth speaking. */
+export function hasSpeechContent(text: string): boolean {
+  return CJK.test(text)
+}
+
+/** Clean text for TTS: remove code, paths, URLs and markup; keep Chinese prose. */
+export function sanitizeForSpeech(text: string): string {
+  return plainText(String(text)).replace(/\s+/g, ' ').trim()
 }
 
 /**

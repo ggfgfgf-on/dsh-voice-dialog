@@ -6,7 +6,7 @@ export type VoiceCommand =
   | { action: 'repeat' }
   | { action: 'stop' }
 
-const OPEN = '[[voice:'
+const OPEN = /\[\[\s*voice\s*[:：]/i
 
 /** Parse one marker body. Unknown/incomplete directives are ignored. */
 export function parseVoiceCommand(raw: string): VoiceCommand | null {
@@ -36,18 +36,20 @@ export class VoiceProtocol {
     this.buffer += text
     const commands: VoiceCommand[] = []
     for (;;) {
-      const start = this.buffer.indexOf(OPEN)
-      if (start < 0) {
+      const match = OPEN.exec(this.buffer)
+      if (match === null) {
         // Keep only a possible prefix of the opening token.
-        this.buffer = this.buffer.slice(-(OPEN.length - 1))
+        this.buffer = this.buffer.slice(-16)
         break
       }
-      const end = this.buffer.indexOf(']]', start + OPEN.length)
+      const start = match.index
+      const bodyStart = start + match[0].length
+      const end = this.buffer.indexOf(']]', bodyStart)
       if (end < 0) {
         this.buffer = this.buffer.slice(start)
         break
       }
-      const raw = this.buffer.slice(start + OPEN.length, end)
+      const raw = this.buffer.slice(bodyStart, end)
       this.buffer = this.buffer.slice(end + 2)
       const command = parseVoiceCommand(raw)
       if (command !== null) commands.push(command)
