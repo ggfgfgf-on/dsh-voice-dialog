@@ -6,7 +6,7 @@
 
 - **只有一个麦克风。** 不再有“电话模式”按钮、悬浮面板或第二套工具栏控件；点麦克风开始/结束连续收音。
 - **连续听写。** 静音约 1.4 秒后自动结束一句，调用 DSH 语音识别转写，再通过 `session.prompt(..., "steer")` 插入当前轮次。助手还在说话时，文字会在下一个 step 边界送到模型。
-- **自动朗读。** Host 监听 `llm/stream`，只取可见的 `text-delta`，按句切分后用 Edge TTS 合成，通过 SSE 推给浏览器排队播放。
+- **自动朗读。** Host 监听 `llm/stream`，只取可见的 `text-delta`，按句切分后用 Edge TTS 合成，通过 SSE 推给浏览器排队播放。Edge 端点不可达时，这一句会退到系统语音朗读，不会静默消失。
 - **软打断。** 你开口时只把朗读音量压低，不停止播放；转写文字插给模型。模型可以说完当前这句，剩下的朗读也不会被取消。
 - **不读思维链。** 通过 `GenerateOptions.purpose` 过滤 compaction / 会话标题等内部调用，只朗读 `text-delta`；`reasoning-delta` 和工具参数永远不会进入 TTS。
 - **插件设置页。** 自动朗读、音量、压低比例、朗读音色与试听、识别服务/语言、模型准备、输入麦克风都在 **插件 → dsh-voice-dialog** 页面里。
@@ -16,7 +16,7 @@
 - DSH `0.2.1-rc.2` 或兼容版本。
 - Node.js 22+。
 - DSH 语音识别服务。本插件的 bundle 自己组合了三条 host 行：`speech-to-text`、`speech-to-text-sensevoice`、`api-speech-to-text`。
-- 朗读需要能访问 Microsoft Edge TTS；首次使用 SenseVoice 可能需要下载模型。
+- 朗读需要能访问 Microsoft Edge TTS（用于所选音色）；访问不了会自动退到浏览器系统语音。首次使用 SenseVoice 可能需要下载模型。
 - 麦克风需要安全上下文：`https://` 或 `http://localhost` / `http://127.0.0.1`。
 
 ## 安装

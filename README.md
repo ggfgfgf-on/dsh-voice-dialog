@@ -6,7 +6,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 
 - **One microphone, no mode button.** The composer microphone starts and stops continuous listening. There is no floating panel and no second toolbar control.
 - **Continuous dictation.** A small VAD closes an utterance after ~1.4 s of silence, transcribes it through DSH speech-to-text, and sends the text with `session.prompt(..., "steer")`. If the assistant is still talking, the text is delivered at its next step boundary.
-- **Automatic read-aloud.** The host taps `llm/stream`, segments visible assistant text into sentences, synthesizes Edge TTS audio, and streams it over SSE. The browser queues playback.
+- **Automatic read-aloud.** The host taps `llm/stream`, segments visible assistant text into sentences, synthesizes Edge TTS audio, and streams it over SSE. The browser queues playback. If the Edge endpoint is unreachable, that sentence falls back to the platform speech voice instead of disappearing.
 - **Soft barge-in.** When you start speaking, the reply is ducked (not stopped). The transcript is steered into the model. The assistant may finish its current thought, and its remaining audio is not cancelled.
 - **No chain-of-thought.** Compaction and session-title calls are filtered by `GenerateOptions.purpose`; only `text-delta` chunks are spoken. `reasoning-delta` and tool arguments never reach TTS.
 - **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation and input device all live in the plugin page under **Plugins → dsh-voice-dialog**.
@@ -17,7 +17,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 - Node.js 22+ (DSH requirement).
 - A working DSH speech-to-text provider. This bundle composes the host rows itself:
   `speech-to-text`, `speech-to-text-sensevoice`, `api-speech-to-text`.
-- Network access to Microsoft Edge TTS for read-aloud. The first SenseVoice use may need a model download.
+- Network access to Microsoft Edge TTS for the selected voice; without it, read-aloud falls back to the browser's system voice. The first SenseVoice use may need a model download.
 - A secure browser context for the microphone: `https://` or `http://localhost` / `http://127.0.0.1`.
 
 ## Install

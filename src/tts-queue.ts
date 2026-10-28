@@ -18,8 +18,10 @@ export interface VoiceFrame {
   seq: number
   /** Markdown-stripped sentence text (shown as live caption). */
   text: string
-  /** Base64 MP3 bytes (24kHz mono). */
+  /** Base64 MP3 bytes (24kHz mono); empty when `error` is set. */
   audio: string
+  /** Edge TTS failed; the client may fall back to the system voice. */
+  error?: string
 }
 
 export type FrameListener = (frame: VoiceFrame) => void
@@ -145,6 +147,7 @@ export class TtsQueue {
       console.warn(
         `[dsh-voice-dialog] TTS still unavailable, dropping ${q.pending.length} pending sentence(s)`,
       )
+      for (const item of q.pending) this.emitFailure(sessionId, q, item.text, 'TTS unavailable')
       q.pending.length = 0
       // A later sentence gets a fresh retry budget instead of being dropped
       // on its first failure because the counter was never reset.
@@ -197,9 +200,12 @@ export class TtsQueue {
             }
           }
         } catch (e) {
-          // One failed sentence must not stop the queue; report and continue.
+          // One failed sentence must not stop the queue; report it and let the
+          // browser read that sentence with the system voice instead.
+          const message = e instanceof Error ? e.message : String(e)
           // eslint-disable-next-line no-console
-          console.warn(`[dsh-voice-dialog] synthesis failed: ${String(e)}`)
+          console.warn(`[dsh-voice-dialog] synthesis failed: ${message}`)
+          if (item.epoch === q.epoch) this.emitFailure(sessionId, q, item.text, message)
         }
       }
     } catch (e) {
@@ -210,6 +216,20 @@ export class TtsQueue {
       this.scheduleRetry(sessionId, q)
     } finally {
       q.busy = false
+    }
+  }
+
+  private emitFailure(sessionId: string, q: SessionQueue, text: string, error: string): void {
+    this.emit({ sessionId, seq: q.seq++, text, audio: '', error })
+  }
+
+  private emit(frame: VoiceFrame): void {
+    for (const fn of this.listeners) {
+      try {
+        fn(frame)
+      } catch {
+        // listener errors must not kill the pump
+      }
     }
   }
 

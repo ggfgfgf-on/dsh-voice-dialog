@@ -19,6 +19,7 @@ interface VoiceFrame {
   seq: number
   text: string
   audio: string
+  error?: string
 }
 
 interface HostConfig {
@@ -115,11 +116,27 @@ class TtsPlayer {
   duck(): void {
     this.ducked = true
     this.applyGain()
+    // The system-voice fallback has no Web Audio gain; pause it softly instead.
+    try { window.speechSynthesis?.pause() } catch { /* unsupported */ }
   }
 
   restore(): void {
     this.ducked = false
     this.applyGain()
+    try { window.speechSynthesis?.resume() } catch { /* unsupported */ }
+  }
+
+  /** Read one sentence with the platform voice when Edge TTS is unavailable. */
+  speakFallback(text: string): void {
+    if (!this.prefs.autoRead || !text.trim() || typeof SpeechSynthesisUtterance === 'undefined') return
+    try {
+      const utterance = new SpeechSynthesisUtterance(text)
+      utterance.volume = this.prefs.volume
+      utterance.lang = /[\u3400-\u9fff]/.test(text) ? 'zh-CN' : 'en-US'
+      window.speechSynthesis.speak(utterance)
+    } catch {
+      // A missing/blocked system voice must not break the audio player.
+    }
   }
 
   enqueue(frame: VoiceFrame): void {
@@ -131,6 +148,7 @@ class TtsPlayer {
   private clear(): void {
     this.queue.length = 0
     this.audio.pause()
+    try { window.speechSynthesis?.cancel() } catch { /* unsupported */ }
     this.cleanupUrl()
     this.playing = false
     this.ducked = false
@@ -198,7 +216,9 @@ function useAutoRead(sessionId: string): void {
         source.addEventListener('audio', (event) => {
           try {
             const frame = JSON.parse((event as MessageEvent<string>).data) as VoiceFrame
-            if (frame.sessionId === sessionId) sharedPlayer.enqueue(frame)
+            if (frame.sessionId !== sessionId) return
+            if (frame.error || !frame.audio) sharedPlayer.speakFallback(frame.text)
+            else sharedPlayer.enqueue(frame)
           } catch {
             // A malformed frame must not tear down the stream.
           }
