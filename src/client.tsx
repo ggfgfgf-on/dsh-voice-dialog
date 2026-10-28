@@ -798,6 +798,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           return
         }
         identity = split.sources[0]?.identity ?? null
+        if (identity) setSpeaker(displaySpeaker(sessionId, identity.label))
       } catch (failure) {
         // Separation is an enhancement. A missing device, model, or a rare
         // inference failure must leave ordinary dictation untouched.
