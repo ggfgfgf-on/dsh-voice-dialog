@@ -964,6 +964,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
         silenceMs: getPreferences().pauseMs,
+        threshold: getPreferences().micThreshold,
         onLevel: (value) => setLevel(value),
         onSpeechStart: () => { sharedPlayer.unmute(); sharedPlayer.duck() },
         onSpeechEnd: () => { sharedPlayer.restore() },
@@ -1534,6 +1535,10 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
           {device.label || `麦克风 ${index + 1}`}
         </option>)}
       </select></label>
+      <label>触发门槛<input type="range" min="0.005" max="0.08" step="0.001" value={prefs.micThreshold}
+        onChange={(event) => { save({ micThreshold: Number(event.target.value) }) }} />
+        <span>{prefs.micThreshold.toFixed(3)}</span></label>
+      <p className="dsh-vd-muted">数字越小越容易触发；环境噪音大时调高，小声说话总被漏掉时调低。默认 0.022，重新开始语音后生效。</p>
       <p className="dsh-vd-muted">首次使用需要允许浏览器访问麦克风；手机浏览器必须通过 HTTPS 或 localhost 访问。</p>
     </section>
   </div>

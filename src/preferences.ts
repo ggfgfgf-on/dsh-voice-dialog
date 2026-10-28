@@ -12,6 +12,8 @@ export interface VoiceDialogPreferences {
   deviceId: string
   /** Silence that closes an utterance, in milliseconds. */
   pauseMs: number
+  /** RMS loudness needed to open the microphone gate (lower = more sensitive). */
+  micThreshold: number
   /** Prefix each transcript with the detected speaker label. */
   speakerPrefix: boolean
   /** Drop utterances that do not match the enrolled voiceprint. */
@@ -35,6 +37,7 @@ const DEFAULTS: VoiceDialogPreferences = {
   duckLevel: 0.18,
   deviceId: '',
   pauseMs: 1600,
+  micThreshold: 0.022,
   speakerPrefix: true,
   speakerGate: false,
   speakerThreshold: 0.52,
@@ -52,6 +55,11 @@ function clampPause(value: unknown, fallback: number): number {
 function clampThreshold(value: unknown, fallback: number): number {
   const number = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(number) ? Math.min(0.8, Math.max(0.35, Math.round(number * 100) / 100)) : fallback
+}
+
+function clampMicThreshold(value: unknown, fallback: number): number {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? Math.min(0.08, Math.max(0.005, Math.round(number * 1000) / 1000)) : fallback
 }
 
 function parseGuestMode(value: unknown, fallback: GuestMode): GuestMode {
@@ -79,6 +87,7 @@ function parse(raw: string | null): VoiceDialogPreferences {
       duckLevel: clamp(value.duckLevel, DEFAULTS.duckLevel),
       deviceId: typeof value.deviceId === 'string' ? value.deviceId : DEFAULTS.deviceId,
       pauseMs: clampPause(value.pauseMs, DEFAULTS.pauseMs),
+      micThreshold: clampMicThreshold(value.micThreshold, DEFAULTS.micThreshold),
       speakerPrefix: typeof value.speakerPrefix === 'boolean' ? value.speakerPrefix : DEFAULTS.speakerPrefix,
       speakerGate: typeof value.speakerGate === 'boolean' ? value.speakerGate : DEFAULTS.speakerGate,
       speakerThreshold: clampThreshold(value.speakerThreshold, DEFAULTS.speakerThreshold),
@@ -107,6 +116,7 @@ export function setPreferences(patch: Partial<VoiceDialogPreferences>): VoiceDia
   next.volume = clamp(next.volume, DEFAULTS.volume)
   next.duckLevel = clamp(next.duckLevel, DEFAULTS.duckLevel)
   next.pauseMs = clampPause(next.pauseMs, DEFAULTS.pauseMs)
+  next.micThreshold = clampMicThreshold(next.micThreshold, DEFAULTS.micThreshold)
   next.speakerThreshold = clampThreshold(next.speakerThreshold, DEFAULTS.speakerThreshold)
   next.ownerMode = parseOwnerMode(next.ownerMode, DEFAULTS.ownerMode)
   next.guestMode = parseGuestMode(next.guestMode, DEFAULTS.guestMode)
