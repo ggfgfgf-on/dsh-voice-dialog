@@ -91,6 +91,15 @@ await build({
 })
 
 await build({
+  entryPoints: ['src/scheduler.ts'],
+  outfile: 'lib/scheduler.js',
+  bundle: false,
+  format: 'esm',
+  platform: 'node',
+  logLevel: 'silent',
+})
+
+await build({
   entryPoints: ['src/speech-filter.ts'],
   outfile: 'lib/speech-filter.js',
   bundle: false,

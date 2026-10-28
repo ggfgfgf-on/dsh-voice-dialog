@@ -1,7 +1,7 @@
 {
   "name": "dsh-voice-dialog",
-  "version": "0.4.0",
-  "description": "Voice dialog for DeepSeek Harness: built-in ASR bridge, auto-read replies, soft steering interruptions",
+  "version": "0.5.0",
+  "description": "Voice dialog for DeepSeek Harness: multi-speaker ASR, priority queuing, auto-read replies",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

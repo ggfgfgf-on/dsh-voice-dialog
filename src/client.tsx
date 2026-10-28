@@ -7,6 +7,7 @@ import {
 import speechRemote from './speech-remote.js'
 import { MicrophoneLoop, recordVoiceSample } from './mic.ts'
 import { getPreferences, setPreferences, subscribePreferences, type VoiceDialogPreferences } from './preferences.ts'
+import { SpeechScheduler } from './scheduler.ts'
 import { audioBase64, encodeWave } from './wav.ts'
 
 export const inject = ['remote']
@@ -494,16 +495,36 @@ function LiveWave({ level }: { level: number }) {
   </svg>
 }
 
+/** Keep at most `limit` ASR requests in flight without losing order. */
+function createLimit(limit: number): <T>(task: () => Promise<T>) => Promise<T> {
+  const width = Math.max(1, Math.floor(limit))
+  let active = 0
+  const waiting: Array<() => void> = []
+  return async <T,>(task: () => Promise<T>): Promise<T> => {
+    if (active >= width) await new Promise<void>((resolve) => { waiting.push(resolve) })
+    else active += 1
+    try {
+      return await task()
+    } finally {
+      const next = waiting.shift()
+      // Transfer the slot to the next waiter instead of freeing it and racing.
+      if (next) next()
+      else active = Math.max(0, active - 1)
+    }
+  }
+}
+
 function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const [active, setActive] = useState(false)
   const [level, setLevel] = useState(0)
   const [phase, setPhase] = useState<'idle' | 'starting' | 'listening'>('idle')
   const [pending, setPending] = useState(0)
+  const [queued, setQueued] = useState(0)
   const [error, setError] = useState('')
   const [speaker, setSpeaker] = useState('')
   const micRef = useRef<MicrophoneLoop | null>(null)
-  const queueRef = useRef<Float32Array[]>([])
-  const processing = useRef(false)
+  const schedulerRef = useRef<SpeechScheduler | null>(null)
+  const classifyRef = useRef<Promise<void>>(Promise.resolve())
   useAutoRead(sessionId)
   useLayoutEffect(() => {
     onActiveChange?.(active)
@@ -530,7 +551,12 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     await micRef.current?.stop()
     micRef.current = null
     // Keep already captured segments: stopping the microphone must not lose
-    // the last sentence the user just spoke.
+    // the last sentence the user just spoke. The scheduler flushes guest lines
+    // that are already waiting, then refuses new work.
+    schedulerRef.current?.dispose()
+    schedulerRef.current = null
+    setPending(0)
+    setQueued(0)
     reportVoiceState(sessionId, false)
     setActive(false)
     setPhase('idle')
@@ -581,64 +607,102 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     }
   }, [sessionId])
 
-  const drain = async (): Promise<void> => {
-    if (processing.current) return
-    processing.current = true
-    try {
-      while (queueRef.current.length > 0) {
-        setPending(queueRef.current.length)
-        await transcribeAndSend(queueRef.current.shift()!)
-      }
-    } finally {
-      processing.current = false
-      setPending(0)
-      sharedPlayer.restore()
+  const transcribeSamples = async (samples: Float32Array): Promise<string> => {
+    const catalog = await ctx.remote.speech.catalog()
+    if (!catalog.ok) throw new Error(catalog.error?.message ?? '语音识别服务不可用')
+    const provider = catalog.value.providers.find((item: any) => item.id === catalog.value.selection.providerId)
+    if (!provider || !['ready', 'standby', 'waking'].includes(provider.preparation.phase)) {
+      throw new Error('语音模型未就绪，请在插件设置中准备')
     }
+    const result = await ctx.remote.speech.transcribe({
+      audioBase64: audioBase64(encodeWave(samples)),
+      ...catalog.value.selection,
+    }, new AbortController().signal)
+    if (!result.ok) throw new Error(result.error?.message ?? '识别失败')
+    return String(result.value?.text ?? '').trim()
   }
 
-  const transcribeAndSend = async (samples: Float32Array): Promise<void> => {
-    try {
-      const prefs = getPreferences()
-      let prefix = ''
-      if (prefs.speakerPrefix || prefs.speakerGate) {
-        try {
-          const identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold)
-          setSpeaker(identity.label)
-          if (prefs.speakerGate && !identity.owner) {
-            setSpeaker('已忽略其他人的声音')
-            return
-          }
-          if (prefs.speakerPrefix && identity.label) prefix = '[声纹：' + identity.label + '] '
-        } catch (failure) {
-          // A missing model must not break normal dictation; the gate is
-          // stricter because it is an explicit "only me" promise.
-          if (prefs.speakerGate) throw failure
-          console.warn('[dsh-voice-dialog] voiceprint skipped', failure)
+  /** Identify first, then hand one lane to the scheduler. */
+  const scheduleSegment = async (
+    samples: Float32Array,
+    scheduler: SpeechScheduler,
+    runLimited: <T>(task: () => Promise<T>) => Promise<T>,
+  ): Promise<void> => {
+    const prefs = getPreferences()
+    let identity: SpeakerIdentity | null = null
+    if (prefs.speakerPrefix || prefs.speakerGate || prefs.guestMode !== 'steer') {
+      try {
+        identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold)
+        setSpeaker(identity.label)
+      } catch (failure) {
+        // A missing model must not break normal dictation; the gate is
+        // stricter because it is an explicit "only me" promise.
+        if (prefs.speakerGate) {
+          const message = failure instanceof Error ? failure.message : String(failure)
+          setError(message)
+          return
         }
+        console.warn('[dsh-voice-dialog] voiceprint skipped', failure)
       }
-      const catalog = await ctx.remote.speech.catalog()
-      if (!catalog.ok) throw new Error(catalog.error?.message ?? '语音识别服务不可用')
-      const provider = catalog.value.providers.find((item: any) => item.id === catalog.value.selection.providerId)
-      if (!provider || !['ready', 'standby', 'waking'].includes(provider.preparation.phase)) {
-        throw new Error('语音模型未就绪，请在插件设置中准备')
-      }
-      const result = await ctx.remote.speech.transcribe({
-        audioBase64: audioBase64(encodeWave(samples)),
-        ...catalog.value.selection,
-      }, new AbortController().signal)
-      if (!result.ok) throw new Error(result.error?.message ?? '识别失败')
-      const text = String(result.value?.text ?? '').trim()
-      if (!text) return
+    }
+
+    if (prefs.speakerGate && (!identity || !identity.owner)) {
+      setSpeaker('已忽略其他人的声音')
+      return
+    }
+
+    // Without an enrolled voiceprint there is no priority signal. Keep the
+    // previous behaviour: treat dictation as the owner instead of queueing it.
+    const lane = identity?.enrolled === true && !identity.owner ? 'guest' : 'owner'
+    if (lane === 'guest' && prefs.guestMode === 'ignore') {
+      setSpeaker('已忽略其他人的声音')
+      return
+    }
+    if (lane === 'guest') setSpeaker(identity?.label ?? '其他人')
+
+    const prefix = prefs.speakerPrefix && identity?.label ? '[声纹：' + identity.label + '] ' : ''
+    const work = runLimited(async () => {
+      const text = await transcribeSamples(samples)
+      return text ? prefix + text : null
+    })
+    scheduler.enqueue(lane, identity?.label ?? '', work)
+  }
+
+  const handleSegment = (
+    samples: Float32Array,
+    scheduler: SpeechScheduler,
+    runLimited: <T>(task: () => Promise<T>) => Promise<T>,
+  ): void => {
+    // Voiceprint calls are serialized by the host; ASR itself runs on up to
+    // three lanes, so a slow guest line cannot block the owner's next line.
+    classifyRef.current = classifyRef.current
+      .then(() => scheduleSegment(samples, scheduler, runLimited))
+      .catch((failure: unknown) => {
+        const message = failure instanceof Error ? failure.message : String(failure)
+        setError(message)
+        console.warn('[dsh-voice-dialog]', message)
+      })
+  }
+
+  const makeScheduler = (): SpeechScheduler => new SpeechScheduler({
+    deliver: async (text, mode) => {
       const session = ctx.sessions.binding(sessionId)?.session
       if (!session) throw new Error('当前会话不可用')
-      const sent = await session.prompt([{ type: 'text', text: prefix + text }], 'steer')
+      const sent = await session.prompt([{ type: 'text', text }], mode)
       if (!sent.ok) throw new Error(sent.error?.message ?? '发送失败')
-    } catch (failure) {
+    },
+    guestMode: () => getPreferences().guestMode,
+    batchMs: 900,
+    onStatus: ({ active, queued }) => {
+      setPending(active)
+      setQueued(queued)
+    },
+    onError: (failure) => {
       const message = failure instanceof Error ? failure.message : String(failure)
       setError(message)
       console.warn('[dsh-voice-dialog]', message)
-    }
-  }
+    },
+  })
 
   const start = async (): Promise<void> => {
     setError('')
@@ -661,16 +725,19 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         return
       }
       await sharedPlayer.enable()
+      const scheduler = makeScheduler()
+      schedulerRef.current = scheduler
+      classifyRef.current = Promise.resolve()
+      setPending(0)
+      setQueued(0)
+      const runLimited = createLimit(prefs.parallelAsr ? 3 : 1)
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
         silenceMs: getPreferences().pauseMs,
         onLevel: (value) => setLevel(value),
         onSpeechStart: () => { sharedPlayer.unmute(); sharedPlayer.duck() },
         onSpeechEnd: () => { sharedPlayer.restore() },
-        onSegment: (samples) => {
-          queueRef.current.push(samples)
-          void drain()
-        },
+        onSegment: (samples) => { handleSegment(samples, scheduler, runLimited) },
         onError: (failure) => {
           setError(failure instanceof Error ? failure.message : String(failure))
         },
@@ -685,6 +752,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       setActive(true)
       setPhase('listening')
     } catch (failure) {
+      schedulerRef.current?.dispose()
+      schedulerRef.current = null
       setError(failure instanceof Error ? failure.message : String(failure))
       setPhase('idle')
     }
@@ -696,17 +765,20 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     else void start()
   }
 
+  const activity = pending > 0
+    ? queued > 0 ? `并行识别 ${pending} 段 · ${queued} 条其他人插话排队` : `正在并行识别（${pending}）…`
+    : queued > 0 ? `其他人插话排队（${queued}）…` : ''
   const label = error || (active
-    ? pending > 0 ? `正在识别并插入（${pending}）…` : speaker ? `正在听…（${speaker}）` : '正在听…点击结束'
-    : '语音对话：点一下开始，停顿后自动插入，回答自动朗读')
+    ? activity || (speaker ? `正在听…（${speaker}）` : '正在听…点击结束')
+    : '语音对话：点一下开始，多人插话按优先级排队，回答自动朗读')
 
   if (active) return <>
     <style>{MIC_CSS}</style>
-    <div className="dsh-vd-captureRow" data-voice-activity={pending > 0 ? 'transcribing' : 'recording'}>
+    <div className="dsh-vd-captureRow" data-voice-activity={activity ? 'transcribing' : 'recording'}>
       <Button type="button" className="dsh-vd-round" size="sm" aria-label="结束语音对话"
         onClick={() => { void stop() }}><IconCloseOutlineRegular size={14} /></Button>
-      {pending > 0 || error
-        ? <span className="dsh-vd-activity" role="status">{error || `正在识别并插入（${pending}）…`}</span>
+      {activity || error
+        ? <span className="dsh-vd-activity" role="status">{error || activity}</span>
         : <LiveWave level={level} />}
       <Button type="button" className="dsh-vd-round" size="sm" aria-label="结束语音对话"
         onClick={() => { void stop() }}><IconStopFillRegular size={14} /></Button>
@@ -999,7 +1071,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   return <div className="dsh-vd-settings">
     <style>{SETTINGS_CSS}</style>
     <h2>语音对话</h2>
-    <p className="dsh-vd-muted">一个麦克风完成连续对话：停顿后自动识别并插入当前回答，助手回复自动朗读。设置只保存在这个浏览器。</p>
+    <p className="dsh-vd-muted">一个麦克风完成连续对话：停顿后自动识别，我直接插话，其他人按优先级排队；助手回复自动朗读。设置只保存在这个浏览器。</p>
 
     <section>
       <h3>朗读</h3>
@@ -1022,7 +1094,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
           onClick={() => { void playPreview() }}>{previewing ? '停止试听' : busy ? '合成中…' : '试听'}</button>
       </div>
       {actionError && <p className="dsh-vd-error" role="alert">{actionError}</p>}
-      <p className="dsh-vd-muted">说话只会压低朗读，不会切断回答；识别出的文字作为插话交给正在运行的模型，模型可以说完再回应。</p>
+      <p className="dsh-vd-muted">说话只会压低朗读，不会切断回答；我直接插话，其他人默认排队，等这一轮说完再交给模型。</p>
       {host && <p className="dsh-vd-muted">音色和语速保存在本机（重启后仍生效），朗读偏好保存在这个浏览器。</p>}
     </section>
 
@@ -1088,6 +1160,22 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       </>}
       {voiceprintError && <p className="dsh-vd-error" role="alert">{voiceprintError}</p>}
       <p className="dsh-vd-muted">带「客人」前缀的是其他人；只有登记过我的声纹，才能启用「只回应我的声音」。每次判定是你的声音，会用它慢慢强化声纹；其他人的声音不会写进去。</p>
+    </section>
+
+
+    <section>
+      <h3>多人插话</h3>
+      <p className="dsh-vd-muted">主人优先，其他人可以排队，不抢当前回答。排队的内容会合成一条低优先级消息，等模型这一轮结束再送进去。</p>
+      <label>其他人插话<select value={prefs.guestMode} disabled={busy}
+        onChange={(event) => { save({ guestMode: event.target.value as VoiceDialogPreferences['guestMode'] }) }}>
+        <option value="queue">排队，等当前回答说完</option>
+        <option value="steer">直接插话，立即交给模型</option>
+        <option value="ignore">忽略，不交给模型</option>
+      </select></label>
+      <label className="dsh-vd-check"><input type="checkbox" checked={prefs.parallelAsr}
+        onChange={(event) => { save({ parallelAsr: event.target.checked }) }} />并行识别多段语音（最多三路）</label>
+      <p className="dsh-vd-muted">先后接话的多个人可以同时识别，互不阻塞。同一个瞬间两个人同时开口，仍可能被当成一段音频；完全分离需要双麦克风或额外的声源分离。</p>
+      <p className="dsh-vd-muted">没登记我的声纹时无法区分主人和客人，所有语音都按主人处理。</p>
     </section>
 
     <section>
