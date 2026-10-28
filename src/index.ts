@@ -11,6 +11,7 @@ import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts'
 import { SentenceSegmenter } from './segmenter.ts'
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { TtsQueue, type VoiceFrame } from './tts-queue.ts'
+import { VoiceProtocol, type VoiceCommand } from './voice-protocol.ts'
 
 export const name = 'voice-dialog'
 export const inject = ['webServer', 'tools', 'systemPrompt']
@@ -141,17 +142,21 @@ export function apply(ctx: Context, config: Config): void {
     order: 240,
     text: 'Voice input may contain meta-commands about the speaking itself. When the latest user '
       + 'utterance asks to change volume (轻一点/响一点), repeat (再说一遍/重复一遍/听不清/什么), or stop '
-      + '(别说了/闭嘴/停), call voice_dialog instead of only replying in text. Never read reasoning or '
-      + 'tool arguments aloud; only the final assistant reply is read.',
+      + '(别说了/闭嘴/停), call voice_dialog instead of only replying in text. '
+      + 'You also control the spoken channel from reasoning: put the exact words to speak in a '
+      + '[[voice: ...]] marker, or emit [[voice: volume +0.15]], [[voice: repeat]] or [[voice: stop]]. '
+      + 'Markers belong in reasoning, never in the visible answer. A say marker suppresses automatic '
+      + 'reading of the visible answer; without one, the final answer is read. Never read reasoning or '
+      + 'tool arguments aloud.',
   }))
 
   ctx.on('llm/stream', (options: GenerateOptions, next): AsyncIterable<StreamChunk> => {
     const sessionId = options.sessionId
     // Auxiliary calls (compaction, session title) use the same session id but
-    // are not assistant speech. Reasoning and tool arguments are filtered by
-    // isSpeakableChunk below, so the model's chain of thought is never read.
+    // are not assistant speech. Reasoning is only scanned for explicit
+    // [[voice:...]] directives; its text is never read aloud wholesale.
     if (!shouldSpeak(options, config.enabled)) return next()
-    return tapStream(sessionId, next(), queue)
+    return tapStream(sessionId, next(), queue, (control) => { broadcast('control', control) })
   })
 
   ctx.effect(() =>
@@ -276,9 +281,21 @@ async function* tapStream(
   sessionId: string,
   inner: AsyncIterable<StreamChunk>,
   queue: TtsQueue,
+  control: (command: VoiceControl) => void,
 ): AsyncIterable<StreamChunk> {
   const replyId = `${sessionId}:${Date.now().toString(36)}:${replySequence++}`
   const segmenter = new SentenceSegmenter()
+  const protocol = new VoiceProtocol()
+  let directed = false
+  const applyVoice = (command: VoiceCommand): void => {
+    if (command.action === 'say') {
+      directed = true
+      queue.enqueue(sessionId, command.text, replyId)
+      return
+    }
+    if (command.action === 'stop') directed = true
+    control(command)
+  }
   let completed = false
   let flushed = false
   let finishReason: unknown = null
@@ -289,7 +306,10 @@ async function* tapStream(
   }
   try {
     for await (const chunk of inner) {
-      if (isSpeakableChunk(chunk)) {
+      if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+        for (const command of protocol.feed(chunk.text)) applyVoice(command)
+      }
+      if (isSpeakableChunk(chunk) && !directed) {
         for (const sentence of segmenter.feed(chunk.text)) queue.enqueue(sessionId, sentence, replyId)
       }
       if (chunk.type === 'finish') finishReason = chunk.reason
@@ -300,6 +320,7 @@ async function* tapStream(
     // Do not speak a fragment from an aborted or failed stream.
     const aborted = finishReason !== null && typeof finishReason === 'object'
       && (finishReason as { kind?: unknown }).kind === 'aborted'
+    protocol.flush()
     if (completed && !aborted) flushOnce()
   }
 }
