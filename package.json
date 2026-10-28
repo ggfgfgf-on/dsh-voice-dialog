@@ -1,6 +1,6 @@
 {
   "name": "dsh-voice-dialog",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Voice dialog for DeepSeek Harness: built-in ASR bridge, auto-read replies, soft steering interruptions",
   "type": "module",
   "main": "lib/index.js",
@@ -38,6 +38,9 @@
   "dependencies": {
     "https-proxy-agent": "^5.0.1",
     "msedge-tts": "^2.1.1"
+  },
+  "optionalDependencies": {
+    "sherpa-onnx-node": "^2.0.1"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

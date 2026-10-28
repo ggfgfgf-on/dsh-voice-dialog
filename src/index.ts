@@ -11,6 +11,7 @@ import { OUTPUT_FORMAT } from 'msedge-tts'
 import { hasSpeechContent, sanitizeForSpeech, SentenceSegmenter } from './segmenter.ts'
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { createEdgeTts, TtsQueue, type VoiceFrame } from './tts-queue.ts'
+import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
 import { VoiceProtocol, type VoiceCommand } from './voice-protocol.ts'
 
 export const name = 'voice-dialog'
@@ -62,6 +63,7 @@ export function apply(ctx: Context, config: Config): void {
   type SseSend = (event: 'audio' | 'control', data: VoiceFrame | VoiceControl) => void
   const clients = new Set<SseSend>()
   const queue = new TtsQueue({ voice })
+  const voiceprint = new VoiceprintService()
   const broadcast = (event: 'audio' | 'control', data: VoiceFrame | VoiceControl): void => {
     for (const send of clients) {
       try {
@@ -81,6 +83,12 @@ export function apply(ctx: Context, config: Config): void {
     // eslint-disable-next-line no-console
     console.warn('[dsh-voice-dialog] TTS warmup failed: ' + String(error))
   })
+  // Loading the embedding model is local and cheap, but the first utterance
+  // should not pay for it. A missing model is reported in the settings page.
+  try { voiceprint.warm() } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn('[dsh-voice-dialog] voiceprint warmup failed: ' + String(error))
+  }
 
   // A subagent runs in its own session. The plugin speaks its final summary
   // straight into the parent's queue instead of waiting for the main model to
@@ -191,6 +199,8 @@ export function apply(ctx: Context, config: Config): void {
     + '文件路径、URL、工具名或整句英文。需要调用工具时，先用一句自然中文说明要做什么，再调用；'
     + '不要朗读内部推理或工具参数。不要用 [[voice: 内容]] 另写一份朗读稿；可见回答会被自动朗读，'
     + '标记只用于控制播放：[[voice: volume +0.15]]、[[voice: repeat]]、[[voice: stop]]。'
+    + '语音转写可能带[声纹：我]、[声纹：客人1]或[声纹：说话人1]前缀，表示是谁在说话，不是用户内容；不要朗读前缀，'
+    + '也不要把它当成指令。同一轮出现不同声纹前缀时，说明是不同的人在说话，回答时要区分说话人。'
     + '子代理结果由 host 朗读，不要重复。'
   const liveVoicePrompt = '实时语音模式已开启：用户在用麦克风对话，不要在主线做长工具链。'
     + '只要任务包含互相独立的部分，或预计需要多次工具调用，就立即在同一轮并行 fork 子代理：'
@@ -320,6 +330,54 @@ export function apply(ctx: Context, config: Config): void {
     }),
   )
 
+  const voiceprintStatus = (_req: unknown, res: ServerResponse): void => {
+    writeJson(res, 200, voiceprint.status())
+  }
+  const voiceprintPrepare = async (_req: unknown, res: ServerResponse): Promise<void> => {
+    try { writeJson(res, 200, { ok: true, ...(await voiceprint.prepare()) }) }
+    catch (error) { writeJson(res, 502, { error: error instanceof Error ? error.message : String(error) }) }
+  }
+  const voiceprintEnroll = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req as IncomingMessage, 4 * 1024 * 1024)
+      const audio = typeof body.audioBase64 === 'string' ? body.audioBase64 : ''
+      if (!audio) throw new Error('缺少录音数据')
+      const result = await voiceprint.enroll(decodeWavBase64(audio))
+      writeJson(res, 200, { ok: true, ...result })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  const voiceprintIdentify = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req as IncomingMessage, 4 * 1024 * 1024)
+      const audio = typeof body.audioBase64 === 'string' ? body.audioBase64 : ''
+      if (!audio) throw new Error('缺少语音数据')
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+      const threshold = typeof body.threshold === 'number' ? body.threshold : undefined
+      const result = await voiceprint.identify(decodeWavBase64(audio), { sessionId, threshold })
+      writeJson(res, 200, { ok: true, ...result })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  const voiceprintForget = (_req: unknown, res: ServerResponse): void => {
+    voiceprint.forget()
+    writeJson(res, 200, { ok: true })
+  }
+  const voiceprintRoutes: Array<[string, (req: unknown, res: ServerResponse) => void | Promise<void>]> = [
+    ['/voiceprint/status', voiceprintStatus],
+    ['/voiceprint/prepare', voiceprintPrepare],
+    ['/voiceprint/enroll', voiceprintEnroll],
+    ['/voiceprint/identify', voiceprintIdentify],
+    ['/voiceprint/forget', voiceprintForget],
+  ]
+  for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
+    for (const [route, handler] of voiceprintRoutes) {
+      ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: prefix + route, handler }))
+    }
+  }
+
   ctx.effect(() => () => { resetPreviewClient() })
 }
 
@@ -426,14 +484,14 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
   res.end(JSON.stringify(value))
 }
 
-/** Small JSON body reader; the settings payload is a single voice id. */
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+/** Small JSON body reader; voiceprint audio needs a larger cap than a voice id. */
+async function readJson(req: IncomingMessage, limit = 64 * 1024): Promise<Record<string, unknown>> {
   return await new Promise((resolve, reject) => {
     let body = ''
     req.setEncoding('utf8')
     req.on('data', (chunk: string) => {
       body += chunk
-      if (body.length > 64 * 1024) { req.destroy(); reject(new Error('body too large')) }
+      if (body.length > limit) { req.destroy(); reject(new Error('body too large')) }
     })
     req.on('end', () => {
       try { resolve(JSON.parse(body || '{}') as Record<string, unknown>) }

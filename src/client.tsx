@@ -5,7 +5,7 @@ import {
   Button, IconCloseOutlineRegular, IconMicrophoneOutlineRegular, IconStopFillRegular, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import speechRemote from './speech-remote.js'
-import { MicrophoneLoop } from './mic.ts'
+import { MicrophoneLoop, recordVoiceSample } from './mic.ts'
 import { getPreferences, setPreferences, subscribePreferences, type VoiceDialogPreferences } from './preferences.ts'
 import { audioBase64, encodeWave } from './wav.ts'
 
@@ -33,6 +33,24 @@ interface HostConfig {
   basePath: string
   voice: string
   enabled: boolean
+}
+
+interface VoiceprintStatus {
+  ready: boolean
+  addonAvailable: boolean
+  modelPresent: boolean
+  enrolled: boolean
+  modelPath: string
+  modelBytes: number
+  embeddingDim?: number
+  error?: string
+}
+
+interface SpeakerIdentity {
+  enrolled: boolean
+  owner: boolean
+  label: string
+  similarity: number
 }
 
 /** Edge TTS voices exposed by the settings page. */
@@ -102,6 +120,53 @@ function loadConfig(): Promise<HostConfig> {
       })
   }
   return configPromise
+}
+
+async function errorFrom(response: Response, fallback: string): Promise<Error> {
+  const detail = await response.json().catch(() => null) as { error?: string } | null
+  return new Error(detail?.error ?? fallback + '（HTTP ' + response.status + '）')
+}
+
+async function fetchVoiceprintStatus(): Promise<VoiceprintStatus> {
+  const response = await fetch(apiUrl('/voiceprint/status'))
+  if (!response.ok) throw await errorFrom(response, '声纹状态读取失败')
+  return await response.json() as VoiceprintStatus
+}
+
+async function prepareVoiceprint(): Promise<VoiceprintStatus> {
+  const response = await fetch(apiUrl('/voiceprint/prepare'), { method: 'POST' })
+  if (!response.ok) throw await errorFrom(response, '声纹模型下载失败')
+  return await response.json() as VoiceprintStatus
+}
+
+async function enrollVoiceprint(samples: Float32Array): Promise<void> {
+  const response = await fetch(apiUrl('/voiceprint/enroll'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ audioBase64: audioBase64(encodeWave(samples)) }),
+  })
+  if (!response.ok) throw await errorFrom(response, '声纹保存失败')
+}
+
+async function identifySpeaker(
+  samples: Float32Array, sessionId: string, threshold: number,
+): Promise<SpeakerIdentity> {
+  const response = await fetch(apiUrl('/voiceprint/identify'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      audioBase64: audioBase64(encodeWave(samples)),
+      sessionId,
+      threshold,
+    }),
+  })
+  if (!response.ok) throw await errorFrom(response, '声纹识别失败')
+  return await response.json() as SpeakerIdentity
+}
+
+async function forgetVoiceprint(): Promise<void> {
+  const response = await fetch(apiUrl('/voiceprint/forget'), { method: 'POST' })
+  if (!response.ok) throw await errorFrom(response, '声纹删除失败')
 }
 
 function base64ToAudioUrl(base64: string): string {
@@ -430,6 +495,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const [phase, setPhase] = useState<'idle' | 'starting' | 'listening'>('idle')
   const [pending, setPending] = useState(0)
   const [error, setError] = useState('')
+  const [speaker, setSpeaker] = useState('')
   const micRef = useRef<MicrophoneLoop | null>(null)
   const queueRef = useRef<Float32Array[]>([])
   const processing = useRef(false)
@@ -464,6 +530,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     setActive(false)
     setPhase('idle')
     setLevel(0)
+    setSpeaker('')
     sharedPlayer.endSession()
     sharedPlayer.restore()
   }
@@ -487,6 +554,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     setActive(false)
     setPhase('idle')
     setError('')
+    setSpeaker('')
     return () => {
       const mic = micRef.current
       if (!mic) return
@@ -525,6 +593,24 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
 
   const transcribeAndSend = async (samples: Float32Array): Promise<void> => {
     try {
+      const prefs = getPreferences()
+      let prefix = ''
+      if (prefs.speakerPrefix || prefs.speakerGate) {
+        try {
+          const identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold)
+          setSpeaker(identity.label)
+          if (prefs.speakerGate && !identity.owner) {
+            setSpeaker('已忽略其他人的声音')
+            return
+          }
+          if (prefs.speakerPrefix && identity.label) prefix = '[声纹：' + identity.label + '] '
+        } catch (failure) {
+          // A missing model must not break normal dictation; the gate is
+          // stricter because it is an explicit "only me" promise.
+          if (prefs.speakerGate) throw failure
+          console.warn('[dsh-voice-dialog] voiceprint skipped', failure)
+        }
+      }
       const catalog = await ctx.remote.speech.catalog()
       if (!catalog.ok) throw new Error(catalog.error?.message ?? '语音识别服务不可用')
       const provider = catalog.value.providers.find((item: any) => item.id === catalog.value.selection.providerId)
@@ -540,7 +626,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       if (!text) return
       const session = ctx.sessions.binding(sessionId)?.session
       if (!session) throw new Error('当前会话不可用')
-      const sent = await session.prompt([{ type: 'text', text }], 'steer')
+      const sent = await session.prompt([{ type: 'text', text: prefix + text }], 'steer')
       if (!sent.ok) throw new Error(sent.error?.message ?? '发送失败')
     } catch (failure) {
       const message = failure instanceof Error ? failure.message : String(failure)
@@ -551,8 +637,15 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
 
   const start = async (): Promise<void> => {
     setError('')
+    setSpeaker('')
     setPhase('starting')
     try {
+      const prefs = getPreferences()
+      if (prefs.speakerGate) {
+        const status = await fetchVoiceprintStatus()
+        if (!status.ready) throw new Error(status.error ?? '声纹模型未安装，请在插件设置中准备')
+        if (!status.enrolled) throw new Error('请先在插件设置里录制我的声纹')
+      }
       const catalog = await ctx.remote.speech.catalog()
       if (!catalog.ok) throw new Error(catalog.error?.message ?? '语音识别服务不可用')
       const provider = catalog.value.providers.find((item: any) => item.id === catalog.value.selection.providerId)
@@ -599,7 +692,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   }
 
   const label = error || (active
-    ? pending > 0 ? `正在识别并插入（${pending}）…` : '正在听…点击结束'
+    ? pending > 0 ? `正在识别并插入（${pending}）…` : speaker ? `正在听…（${speaker}）` : '正在听…点击结束'
     : '语音对话：点一下开始，停顿后自动插入，回答自动朗读')
 
   if (active) return <>
@@ -654,6 +747,12 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   const [busy, setBusy] = useState(false)
   const [catalogError, setCatalogError] = useState('')
   const [actionError, setActionError] = useState('')
+  const [voiceprint, setVoiceprint] = useState<VoiceprintStatus | null>(null)
+  const [voiceprintError, setVoiceprintError] = useState('')
+  const [voiceprintBusy, setVoiceprintBusy] = useState<'' | 'prepare' | 'record' | 'forget'>('')
+  const [recording, setRecording] = useState(false)
+  const [recordLevel, setRecordLevel] = useState(0)
+  const recordAbort = useRef<AbortController | null>(null)
 
   useEffect(() => subscribePreferences(setPrefs), [])
   useEffect(() => {
@@ -679,6 +778,69 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       .then((all) => setDevices(all.filter((device) => device.kind === 'audioinput')))
       .catch(() => undefined)
   }, [])
+  useEffect(() => { void refreshVoiceprint() }, [])
+  useEffect(() => () => { recordAbort.current?.abort() }, [])
+
+  const refreshVoiceprint = async (): Promise<void> => {
+    try {
+      setVoiceprint(await fetchVoiceprintStatus())
+      setVoiceprintError('')
+    } catch (failure) {
+      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }
+
+  const downloadVoiceprint = async (): Promise<void> => {
+    setVoiceprintBusy('prepare')
+    setVoiceprintError('')
+    try {
+      setVoiceprint(await prepareVoiceprint())
+    } catch (failure) {
+      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setVoiceprintBusy('')
+    }
+  }
+
+  const recordMyVoice = async (): Promise<void> => {
+    setVoiceprintBusy('record')
+    setVoiceprintError('')
+    setActionError('')
+    setRecording(true)
+    setRecordLevel(0)
+    const abort = new AbortController()
+    recordAbort.current = abort
+    try {
+      const samples = await recordVoiceSample({
+        seconds: 6.5,
+        deviceId: prefs.deviceId,
+        onLevel: setRecordLevel,
+        signal: abort.signal,
+      })
+      await enrollVoiceprint(samples)
+      setVoiceprint(await fetchVoiceprintStatus())
+    } catch (failure) {
+      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setRecording(false)
+      setRecordLevel(0)
+      setVoiceprintBusy('')
+      recordAbort.current = null
+    }
+  }
+
+  const removeVoiceprint = async (): Promise<void> => {
+    setVoiceprintBusy('forget')
+    setVoiceprintError('')
+    try {
+      await forgetVoiceprint()
+      await refreshVoiceprint()
+    } catch (failure) {
+      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setVoiceprintBusy('')
+    }
+  }
 
   const [voice, setVoice] = useState('')
   const [previewText, setPreviewText] = useState('你好，我是你的语音助手。')
@@ -856,6 +1018,43 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     </section>
 
     <section>
+      <h3>声纹</h3>
+      <p className="dsh-vd-muted">给每段语音标出说话人，模型就不会把不同的人当成同一个人。声纹只保存在本机，录音不会上传到外部服务。</p>
+      <label className="dsh-vd-check"><input type="checkbox" checked={prefs.speakerPrefix}
+        onChange={(event) => { save({ speakerPrefix: event.target.checked }) }} />给语音输入加声纹前缀（我 / 客人）</label>
+      <label className="dsh-vd-check"><input type="checkbox" checked={prefs.speakerGate}
+        onChange={(event) => { save({ speakerGate: event.target.checked }) }} />只回应我的声音</label>
+      <label>认定阈值<input type="range" min="0.35" max="0.8" step="0.01" value={prefs.speakerThreshold}
+        onChange={(event) => { save({ speakerThreshold: Number(event.target.value) }) }} /><span>{prefs.speakerThreshold.toFixed(2)}</span></label>
+      <p className="dsh-vd-muted">阈值越高越严格；别人被当成你的概率更低，但你自己也可能被忽略。建议从 0.52 开始。</p>
+      {voiceprint === null && !voiceprintError && <p className="dsh-vd-muted">正在检查声纹模型…</p>}
+      {voiceprint && <div className="dsh-vd-vpStatus">
+        <span>{voiceprint.ready ? '声纹模型已就绪' : voiceprint.modelPresent ? '缺少声纹组件' : '声纹模型未安装'}</span>
+        <span>{voiceprint.enrolled ? '已登记我的声纹' : '尚未登记我的声纹'}</span>
+        {voiceprint.modelBytes > 0 && <span>{(voiceprint.modelBytes / 1_000_000).toFixed(1)} MB</span>}
+      </div>}
+      {voiceprint && !voiceprint.addonAvailable && <p className="dsh-vd-error">缺少本地声纹组件：在 profile 目录执行 pnpm add sherpa-onnx-node，然后重启 DSH。</p>}
+      {voiceprint && !voiceprint.modelPresent && voiceprint.addonAvailable && <button type="button" className="dsh-vd-button"
+        disabled={voiceprintBusy !== ''} onClick={() => { void downloadVoiceprint() }}>
+        {voiceprintBusy === 'prepare' ? '下载中…' : '下载声纹模型（约 27MB）'}
+      </button>}
+      <div className="dsh-vd-preview">
+        <button type="button" className="dsh-vd-button" disabled={voiceprintBusy !== '' || recording || !voiceprint?.ready}
+          onClick={() => { void recordMyVoice() }}>
+          {recording ? '录音中…' : voiceprint?.enrolled ? '重新录制我的声纹' : '录制我的声纹'}
+        </button>
+        {voiceprint?.enrolled && <button type="button" className="dsh-vd-button" disabled={voiceprintBusy !== '' || recording}
+          onClick={() => { void removeVoiceprint() }}>{voiceprintBusy === 'forget' ? '删除中…' : '删除声纹'}</button>}
+      </div>
+      {recording && <>
+        <div className="dsh-vd-recordBar"><span style={{ width: `${Math.max(4, Math.round(recordLevel * 100))}%` }} /></div>
+        <p className="dsh-vd-muted">请用平常音量说一句话，例如：今天天气不错，我在和你说话。录音六秒后自动保存。</p>
+      </>}
+      {voiceprintError && <p className="dsh-vd-error" role="alert">{voiceprintError}</p>}
+      <p className="dsh-vd-muted">带「客人」前缀的是其他人；只有登记过我的声纹，才能启用「只回应我的声音」。</p>
+    </section>
+
+    <section>
       <h3>麦克风</h3>
       <label>输入设备<select value={prefs.deviceId} onChange={(event) => { save({ deviceId: event.target.value }) }}>
         <option value="">系统默认</option>
@@ -906,4 +1105,7 @@ const SETTINGS_CSS = `
 .dsh-vd-button { align-self: flex-start; border: 1px solid var(--dsw-alias-border-l1); border-radius: 7px; padding: 6px 12px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
 .dsh-vd-button:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
 .dsh-vd-button:disabled { opacity: .5; cursor: default; }
+.dsh-vd-vpStatus { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--dsw-alias-label-secondary); }
+.dsh-vd-recordBar { height: 6px; overflow: hidden; border-radius: 3px; background: var(--dsw-alias-interactive-bg-hover); }
+.dsh-vd-recordBar span { display: block; height: 100%; border-radius: 3px; background: var(--dsw-alias-state-business-primary); transition: width .08s linear; }
 `

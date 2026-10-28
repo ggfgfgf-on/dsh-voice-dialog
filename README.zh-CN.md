@@ -12,6 +12,7 @@
 - **模型决定说什么。** 模型可以在 reasoning 里写 `[[voice: 要说的内容]]` 指定朗读文本，或用 `[[voice: volume +0.15]]`、`[[voice: repeat]]`、`[[voice: stop]]` 控制。出现 say 指令时不再自动读可见回复；没有指令时读最终回复。
 - **模型语音控制。** 新增 `voice_dialog` 工具：轻一点/响一点（`volume`）、听不清/什么/重复一遍（`repeat`）、别说了/闭嘴/停（`stop`）。Host 通过同一条 SSE 把动作广播给浏览器；`stop` 会静音后续句子，直到用户再次开口。同样的动作和指定朗读文本也可以直接用 reasoning 标记表达，模型不必每次走工具调用。
 - **后台子代理直接播报。** 开麦时客户端把当前会话标记为语音活跃；子代理结束时 host 读取它的最终文本，压成一句摘要直接排进父会话的 TTS，不需要主模型再开一轮。客户端用心跳续期，标签页消失后状态自动过期。
+- **声纹前缀。** 本地 CAM++ 声纹模型（由 `sherpa-onnx-node` 运行，不调用云端）识别登记过的本人，并把其他声音聚类；每段转写前加 `[声纹：我]` 或 `[声纹：客人1]`，模型能看出是谁在说。设置页录制本人声纹；可选的“只回应我的声音”会丢弃不匹配的语音。
 - **插件设置页。** 自动朗读、音量、压低比例、朗读音色与试听、识别服务/语言、模型准备、输入麦克风都在 **插件 → dsh-voice-dialog** 页面里。麦克风激活后，输入框会展开成内置语音输入插件风格的整行：波形、取消和停止按钮。
 
 ## 要求
@@ -22,6 +23,7 @@
 - 朗读需要能访问 Microsoft Edge TTS（用于所选音色）；访问不了会自动退到浏览器系统语音。首次使用 SenseVoice 可能需要下载模型。
 - 需要代理才能访问 Edge 时，插件自动读取 `HTTPS_PROXY` / `HTTP_PROXY`，WebSocket 通过 CONNECT 隧道；可用 `DSH_VOICE_TTS_PROXY` 覆盖，`NO_PROXY` 可让 Edge 直连。
 - 麦克风需要安全上下文：`https://` 或 `http://localhost` / `http://127.0.0.1`。
+- 声纹前缀可选：`sherpa-onnx-node`（可选依赖，自带当前平台的原生模块）和一次约 27 MB 的 CAM++ 模型下载。没有它们时语音输入仍可用，只是不带说话人前缀。
 
 ## 安装
 
@@ -68,6 +70,9 @@ dsh plugin --profile web add file:D:/path/to/dsh-voice-dialog
 | Edge 朗读音色 | Host `~/.dsh/voice-dialog/settings.json` | 立即生效，重启后保留 |
 | 识别服务、语言 | DSH speech selection | 与其他语音客户端共享 |
 | 模型准备 | DSH speech host | 下载 / 取消 / 重试 |
+| 声纹前缀、只回应我的声音、阈值 | 浏览器 `localStorage` | 控制加不加前缀、是否过滤 |
+| 本人声纹 | Host `~/.dsh/voice-dialog/voiceprint.json` | 只保存特征向量，不保存原始录音 |
+| 声纹模型 | Host `~/.dsh/voice-dialog/models/` | 从设置页下载 |
 
 音色包含普通话、粤语、台湾国语、英语、日语等 Edge 声音；**试听**会通过 host 合成一小段，不会打扰正在播放的回复队列。Edge 不可达时会自动改用系统语音试听并显示提示。
 
@@ -91,6 +96,7 @@ SSE ──► TtsPlayer(Web Audio gain) ◄── 开口时 duck ─────
 
 - 音频交给当前配置的 DSH 识别服务；默认 SenseVoice 完全在本机。
 - 只有最终句子文本会发给 Microsoft Edge TTS 朗读。
+- 声纹比对在本机 host 完成：浏览器只把这一小段音频发到 `127.0.0.1`，host 只保存 192 维特征向量（不保存原始录音），不会上传到云端。其他人的声纹只在当前会话内存里聚类，不落盘。
 - 浏览器偏好保存在 `localStorage`；音色 id 保存在 `~/.dsh/voice-dialog/settings.json`，不使用 API Key。
 
 ## 常见问题
@@ -100,6 +106,8 @@ SSE ──► TtsPlayer(Web Audio gain) ◄── 开口时 duck ─────
 - **试听失败 / 日志出现 `read ECONNRESET`**：通常是直连 `speech.platform.bing.com` 被网络重置。设置 `HTTPS_PROXY` 后重启 DSH；host 日志会打印 `Edge TTS via proxy http://…`。若系统语音也失败，检查浏览器是否允许语音合成。
 - **设置页提示语音服务不可用**：可能同时启用了两个语音 bundle，或 host 行没挂载。只保留 `dsh-voice-dialog`。
 - **模型未就绪**：打开插件页点“准备语音模型”。
+- **没有声纹前缀**：打开插件页确认声纹模型已就绪，再点“录制我的声纹”。如果提示缺少本地组件，在 profile 目录执行 `pnpm add sherpa-onnx-node` 后重启 DSH。
+- **本人被标成客人**：把声纹阈值稍微调低（建议从 0.52 开始），或在安静环境重新录一遍。
 
 ## 开发
 
@@ -109,7 +117,7 @@ npm run build
 npm test
 ```
 
-`npm run build` 生成 host ESM、客户端 `__ModuleLoader__` 闭包和测试用的纯 Node 模块；`npm test` 覆盖句子切分、Markdown 过滤、不读思维链、WAV 编码和音色切换。
+`npm run build` 生成 host ESM、客户端 `__ModuleLoader__` 闭包和测试用的纯 Node 模块；`npm test` 覆盖句子切分、Markdown 过滤、不读思维链、WAV 编码、音色切换和声纹 WAV 解码/余弦相似度。原生声纹模型在开发时单独验证，`npm test` 不会下载模型。
 
 ## 许可
 

@@ -202,3 +202,92 @@ export class MicrophoneLoop {
     }
   }
 }
+
+export interface RecordVoiceOptions {
+  /** Recording length; enrollment works best with 5-8 seconds. */
+  seconds?: number
+  deviceId?: string
+  onLevel?: (level: number) => void
+  signal?: AbortSignal
+}
+
+/**
+ * Record one finite voice sample for speaker enrollment.
+ *
+ * The continuous loop above is optimized for streaming utterances; this one
+ * returns a complete 16 kHz buffer so the host can compute one embedding.
+ * It never uploads audio itself: the caller sends it to the local host only.
+ */
+export async function recordVoiceSample(options: RecordVoiceOptions = {}): Promise<Float32Array> {
+  if (options.signal?.aborted) throw new Error('录音已取消')
+  const seconds = Math.min(15, Math.max(1, options.seconds ?? 6.5))
+  const devices = (navigator as Partial<Navigator>).mediaDevices
+  if (!devices) throw new Error('当前页面不是安全上下文，浏览器不提供麦克风 API；请使用 HTTPS 或 localhost。')
+  const stream = await devices.getUserMedia({
+    audio: {
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1,
+      ...(options.deviceId ? { deviceId: { exact: options.deviceId } } : {}),
+    },
+    video: false,
+  })
+  let context: AudioContext
+  try {
+    const Ctor = window.AudioContext
+    try { context = new Ctor({ sampleRate: TARGET_RATE }) }
+    catch { context = new Ctor() }
+    await context.resume()
+  } catch (error) {
+    stream.getTracks().forEach((track) => { track.stop() })
+    throw error
+  }
+  const source = context.createMediaStreamSource(stream)
+  const processor = context.createScriptProcessor(BUFFER_SIZE, 1, 1)
+  const sink = context.createGain()
+  sink.gain.value = 0
+  const chunks: Float32Array[] = []
+  let peak = 0
+  let done = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return await new Promise<Float32Array>((resolve, reject) => {
+    const cleanup = async (error?: unknown): Promise<void> => {
+      if (done) return
+      done = true
+      if (timer !== undefined) clearTimeout(timer)
+      options.signal?.removeEventListener('abort', onAbort)
+      processor.onaudioprocess = null
+      try {
+        processor.disconnect()
+        source.disconnect()
+        sink.disconnect()
+      } catch {
+        // A partially constructed graph can already be detached.
+      }
+      stream.getTracks().forEach((track) => { track.stop() })
+      const captured = flatten(chunks)
+      const samples = resample(captured, context.sampleRate, TARGET_RATE)
+      if (context.state !== 'closed') await context.close().catch(() => undefined)
+      if (error) { reject(error); return }
+      if (peak < 0.008) { reject(new Error('没有听到声音，请靠近麦克风再试')); return }
+      if (samples.length / TARGET_RATE < 1) { reject(new Error('录音太短，请说满两秒再试')); return }
+      resolve(samples)
+    }
+    const onAbort = (): void => { void cleanup(new Error('录音已取消')) }
+    timer = setTimeout(() => { void cleanup() }, seconds * 1000)
+    options.signal?.addEventListener('abort', onAbort)
+    processor.onaudioprocess = (event) => {
+      if (done) return
+      const input = event.inputBuffer.getChannelData(0)
+      const copy = new Float32Array(input.length)
+      copy.set(input)
+      chunks.push(copy)
+      let sum = 0
+      for (const sample of copy) sum += sample * sample
+      const rms = Math.sqrt(sum / copy.length)
+      if (rms > peak) peak = rms
+      options.onLevel?.(Math.min(1, rms / 0.25))
+    }
+    source.connect(processor)
+    processor.connect(sink)
+    sink.connect(context.destination)
+  })
+}

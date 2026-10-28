@@ -31,6 +31,7 @@ await build({
     '@deepseek-ai/schemastery',
     '@deepseek-ai/dsh-host-webserver',
     '@deepseek-ai/dsh-llm',
+    'sherpa-onnx-node',
     'node:*',
   ],
   banner: {
@@ -101,6 +102,15 @@ await build({
 await build({
   entryPoints: ['src/wav.ts'],
   outfile: 'lib/wav.js',
+  bundle: false,
+  format: 'esm',
+  platform: 'node',
+  logLevel: 'silent',
+})
+
+await build({
+  entryPoints: ['src/voiceprint.ts'],
+  outfile: 'lib/voiceprint.js',
   bundle: false,
   format: 'esm',
   platform: 'node',

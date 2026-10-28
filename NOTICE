@@ -19,5 +19,10 @@ MIT-licensed projects:
   was copied. Copyright (c) 2026 1624318455.
   https://github.com/1624318455/dsh-plugin-tts
 
+- **3D-Speaker / CAM++** — the optional speaker-embedding model
+  `3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` is downloaded at runtime
+  from the sherpa-onnx release mirror; it is not bundled. Apache-2.0.
+  https://github.com/modelscope/3D-Speaker
+
 The bundled npm dependencies keep their own licenses; see
 node_modules/<package>/LICENSE after installation.

@@ -11,14 +11,34 @@ export interface VoiceDialogPreferences {
   deviceId: string
   /** Silence that closes an utterance, in milliseconds. */
   pauseMs: number
+  /** Prefix each transcript with the detected speaker label. */
+  speakerPrefix: boolean
+  /** Drop utterances that do not match the enrolled voiceprint. */
+  speakerGate: boolean
+  /** Cosine similarity at which an utterance counts as the enrolled speaker. */
+  speakerThreshold: number
 }
 
 const STORAGE_KEY = 'dsh-voice-dialog.preferences'
-const DEFAULTS: VoiceDialogPreferences = { autoRead: true, volume: 0.9, duckLevel: 0.18, deviceId: '', pauseMs: 1600 }
+const DEFAULTS: VoiceDialogPreferences = {
+  autoRead: true,
+  volume: 0.9,
+  duckLevel: 0.18,
+  deviceId: '',
+  pauseMs: 1600,
+  speakerPrefix: true,
+  speakerGate: false,
+  speakerThreshold: 0.52,
+}
 
 function clampPause(value: unknown, fallback: number): number {
   const number = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(number) ? Math.min(3000, Math.max(800, Math.round(number))) : fallback
+}
+
+function clampThreshold(value: unknown, fallback: number): number {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? Math.min(0.8, Math.max(0.35, Math.round(number * 100) / 100)) : fallback
 }
 const listeners = new Set<(value: VoiceDialogPreferences) => void>()
 
@@ -37,6 +57,9 @@ function parse(raw: string | null): VoiceDialogPreferences {
       duckLevel: clamp(value.duckLevel, DEFAULTS.duckLevel),
       deviceId: typeof value.deviceId === 'string' ? value.deviceId : DEFAULTS.deviceId,
       pauseMs: clampPause(value.pauseMs, DEFAULTS.pauseMs),
+      speakerPrefix: typeof value.speakerPrefix === 'boolean' ? value.speakerPrefix : DEFAULTS.speakerPrefix,
+      speakerGate: typeof value.speakerGate === 'boolean' ? value.speakerGate : DEFAULTS.speakerGate,
+      speakerThreshold: clampThreshold(value.speakerThreshold, DEFAULTS.speakerThreshold),
     }
   } catch {
     return { ...DEFAULTS }
@@ -58,6 +81,7 @@ export function setPreferences(patch: Partial<VoiceDialogPreferences>): VoiceDia
   next.volume = clamp(next.volume, DEFAULTS.volume)
   next.duckLevel = clamp(next.duckLevel, DEFAULTS.duckLevel)
   next.pauseMs = clampPause(next.pauseMs, DEFAULTS.pauseMs)
+  next.speakerThreshold = clampThreshold(next.speakerThreshold, DEFAULTS.speakerThreshold)
   current = next
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)) } catch { /* private mode */ }
   for (const listener of listeners) listener(next)

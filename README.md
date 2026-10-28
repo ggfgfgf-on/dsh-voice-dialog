@@ -12,6 +12,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 - **Model-directed speech.** The model can choose the exact spoken words from reasoning: `[[voice: 要说的内容]]`, `[[voice: volume +0.15]]`, `[[voice: repeat]]`, `[[voice: stop]]`. A say marker suppresses automatic reading of the visible answer; without one, the final answer is read.
 - **Model-facing voice control.** A `voice_dialog` tool lets the model react to spoken meta-commands: 轻一点/响一点 (`volume`), 听不清/什么/重复一遍 (`repeat`), 别说了/闭嘴/停 (`stop`). The host broadcasts the action to the browser over the same SSE stream. `stop` also mutes new sentences until the user speaks again. The same actions and exact speech are available as reasoning markers, so the model can decide naturally without a tool call.
 - **Background subagents.** While the microphone is active, the host records that parent session's voice state. When a subagent finishes, its final assistant text is summarized and queued straight into the parent's TTS stream, so the result is spoken without starting another main-model turn. A short heartbeat expires the state if the tab disappears.
+- **Speaker labels.** A local CAM++ voiceprint model (run by `sherpa-onnx-node`, no cloud call) identifies the enrolled owner and clusters other voices. Each transcript is prefixed with `[声纹：我]` or `[声纹：客人1]`, so the model can tell who is speaking. The settings page records the owner's voice; the optional **只回应我的声音** switch drops utterances that do not match.
 - **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation and input device all live in the plugin page under **Plugins → dsh-voice-dialog**. The active microphone expands into the built-in capture-row style with a live waveform, cancel and stop controls.
 
 ## Requirements
@@ -22,6 +23,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
   `speech-to-text`, `speech-to-text-sensevoice`, `api-speech-to-text`.
 - Network access to Microsoft Edge TTS for the selected voice; without it, read-aloud falls back to the browser's system voice. The first SenseVoice use may need a model download. When Edge needs a proxy, the plugin reads `HTTPS_PROXY` / `HTTP_PROXY` and tunnels the WebSocket with CONNECT; `DSH_VOICE_TTS_PROXY` overrides it and `NO_PROXY` can exempt Edge.
 - A secure browser context for the microphone: `https://` or `http://localhost` / `http://127.0.0.1`.
+- Optional speaker labels: `sherpa-onnx-node` (installed as an optional dependency; it resolves a prebuilt native addon for this platform) and a one-time ~27 MB CAM++ model download. Without them, voice input still works, just without speaker labels.
 
 ## Install
 
@@ -70,6 +72,9 @@ All preferences are in **Plugins → dsh-voice-dialog**:
 | Edge TTS voice | Host `~/.dsh/voice-dialog/settings.json` | Applies immediately; survives restart |
 | ASR provider, language | DSH speech selection | Shared with other speech clients |
 | Model preparation | DSH speech host | Download / cancel / retry |
+| Speaker prefix, only-my-voice, threshold | Browser `localStorage` | Prefix / gate behavior |
+| Owner voiceprint | Host `~/.dsh/voice-dialog/voiceprint.json` | Embedding only; original audio is not stored |
+| Voiceprint model | Host `~/.dsh/voice-dialog/models/` | Downloaded from the settings page |
 
 The voice selector includes Mandarin, Cantonese, Taiwanese, English and Japanese Edge voices. **Audition** synthesizes a short sample through the host without touching the live reply queue; if Edge is unavailable it reads the sample with the system voice and shows a notice.
 
@@ -93,6 +98,7 @@ SSE ──► TtsPlayer(Web Audio gain) ◄── duck on speech start ───
 
 - Audio is transcribed by the configured DSH provider. With the default SenseVoice provider it stays on this machine.
 - Only the final sentence text is sent to Microsoft Edge TTS for read-aloud.
+- Speaker verification runs on the local host. The browser sends the short segment to `127.0.0.1`; the host stores only the 192-dimensional embedding (no audio) and never sends it to a cloud service. Other speakers are clustered in memory for the current session and are not persisted.
 - Browser preferences stay in `localStorage`; the voice id is stored under `~/.dsh/voice-dialog/settings.json`. No API keys are used.
 
 ## Troubleshooting
@@ -102,6 +108,8 @@ SSE ──► TtsPlayer(Web Audio gain) ◄── duck on speech start ───
 - **Voice preview fails / `read ECONNRESET` in the log**: direct egress to `speech.platform.bing.com` is usually being reset. Set `HTTPS_PROXY` and restart DSH; the host log then prints `Edge TTS via proxy http://…`.
 - **Settings page says speech service unavailable**: both voice bundles may be enabled, or the host rows did not mount. Keep only `dsh-voice-dialog`.
 - **Model not ready**: open the plugin page and click **准备语音模型**.
+- **Speaker labels missing**: open the plugin page, check that the voiceprint model is ready, then click **录制我的声纹**. If the native component is missing, run `pnpm add sherpa-onnx-node` in the profile and restart DSH.
+- **The owner is labeled as a guest**: lower the voiceprint threshold slightly (0.52 is a good start), or re-record the voiceprint in a quieter place.
 
 ## Development
 
@@ -111,7 +119,7 @@ npm run build
 npm test
 ```
 
-`npm run build` creates the host ESM bundle, the client `__ModuleLoader__` closure, and plain-node test surfaces. `npm test` covers sentence segmentation, Markdown filtering, the no-CoT filter, WAV encoding and voice switching.
+`npm run build` creates the host ESM bundle, the client `__ModuleLoader__` closure, and plain-node test surfaces. `npm test` covers sentence segmentation, Markdown filtering, the no-CoT filter, WAV encoding, voice switching and the voiceprint WAV decoder/cosine helper. The native voiceprint model is exercised separately in development; it is not downloaded by `npm test`.
 
 ## License
 
