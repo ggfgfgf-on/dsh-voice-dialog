@@ -238,36 +238,62 @@ export function apply(ctx: Context, config: Config): void {
       },
     }),
   )
+
+  ctx.effect(() => () => { resetPreviewClient() })
 }
 
 const PREVIEW_ATTEMPTS = 2
 
-/** One-shot audition with a fresh socket, so a stale live connection cannot poison it. */
+type EdgeTtsClient = ReturnType<typeof createEdgeTts>
+/** Auditions reuse one WebSocket; a fresh TLS handshake per click is both slow and flaky. */
+let previewClient: EdgeTtsClient | undefined
+/** Serializes auditions so two quick clicks cannot race on the shared socket. */
+let previewChain: Promise<void> = Promise.resolve()
+
+function resetPreviewClient(): void {
+  const client = previewClient
+  previewClient = undefined
+  if (client) { try { client.close() } catch { /* already closed */ } }
+}
+
+async function previewTurn(text: string, requested: string): Promise<Buffer> {
+  const client = previewClient ?? (previewClient = createEdgeTts())
+  await client.setMetadata(requested, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3, {
+    wordBoundaryEnabled: false,
+    sentenceBoundaryEnabled: false,
+  })
+  const { audioStream } = await client.toStream(text)
+  const chunks: Buffer[] = []
+  for await (const chunk of audioStream) chunks.push(chunk as Buffer)
+  const audio = Buffer.concat(chunks)
+  if (audio.length === 0) throw new Error('empty synthesis')
+  return audio
+}
+
+/**
+ * One-shot audition on top of a persistent connection.
+ *
+ * The first click pays the handshake; later clicks reuse the open socket.
+ * A reset closes and re-dials once before falling back to the system voice.
+ */
 async function synthesizePreview(text: string, requested: string): Promise<Buffer> {
-  let lastError: unknown
-  for (let attempt = 1; attempt <= PREVIEW_ATTEMPTS; attempt++) {
-    const preview = createEdgeTts()
-    try {
-      await preview.setMetadata(requested, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3, {
-        wordBoundaryEnabled: false,
-        sentenceBoundaryEnabled: false,
-      })
-      const { audioStream } = await preview.toStream(text)
-      const chunks: Buffer[] = []
-      for await (const chunk of audioStream) chunks.push(chunk as Buffer)
-      const audio = Buffer.concat(chunks)
-      if (audio.length === 0) throw new Error('empty synthesis')
-      return audio
-    } catch (error) {
-      lastError = error
-      if (attempt < PREVIEW_ATTEMPTS) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 250))
+  const run = previewChain.then(async () => {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= PREVIEW_ATTEMPTS; attempt++) {
+      try {
+        return await previewTurn(text, requested)
+      } catch (error) {
+        lastError = error
+        resetPreviewClient()
+        if (attempt < PREVIEW_ATTEMPTS) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 120))
+        }
       }
-    } finally {
-      try { await preview.close() } catch { /* already closed */ }
     }
-  }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError))
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
+  })
+  previewChain = run.then(() => undefined, () => undefined)
+  return run
 }
 
 function writeJson(res: ServerResponse, status: number, value: unknown): void {

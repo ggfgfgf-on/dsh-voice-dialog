@@ -105,8 +105,8 @@ export function createEdgeTts(): MsEdgeTTS {
   }
   return new MsEdgeTTS({
     agent,
-    connectionTimeoutMs: 15_000,
-    synthesisTimeoutMs: 30_000,
+    connectionTimeoutMs: 8_000,
+    synthesisTimeoutMs: 20_000,
   })
 }
 

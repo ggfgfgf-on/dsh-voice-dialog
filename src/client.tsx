@@ -732,7 +732,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       <div className="dsh-vd-preview">
         <input aria-label="试听文本" value={previewText} onChange={(event) => { setPreviewText(event.target.value) }} />
         <button type="button" className="dsh-vd-button" disabled={busy || !previewText.trim()}
-          onClick={() => { void playPreview() }}>{previewing ? '停止试听' : '试听'}</button>
+          onClick={() => { void playPreview() }}>{previewing ? '停止试听' : busy ? '合成中…' : '试听'}</button>
       </div>
       {actionError && <p className="dsh-vd-error" role="alert">{actionError}</p>}
       <p className="dsh-vd-muted">说话只会压低朗读，不会切断回答；识别出的文字作为插话交给正在运行的模型，模型可以说完再回应。</p>
