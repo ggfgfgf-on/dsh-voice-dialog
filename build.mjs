@@ -32,6 +32,7 @@ await build({
     '@deepseek-ai/dsh-host-webserver',
     '@deepseek-ai/dsh-llm',
     'sherpa-onnx-node',
+    'onnxruntime-node',
     'node:*',
   ],
   banner: {
@@ -141,6 +142,31 @@ await build({
   bundle: false,
   format: 'esm',
   platform: 'node',
+  logLevel: 'silent',
+})
+
+await build({
+  entryPoints: ['src/separation.ts'],
+  outfile: 'lib/separation.js',
+  bundle: false,
+  format: 'esm',
+  platform: 'node',
+  logLevel: 'silent',
+})
+
+// The worker is bundled: it is forked as a plain .js file and must not import .ts.
+await build({
+  entryPoints: ['src/separation-worker.ts'],
+  outfile: 'lib/separation-worker.js',
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  external: ['onnxruntime-node', 'node:*'],
+  banner: {
+    js:
+      "import { createRequire as __dshCreateRequire } from 'node:module';\n" +
+      'const require = __dshCreateRequire(import.meta.url);',
+  },
   logLevel: 'silent',
 })
 

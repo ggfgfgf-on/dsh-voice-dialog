@@ -13,7 +13,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 - **Model-directed speech.** The model can choose the exact spoken words from reasoning: `[[voice: 要说的内容]]`, `[[voice: volume +0.15]]`, `[[voice: rate +10]]`, `[[voice: repeat]]`, `[[voice: stop]]`. A say marker adds a spoken prefix rather than replacing the visible answer. The same rate control is exposed to the model through the `voice_dialog` tool, so “说慢一点/说快一点/语速调到…” adjusts following sentences immediately.
 - **Model-facing voice control.** A `voice_dialog` tool lets the model react to spoken meta-commands: 轻一点/响一点 (`volume`), 听不清/什么/重复一遍 (`repeat`), 别说了/闭嘴/停 (`stop`). The host broadcasts the action to the browser over the same SSE stream. `stop` also mutes new sentences until the user speaks again. The same actions and exact speech are available as reasoning markers, so the model can decide naturally without a tool call.
 - **Background subagents.** While the microphone is active, the host records that parent session's voice state. When a subagent finishes, its final assistant text is summarized and queued straight into the parent's TTS stream, so the result is spoken without starting another main-model turn. A short heartbeat expires the state if the tab disappears.
-- **Speaker labels and priority.** A local CAM++ voiceprint model (run by `sherpa-onnx-node`, no cloud call) identifies the enrolled owner and clusters other voices. Each transcript is prefixed with `[声纹：我]` or `[声纹：客人1]`, so the model can tell who is speaking. The owner is high priority; guests are low priority. The settings page can enroll the owner plus other regular speakers under persistent names, so their names replace “客人1” in transcripts. Confirmed owner utterances slowly reinforce the template, and the optional **只回应我的声音** switch drops utterances that do not match. The model can also decide per speaker: `voice_dialog` action `speaker` with `speaker: "客人1"` and `policy: "ignore"` drops that guest's future lines, `"queue"` restores queuing, and `speaker: "*"` applies to all guests. A `name` renames the voiceprint (for example `"老婆"`), after which both the canonical label and the new name work for policies and transcripts. The owner `我` cannot be renamed or ignored. One microphone cannot physically separate two voices speaking at the exact same instant; back-to-back interjections are recognized in parallel, while true overlap still needs two microphones or source separation.
+- **Speaker labels and priority.** A local CAM++ voiceprint model (run by `sherpa-onnx-node`, no cloud call) identifies the enrolled owner and clusters other voices. Each transcript is prefixed with `[声纹：我]` or `[声纹：客人1]`, so the model can tell who is speaking. The owner is high priority; guests are low priority. The settings page can enroll the owner plus other regular speakers under persistent names, so their names replace “客人1” in transcripts. Confirmed owner utterances slowly reinforce the template, and the optional **只回应我的声音** switch drops utterances that do not match. The model can also decide per speaker: `voice_dialog` action `speaker` with `speaker: "客人1"` and `policy: "ignore"` drops that guest's future lines, `"queue"` restores queuing, and `speaker: "*"` applies to all guests. A `name` renames the voiceprint (for example `"老婆"`), after which both the canonical label and the new name work for policies and transcripts. The owner `我` cannot be renamed or ignored. When two people talk over each other, an optional local MossFormer2 ONNX model splits the single microphone segment into two streams before recognition; each stream gets its own voiceprint label and queue position. The splitter handles two simultaneous speakers well and falls back to the untouched audio when only one person is talking. Three or more overlapping voices can still be merged.
 - **Settings page.** Auto-read, volume, duck level, Edge voice + audition, ASR provider/language, model preparation, owner/guest delivery policy, parallel recognition and input device all live in the plugin page under **Plugins → dsh-voice-dialog**. The active microphone expands into the built-in capture-row style with a live waveform, cancel and stop controls.
 
 ## Requirements
@@ -25,6 +25,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 - Network access to Microsoft Edge TTS for the selected voice; without it, read-aloud falls back to the browser's system voice. The first SenseVoice use may need a model download. When Edge needs a proxy, the plugin reads `HTTPS_PROXY` / `HTTP_PROXY` and tunnels the WebSocket with CONNECT; `DSH_VOICE_TTS_PROXY` overrides it and `NO_PROXY` can exempt Edge.
 - A secure browser context for the microphone: `https://` or `http://localhost` / `http://127.0.0.1`.
 - Optional speaker labels: `sherpa-onnx-node` (installed as an optional dependency; it resolves a prebuilt native addon for this platform) and a one-time ~27 MB CAM++ model download. Without them, voice input still works, just without speaker labels.
+- Optional simultaneous-speech separation: `onnxruntime-node` plus a one-time ~234 MB MossFormer2 model download (an ONNX export of Alibaba's `MossFormer2_SS_16K`, Apache-2.0). DirectML is tried first (about 0.4 s per 4 s window on a supported GPU); CPU is the fallback. Without it, ordinary dictation is unchanged.
 
 ## Install
 
@@ -78,6 +79,8 @@ All preferences are in **Plugins → dsh-voice-dialog**:
 | Owner delivery, guest interjection policy, parallel ASR | Browser `localStorage` | Owner queues by default (or steers); guests queue (default), steer, or ignore; up to 3 ASR lanes, strict FIFO delivery |
 | Owner + named guest voiceprints | Host `~/.dsh/voice-dialog/voiceprint.json` | Embeddings only; original audio is not stored; up to 12 named guests |
 | Voiceprint model | Host `~/.dsh/voice-dialog/models/` | Downloaded from the settings page |
+| Simultaneous-speech separation | Browser `localStorage` + host model | Optional; splits two overlapping speakers into two labelled recognition lanes |
+| Separation model | Host `~/.dsh/voice-dialog/models/mossformer2_ss_16k.onnx` | ~234 MB; downloaded from the settings page |
 
 The voice selector includes Mandarin, Cantonese, Taiwanese, English and Japanese Edge voices. **Audition** synthesizes a short sample through the host without touching the live reply queue; if Edge is unavailable it reads the sample with the system voice and shows a notice.
 
@@ -88,7 +91,7 @@ llm/stream ──filter(purpose, text-delta)──► SentenceSegmenter ──�
                                                                                    ▲
 subagent/end ──parent voice-state──► summary ───────────────────────────────────────┘
                                                                                    │
-composer microphone ──► MicrophoneLoop(VAD) ──► parallel ASR ──► global FIFO queue ──► prompt(queue)
+composer microphone ──► MicrophoneLoop(VAD) ──► [optional 2-way separation] ──► parallel ASR ──► global FIFO queue ──► prompt(queue)
                                                                   └──► interrupt/ignore controls
                                                                                    │
 SSE ──► TtsPlayer(Web Audio gain) ◄── duck on speech start ────────────────────────┘
@@ -102,7 +105,7 @@ SSE ──► TtsPlayer(Web Audio gain) ◄── duck on speech start ───
 
 - Audio is transcribed by the configured DSH provider. With the default SenseVoice provider it stays on this machine.
 - Only the final sentence text is sent to Microsoft Edge TTS for read-aloud.
-- Speaker verification runs on the local host. The browser sends the short segment to `127.0.0.1`; the host stores only the 192-dimensional embedding (no audio) and never sends it to a cloud service. Other speakers are clustered in memory for the current session and are not persisted.
+- Speaker verification and simultaneous-speech separation run on the local host. The browser sends the short segment to `127.0.0.1`; the host stores only the 192-dimensional embedding (no audio) and never sends it to a cloud service. Separated streams exist only in memory for the current request. Other speakers are clustered in memory for the current session and are not persisted.
 - Browser preferences stay in `localStorage`; the voice id is stored under `~/.dsh/voice-dialog/settings.json`. No API keys are used.
 
 ## Troubleshooting
@@ -123,7 +126,7 @@ npm run build
 npm test
 ```
 
-`npm run build` creates the host ESM bundle, the client `__ModuleLoader__` closure, and plain-node test surfaces. `npm test` covers strict FIFO delivery, queue-aware voice commands, sentence segmentation, Markdown filtering, the no-CoT filter, WAV encoding, voice switching and the voiceprint WAV decoder/cosine helper. The native voiceprint model is exercised separately in development; it is not downloaded by `npm test`.
+`npm run build` creates the host ESM bundle, the client `__ModuleLoader__` closure, and plain-node test surfaces. `npm test` covers strict FIFO delivery, queue-aware voice commands, sentence segmentation, Markdown filtering, the no-CoT filter, WAV encoding, voice switching, the voiceprint WAV decoder/cosine helper, and the separation window/overlap logic with an injected runner. The native voiceprint and separation models are exercised separately in development; they are not downloaded by `npm test`.
 
 ## License
 

@@ -68,6 +68,30 @@ interface SpeakerIdentity {
   similarity: number
 }
 
+interface SeparationStatus {
+  addonAvailable: boolean
+  modelPresent: boolean
+  ready: boolean
+  modelPath: string
+  modelBytes: number
+  backend?: string
+  error?: string
+}
+
+interface SeparatedSource {
+  audioBase64: string
+  rms: number
+  onsetMs: number
+  identity: SpeakerIdentity | null
+}
+
+interface SeparationResult {
+  ok: boolean
+  separated: boolean
+  elapsedMs: number
+  sources: SeparatedSource[]
+}
+
 /** Edge TTS voices exposed by the settings page. */
 const VOICES: ReadonlyArray<readonly [string, string]> = [
   ['zh-CN-XiaoxiaoNeural', '晓晓（女声，默认）'],
@@ -152,6 +176,39 @@ async function prepareVoiceprint(): Promise<VoiceprintStatus> {
   const response = await fetch(apiUrl('/voiceprint/prepare'), { method: 'POST' })
   if (!response.ok) throw await errorFrom(response, '声纹模型下载失败')
   return await response.json() as VoiceprintStatus
+}
+
+async function fetchSeparationStatus(): Promise<SeparationStatus> {
+  const response = await fetch(apiUrl('/separation/status'))
+  if (!response.ok) throw await errorFrom(response, '分离模型状态读取失败')
+  return await response.json() as SeparationStatus
+}
+
+async function prepareSeparation(): Promise<SeparationStatus> {
+  const response = await fetch(apiUrl('/separation/prepare'), { method: 'POST' })
+  if (!response.ok) throw await errorFrom(response, '分离模型下载失败')
+  return await response.json() as SeparationStatus
+}
+
+async function warmSeparation(): Promise<void> {
+  const response = await fetch(apiUrl('/separation/warm'), { method: 'POST' })
+  if (!response.ok) throw await errorFrom(response, '分离模型预热失败')
+}
+
+async function separateSegment(
+  samples: Float32Array, sessionId: string, threshold: number,
+): Promise<SeparationResult> {
+  const response = await fetch(apiUrl('/separation/separate'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      audioBase64: audioBase64(encodeWave(samples)),
+      sessionId,
+      threshold,
+    }),
+  })
+  if (!response.ok) throw await errorFrom(response, '同时说话分离失败')
+  return await response.json() as SeparationResult
 }
 
 async function enrollVoiceprint(samples: Float32Array): Promise<void> {
@@ -582,6 +639,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const micRef = useRef<MicrophoneLoop | null>(null)
   const schedulerRef = useRef<SpeechScheduler | null>(null)
   const classifyRef = useRef<Promise<void>>(Promise.resolve())
+  const separationReadyRef = useRef(false)
+  const separationRetryAtRef = useRef(0)
   useAutoRead(sessionId)
   useLayoutEffect(() => {
     onActiveChange?.(active)
@@ -664,7 +723,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     }
   }, [sessionId])
 
-  const transcribeSamples = async (samples: Float32Array): Promise<string> => {
+  const transcribeAudio = async (audioBase64Value: string): Promise<string> => {
     const catalog = await ctx.remote.speech.catalog()
     if (!catalog.ok) throw new Error(catalog.error?.message ?? '语音识别服务不可用')
     const provider = catalog.value.providers.find((item: any) => item.id === catalog.value.selection.providerId)
@@ -672,11 +731,54 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       throw new Error('语音模型未就绪，请在插件设置中准备')
     }
     const result = await ctx.remote.speech.transcribe({
-      audioBase64: audioBase64(encodeWave(samples)),
+      audioBase64: audioBase64Value,
       ...catalog.value.selection,
     }, new AbortController().signal)
     if (!result.ok) throw new Error(result.error?.message ?? '识别失败')
     return String(result.value?.text ?? '').trim()
+  }
+
+  const transcribeSamples = (samples: Float32Array): Promise<string> =>
+    transcribeAudio(audioBase64(encodeWave(samples)))
+
+  /** Turn the two separated streams into two independently labelled lanes. */
+  const enqueueSeparated = (
+    result: SeparationResult,
+    scheduler: SpeechScheduler,
+    runLimited: <T>(task: () => Promise<T>) => Promise<T>,
+  ): void => {
+    const prefs = getPreferences()
+    const tasks: Array<{
+      lane: 'owner' | 'guest'
+      canonical: string
+      onsetMs: number
+      work: Promise<string | null>
+    }> = []
+    result.sources.forEach((source, index) => {
+      const identity = source.identity
+      const canonical = identity?.label || '说话人' + (index + 1)
+      const lane: 'owner' | 'guest' = identity?.enrolled === true && !identity.owner ? 'guest' : 'owner'
+      const display = displaySpeaker(sessionId, canonical)
+      if (prefs.speakerGate && identity?.owner !== true) {
+        setSpeaker('已忽略其他人的声音')
+        return
+      }
+      if (lane === 'guest' && effectiveGuestMode(sessionId, canonical) === 'ignore') {
+        setSpeaker('已忽略' + (display || '其他人'))
+        return
+      }
+      if (lane === 'guest') setSpeaker(display || '其他人')
+      const prefix = prefs.speakerPrefix && display ? '[声纹：' + display + '] ' : ''
+      const work = runLimited(async () => {
+        const text = await transcribeAudio(source.audioBase64)
+        return text ? prefix + text : null
+      })
+      tasks.push({ lane, canonical, onsetMs: source.onsetMs, work })
+    })
+    // Keep the earlier speaker first; if they started together, the owner goes first.
+    tasks.sort((a, b) => a.onsetMs - b.onsetMs
+      || (a.lane === b.lane ? 0 : a.lane === 'owner' ? -1 : 1))
+    for (const task of tasks) scheduler.enqueue(task.lane, task.canonical, task.work)
   }
 
   /** Identify first, then hand one lane to the scheduler. */
@@ -687,8 +789,27 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   ): Promise<void> => {
     const prefs = getPreferences()
     let identity: SpeakerIdentity | null = null
-    if (prefs.speakerPrefix || prefs.speakerGate || prefs.guestMode !== 'steer'
-      || speakerPolicy.hasCustomization(sessionId)) {
+
+    if (prefs.separateSpeakers && separationReadyRef.current && Date.now() >= separationRetryAtRef.current) {
+      try {
+        const split = await separateSegment(samples, sessionId, prefs.speakerThreshold)
+        if (split.separated && split.sources.length >= 2) {
+          enqueueSeparated(split, scheduler, runLimited)
+          return
+        }
+        identity = split.sources[0]?.identity ?? null
+      } catch (failure) {
+        // Separation is an enhancement. A missing device, model, or a rare
+        // inference failure must leave ordinary dictation untouched.
+        console.warn('[dsh-voice-dialog] separation skipped', failure)
+        // A transient worker/model failure should not disable separation for
+        // the rest of the session; retry after a short cooldown.
+        separationRetryAtRef.current = Date.now() + 30_000
+      }
+    }
+
+    if (!identity && (prefs.speakerPrefix || prefs.speakerGate || prefs.guestMode !== 'steer'
+      || speakerPolicy.hasCustomization(sessionId))) {
       try {
         identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold)
         setSpeaker(displaySpeaker(sessionId, identity.label))
@@ -790,6 +911,19 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     setPhase('starting')
     try {
       const prefs = getPreferences()
+      separationReadyRef.current = false
+      separationRetryAtRef.current = 0
+      if (prefs.separateSpeakers) {
+        try {
+          const status = await fetchSeparationStatus()
+          separationReadyRef.current = status.ready
+          // Loading the 245 MB model takes a couple of seconds; do it while
+          // the user is still listening, not after the first overlap.
+          if (status.ready) void warmSeparation().catch(() => undefined)
+        } catch {
+          // Separation is optional; ordinary dictation must still start.
+        }
+      }
       if (prefs.speakerGate) {
         const status = await fetchVoiceprintStatus()
         if (!status.ready) throw new Error(status.error ?? '声纹模型未安装，请在插件设置中准备')
@@ -907,6 +1041,9 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   const [voiceprint, setVoiceprint] = useState<VoiceprintStatus | null>(null)
   const [voiceprintError, setVoiceprintError] = useState('')
   const [voiceprintBusy, setVoiceprintBusy] = useState<'' | 'prepare' | 'record' | 'record-other' | 'forget'>('')
+  const [separation, setSeparation] = useState<SeparationStatus | null>(null)
+  const [separationError, setSeparationError] = useState('')
+  const [separationBusy, setSeparationBusy] = useState(false)
   const [recordingTarget, setRecordingTarget] = useState<'owner' | 'guest' | ''>('')
   const [guestName, setGuestName] = useState('')
   const [speakerBusy, setSpeakerBusy] = useState('')
@@ -938,7 +1075,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       .then((all) => setDevices(all.filter((device) => device.kind === 'audioinput')))
       .catch(() => undefined)
   }, [])
-  useEffect(() => { void refreshVoiceprint() }, [])
+  useEffect(() => { void refreshVoiceprint(); void refreshSeparation() }, [])
   useEffect(() => () => { recordAbort.current?.abort() }, [])
 
   const refreshVoiceprint = async (): Promise<void> => {
@@ -947,6 +1084,27 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       setVoiceprintError('')
     } catch (failure) {
       setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }
+
+  const refreshSeparation = async (): Promise<void> => {
+    try {
+      setSeparation(await fetchSeparationStatus())
+      setSeparationError('')
+    } catch (failure) {
+      setSeparationError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }
+
+  const downloadSeparation = async (): Promise<void> => {
+    setSeparationBusy(true)
+    setSeparationError('')
+    try {
+      setSeparation(await prepareSeparation())
+    } catch (failure) {
+      setSeparationError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setSeparationBusy(false)
     }
   }
 
@@ -1309,6 +1467,26 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       <p className="dsh-vd-muted">带「客人」前缀的是其他人；只有登记过我的声纹，才能启用「只回应我的声音」。每次判定是你的声音，会用它慢慢强化声纹；其他人的声音不会写进去。</p>
     </section>
 
+    <section>
+      <h3>同时说话分离</h3>
+      <p className="dsh-vd-muted">一个麦克风里两个人同时开口时，本地模型会把声音分成两路，再分别识别、分别标声纹。单人说话会自动走原来的识别路径，不会重复排队。</p>
+      <label className="dsh-vd-check"><input type="checkbox" checked={prefs.separateSpeakers}
+        onChange={(event) => { save({ separateSpeakers: event.target.checked }) }} />自动分离同时开口的声音</label>
+      {separation === null && !separationError && <p className="dsh-vd-muted">正在检查分离模型…</p>}
+      {separation && <div className="dsh-vd-vpStatus">
+        <span>{separation.ready ? '分离模型已就绪' : separation.modelPresent ? '缺少分离组件' : '分离模型未安装'}</span>
+        {separation.backend && <span>{separation.backend === 'dml' ? '显卡加速' : '处理器'}</span>}
+        {separation.modelBytes > 0 && <span>{(separation.modelBytes / 1_000_000).toFixed(1)} MB</span>}
+      </div>}
+      {separation && !separation.addonAvailable && <p className="dsh-vd-error">缺少本地分离组件：在 profile 目录执行 pnpm add onnxruntime-node，然后重启 DSH。</p>}
+      {separation && !separation.modelPresent && separation.addonAvailable && <button type="button" className="dsh-vd-button"
+        disabled={separationBusy} onClick={() => { void downloadSeparation() }}>
+        {separationBusy ? '下载中…' : '下载分离模型（约 234MB）'}
+      </button>}
+      {separation && separation.modelPresent && !separation.ready && <p className="dsh-vd-muted">模型已存在，但本地推理组件还没加载成功。</p>}
+      {separationError && <p className="dsh-vd-error" role="alert">{separationError}</p>}
+      <p className="dsh-vd-muted">开关在重新开始语音后生效。模型只支持两个人同时说；三个人以上仍可能混在一路里。</p>
+    </section>
 
     <section>
       <h3>多人插话</h3>
@@ -1326,7 +1504,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       </select></label>
       <label className="dsh-vd-check"><input type="checkbox" checked={prefs.parallelAsr}
         onChange={(event) => { save({ parallelAsr: event.target.checked }) }} />并行识别多段语音（最多三路）</label>
-      <p className="dsh-vd-muted">先后接话的多个人可以同时识别，互不阻塞。同一个瞬间两个人同时开口，仍可能被当成一段音频；完全分离需要双麦克风或额外的声源分离。</p>
+      <p className="dsh-vd-muted">先后接话的多个人可以同时识别，互不阻塞。同一个瞬间两个人同时开口时，上面的本地分离会把它拆成两路再排队；三个人以上仍可能混在一起。</p>
       <p className="dsh-vd-muted">最新一句说“打断 / 停一下”，会立刻停朗读并清掉还没送出的队列；说“忽略客人1 / 别理老婆”，会当场改策略并删掉那个人排队的句子；说“恢复”重新排队。</p>
       <p className="dsh-vd-muted">模型也能按声纹临时调整：如果某个客人总在插无关的话，可以让模型忽略他；也可以让模型给声纹起名，比如“这个是我老婆”，之后就用老婆称呼。主人不会被忽略。这些调整只在当前会话内存里生效，刷新页面就恢复默认。</p>
       <p className="dsh-vd-muted">没登记我的声纹时无法区分主人和客人，所有语音都按主人处理。</p>

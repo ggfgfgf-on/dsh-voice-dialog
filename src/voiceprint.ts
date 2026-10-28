@@ -401,10 +401,15 @@ export class VoiceprintService {
     this.saveOwner()
   }
 
-  private bestGuest(sessionId: string, embedding: Float32Array): { cluster?: SpeakerCluster; similarity: number } {
+  private bestGuest(
+    sessionId: string,
+    embedding: Float32Array,
+    exclude: Set<string>,
+  ): { cluster?: SpeakerCluster; similarity: number } {
     let best: SpeakerCluster | undefined
     let bestSimilarity = -1
     for (const cluster of this.clusters.get(sessionId) ?? []) {
+      if (exclude.has(cluster.label)) continue
       const similarity = cosineSimilarity(embedding, cluster.centroid)
       if (similarity > bestSimilarity) {
         best = cluster
@@ -522,7 +527,7 @@ export class VoiceprintService {
 
   async identify(
     samples: Float32Array,
-    options: { sessionId?: string; threshold?: number } = {},
+    options: { sessionId?: string; threshold?: number; adapt?: boolean; excludeLabels?: string[] } = {},
   ): Promise<IdentifyResult> {
     if (samples.length < MIN_IDENTIFY_SAMPLES) throw new Error('这段话太短，无法判断声纹')
     const embedding = await this.compute(samples)
@@ -530,7 +535,8 @@ export class VoiceprintService {
     const threshold = Math.min(0.85, Math.max(0.3, options.threshold ?? DEFAULT_THRESHOLD))
     const sessionId = (options.sessionId ?? '').trim() || 'default'
     const previousLabel = this.lastSpeakerLabels.get(sessionId)
-    const guest = this.bestGuest(sessionId, embedding)
+    const exclude = new Set((options.excludeLabels ?? []).filter((label) => typeof label === 'string'))
+    const guest = this.bestGuest(sessionId, embedding, exclude)
     const namedSpeakers = this.loadSpeakers()
     const named = this.bestNamed(namedSpeakers, embedding)
     const namedThreshold = Math.max(NAMED_THRESHOLD_FLOOR, threshold)
@@ -541,7 +547,7 @@ export class VoiceprintService {
     if (owner) {
       const similarity = cosineSimilarity(embedding, owner)
       if (similarity >= threshold && !namedIsClearlyStronger) {
-        this.adaptOwner(embedding, OWNER_ADAPT_WEIGHT)
+        if (options.adapt !== false) this.adaptOwner(embedding, OWNER_ADAPT_WEIGHT)
         this.rememberLabel(sessionId, '我')
         return { enrolled: true, owner: true, label: '我', similarity }
       }
@@ -557,7 +563,7 @@ export class VoiceprintService {
       const priorOwnerException = previousLabel === '我' && similarity >= OWNER_HISTORY_FLOOR
         && !namedIsClearlyStronger
       if (similarity >= softFloor && (!guestIsClearlyStronger || priorOwnerException)) {
-        this.adaptOwner(embedding, OWNER_SOFT_ADAPT_WEIGHT)
+        if (options.adapt !== false) this.adaptOwner(embedding, OWNER_SOFT_ADAPT_WEIGHT)
         this.rememberLabel(sessionId, '我')
         return { enrolled: true, owner: true, label: '我', similarity }
       }

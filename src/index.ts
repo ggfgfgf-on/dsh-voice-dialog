@@ -12,6 +12,7 @@ import { hasSpeechContent, sanitizeForSpeech, SentenceSegmenter } from './segmen
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { createEdgeTts, rateToProsody, TtsQueue, type VoiceFrame } from './tts-queue.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
+import { encodeWavBase64, SeparationService } from './separation.ts'
 import { VoiceProtocol, type VoiceCommand } from './voice-protocol.ts'
 
 export const name = 'voice-dialog'
@@ -87,6 +88,7 @@ export function apply(ctx: Context, config: Config): void {
   const queue = new TtsQueue({ voice })
   queue.setRate(rate)
   const voiceprint = new VoiceprintService()
+  const separation = new SeparationService()
   const broadcast = (event: 'audio' | 'control', data: VoiceFrame | VoiceControl): void => {
     for (const send of clients) {
       try {
@@ -110,6 +112,7 @@ export function apply(ctx: Context, config: Config): void {
   const unsubscribe = queue.subscribe((frame) => { broadcast('audio', frame) })
   ctx.effect(() => unsubscribe)
   ctx.effect(() => async () => { await queue.close() })
+  ctx.effect(() => () => { void separation.close() })
   // Dial Edge before the first reply: the proxy handshake is the slow/flaky
   // part, and waiting for it inside the first sentence feels like no audio.
   void queue.warm().catch((error: unknown) => {
@@ -505,6 +508,72 @@ export function apply(ctx: Context, config: Config): void {
       writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
     }
   }
+  const separationStatus = (_req: unknown, res: ServerResponse): void => {
+    writeJson(res, 200, separation.status())
+  }
+  const separationPrepare = async (_req: unknown, res: ServerResponse): Promise<void> => {
+    try { writeJson(res, 200, { ok: true, ...(await separation.prepare()) }) }
+    catch (error) { writeJson(res, 502, { error: error instanceof Error ? error.message : String(error) }) }
+  }
+  const separationWarm = async (_req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      await separation.warm()
+      writeJson(res, 200, { ok: true, backend: separation.status().backend })
+    } catch (error) {
+      writeJson(res, 502, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  const separationRun = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req as IncomingMessage, 8 * 1024 * 1024)
+      const audio = typeof body.audioBase64 === 'string' ? body.audioBase64 : ''
+      if (!audio) throw new Error('缺少语音数据')
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+      const threshold = typeof body.threshold === 'number' ? body.threshold : undefined
+      const samples = decodeWavBase64(audio)
+      const result = await separation.separate(samples)
+      const loud = Math.max(...result.sources.map((source) => source.rms), 0)
+      // One dominant stream is ordinary dictation: keep the untouched audio
+      // and the normal voiceprint path instead of transcribing artifacts.
+      if (result.sources.length < 2 || loud < 0.002) {
+        let identity: unknown = null
+        try { identity = await voiceprint.identify(samples, { sessionId, threshold }) } catch { /* optional */ }
+        writeJson(res, 200, {
+          ok: true,
+          separated: false,
+          elapsedMs: result.elapsedMs,
+          sources: [{ audioBase64: audio, rms: loud, onsetMs: 0, identity }],
+        })
+        return
+      }
+      const sources = []
+      // Two separated streams are two different people; do not let the second
+      // one fall into the first one's temporary guest cluster.
+      const usedGuestLabels: string[] = []
+      for (const source of result.sources) {
+        let identity: any = null
+        try {
+          identity = await voiceprint.identify(source.samples, {
+            sessionId,
+            threshold,
+            adapt: false,
+            excludeLabels: usedGuestLabels,
+          })
+        } catch { /* a very short stream can still be transcribed */ }
+        if (identity?.enrolled && !identity.owner && identity.label) usedGuestLabels.push(identity.label)
+        sources.push({
+          audioBase64: encodeWavBase64(source.samples),
+          rms: source.rms,
+          onsetMs: source.onsetMs,
+          identity,
+        })
+      }
+      writeJson(res, 200, { ok: true, separated: true, elapsedMs: result.elapsedMs, sources })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
   const voiceprintRoutes: Array<[string, (req: unknown, res: ServerResponse) => void | Promise<void>]> = [
     ['/voiceprint/status', voiceprintStatus],
     ['/voiceprint/prepare', voiceprintPrepare],
@@ -515,8 +584,14 @@ export function apply(ctx: Context, config: Config): void {
     ['/voiceprint/speakers/rename', voiceprintRenameSpeaker],
     ['/voiceprint/speakers/remove', voiceprintRemoveSpeaker],
   ]
+  const separationRoutes: Array<[string, (req: unknown, res: ServerResponse) => void | Promise<void>]> = [
+    ['/separation/status', separationStatus],
+    ['/separation/prepare', separationPrepare],
+    ['/separation/warm', separationWarm],
+    ['/separation/separate', separationRun],
+  ]
   for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
-    for (const [route, handler] of voiceprintRoutes) {
+    for (const [route, handler] of [...voiceprintRoutes, ...separationRoutes]) {
       ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: prefix + route, handler }))
     }
   }
