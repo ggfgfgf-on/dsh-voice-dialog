@@ -28,6 +28,8 @@ export interface VoiceDialogPreferences {
   parallelAsr: boolean
   /** Split overlapping speakers into two streams before recognition. */
   separateSpeakers: boolean
+  /** Let a parallel model decide whether to interrupt, queue, or ignore. */
+  organizerEnabled: boolean
 }
 
 const STORAGE_KEY = 'dsh-voice-dialog.preferences'
@@ -45,6 +47,7 @@ const DEFAULTS: VoiceDialogPreferences = {
   guestMode: 'queue',
   parallelAsr: true,
   separateSpeakers: true,
+  organizerEnabled: true,
 }
 
 function clampPause(value: unknown, fallback: number): number {
@@ -95,6 +98,7 @@ function parse(raw: string | null): VoiceDialogPreferences {
       guestMode: parseGuestMode(value.guestMode, DEFAULTS.guestMode),
       parallelAsr: typeof value.parallelAsr === 'boolean' ? value.parallelAsr : DEFAULTS.parallelAsr,
       separateSpeakers: typeof value.separateSpeakers === 'boolean' ? value.separateSpeakers : DEFAULTS.separateSpeakers,
+      organizerEnabled: typeof value.organizerEnabled === 'boolean' ? value.organizerEnabled : DEFAULTS.organizerEnabled,
     }
   } catch {
     return { ...DEFAULTS }
@@ -122,6 +126,7 @@ export function setPreferences(patch: Partial<VoiceDialogPreferences>): VoiceDia
   next.guestMode = parseGuestMode(next.guestMode, DEFAULTS.guestMode)
   next.parallelAsr = typeof next.parallelAsr === 'boolean' ? next.parallelAsr : DEFAULTS.parallelAsr
   next.separateSpeakers = typeof next.separateSpeakers === 'boolean' ? next.separateSpeakers : DEFAULTS.separateSpeakers
+  next.organizerEnabled = typeof next.organizerEnabled === 'boolean' ? next.organizerEnabled : DEFAULTS.organizerEnabled
   current = next
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)) } catch { /* private mode */ }
   for (const listener of listeners) listener(next)

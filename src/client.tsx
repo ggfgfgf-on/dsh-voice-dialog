@@ -9,6 +9,8 @@ import { MicrophoneLoop, recordVoiceSample } from './mic.ts'
 import { ContinuousSeparation, dedupeTranscript, type ContinuousSegment } from './continuous-separation.ts'
 import { getPreferences, setPreferences, subscribePreferences, type VoiceDialogPreferences } from './preferences.ts'
 import { SpeechScheduler, type GuestMode } from './scheduler.ts'
+import { SpeechOrganizer, type OrganizerRequest } from './organizer.ts'
+import { parseQueueControl } from './queue-control.ts'
 import { SpeakerPolicyStore } from './speaker-policy.ts'
 import { audioBase64, decodeWaveBase64, encodeWave } from './wav.ts'
 
@@ -196,6 +198,17 @@ async function warmSeparation(): Promise<void> {
   if (!response.ok) throw await errorFrom(response, '分离模型预热失败')
 }
 
+async function organizeSpeech(request: OrganizerRequest, signal: AbortSignal): Promise<unknown> {
+  const response = await fetch(apiUrl('/organize'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+    signal,
+  })
+  if (!response.ok) throw await errorFrom(response, '并行组织失败')
+  return await response.json()
+}
+
 async function separateSegment(
   samples: Float32Array, sessionId: string, threshold: number, identify = true,
 ): Promise<SeparationResult> {
@@ -295,6 +308,11 @@ class TtsPlayer {
   private blocked = false
   private active = false
   private muted = false
+  private cutting = false
+  private afterCut: VoiceFrame[] = []
+  private cutReplyId: string | undefined
+  private cutToken = 0
+  private currentFrame: VoiceFrame | undefined
   private sessionId: string | undefined
   private volumeOverride: number | undefined
   private lastReplyId: string | undefined
@@ -331,6 +349,61 @@ class TtsPlayer {
     this.active = false
   }
 
+  /** True while a reply is audible or waiting to be read. */
+  busy(): boolean {
+    return this.active && (this.playing || this.queue.length > 0 || this.cutting)
+  }
+
+  /**
+   * Organizer-driven cut: fade the current sentence, drop unread old frames,
+   * then let frames that arrived during the fade start the new answer.
+   */
+  cut(expectedVersion: number, isCurrent: (version: number) => boolean): boolean {
+    if (!this.active || this.muted || !this.sessionId) return false
+    if (!isCurrent(expectedVersion)) return false
+    if (!this.playing && this.queue.length === 0) return false
+    const token = ++this.cutToken
+    this.cutting = true
+    this.cutReplyId = this.currentFrame?.replyId
+    const context = this.context
+    const gain = this.gain
+    if (gain && context) {
+      try {
+        gain.gain.cancelScheduledValues(context.currentTime)
+        gain.gain.setValueAtTime(gain.gain.value, context.currentTime)
+        gain.gain.linearRampToValueAtTime(0, context.currentTime + 0.25)
+      } catch {
+        // A closed context must not block the cut.
+      }
+    }
+    setTimeout(() => {
+      if (token !== this.cutToken) return
+      if (!this.active || !isCurrent(expectedVersion)) {
+        const pending = this.afterCut
+        this.afterCut = []
+        this.cutting = false
+        this.applyGain()
+        if (this.active) for (const frame of pending) this.enqueue(frame)
+        return
+      }
+      this.queue.length = 0
+      this.audio.pause()
+      this.audio.onended = null
+      this.audio.onerror = null
+      this.cleanupUrl()
+      try { window.speechSynthesis?.cancel() } catch { /* unsupported */ }
+      this.playing = false
+      this.ducked = false
+      this.blocked = false
+      this.cutting = false
+      const pending = this.afterCut
+      this.afterCut = []
+      this.applyGain()
+      for (const frame of pending) this.enqueue(frame)
+    }, 260)
+    return true
+  }
+
   /** Apply a control broadcast from the model-facing voice_dialog tool. */
   control(control: VoiceControl): void {
     if (control.action === 'stop') { this.stopAll(); return }
@@ -365,6 +438,10 @@ class TtsPlayer {
 
   private halt(): void {
     this.queue.length = 0
+    this.afterCut = []
+    this.cutting = false
+    this.cutToken += 1
+    this.cutReplyId = undefined
     this.audio.pause()
     this.cleanupUrl()
     try { window.speechSynthesis?.cancel() } catch { /* unsupported */ }
@@ -425,12 +502,19 @@ class TtsPlayer {
     // microphone is open may speak.
     if (this.sessionId !== undefined && frame.sessionId !== this.sessionId) return
     this.note(frame)
+    if (this.cutReplyId !== undefined && frame.replyId !== this.cutReplyId) this.cutReplyId = undefined
+    if (this.cutReplyId !== undefined && frame.replyId === this.cutReplyId) return
+    if (this.cutting) { this.afterCut.push(frame); return }
     this.queue.push(frame)
     if (!this.playing) this.playNext()
   }
 
   private clear(): void {
     this.queue.length = 0
+    this.afterCut = []
+    this.cutting = false
+    this.cutToken += 1
+    this.cutReplyId = undefined
     this.audio.pause()
     try { window.speechSynthesis?.cancel() } catch { /* unsupported */ }
     this.cleanupUrl()
@@ -468,6 +552,7 @@ class TtsPlayer {
     }
     this.ensureContext()
     this.cleanupUrl()
+    this.currentFrame = frame
     this.url = base64ToAudioUrl(frame.audio)
     this.audio.src = this.url
     this.playing = true
@@ -644,6 +729,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const separationReadyRef = useRef(false)
   const separationRetryAtRef = useRef(0)
   const separatorRef = useRef<ContinuousSeparation | null>(null)
+  const organizerRef = useRef<SpeechOrganizer | null>(null)
   const lastLaneTextRef = useRef<Map<string, string>>(new Map())
   useAutoRead(sessionId)
   useLayoutEffect(() => {
@@ -688,6 +774,10 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     // Continuous separation owns its own source buffers; flush them before
     // closing the scheduler, or the last 1.6 s of speech would be lost.
     await flushSeparator()
+    // An explicit later command must not be overridden by a plan still in
+    // flight. Pending holds are released by the organizer's finally block.
+    organizerRef.current?.cancel()
+    organizerRef.current = null
     // Keep already captured segments: stopping the microphone must not lose
     // the last sentence the user just spoke. The scheduler flushes guest lines
     // that are already waiting, then refuses new work.
@@ -766,6 +856,66 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const transcribeSamples = (samples: Float32Array): Promise<string> =>
     transcribeAudio(audioBase64(encodeWave(samples)))
 
+  /**
+   * Queue immediately, but when an assistant reply is active let the parallel
+   * organizer decide whether this owner line should steer, queue, or vanish.
+   * The entry keeps its FIFO position; only its delivery mode can change.
+   */
+  const enqueueWithOrganizer = (
+    lane: 'owner' | 'guest',
+    canonical: string,
+    work: Promise<string | null>,
+    scheduler: SpeechScheduler,
+  ): void => {
+    const prefs = getPreferences()
+    if (!prefs.organizerEnabled || lane !== 'owner') {
+      scheduler.enqueue(lane, canonical, work)
+      return
+    }
+    let organizer = organizerRef.current
+    if (!organizer) {
+      organizer = new SpeechOrganizer((request, signal) => organizeSpeech(request, signal), { timeoutMs: 1300 })
+      organizerRef.current = organizer
+    }
+    let release!: () => void
+    const hold = new Promise<void>((resolve) => { release = resolve })
+    let settled = false
+    let safety: ReturnType<typeof setTimeout> | null = null
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      if (safety !== null) clearTimeout(safety)
+      release()
+    }
+    const entry = scheduler.enqueue(lane, canonical, work, { hold })
+    // A hung ASR call must not wedge the FIFO head forever.
+    safety = setTimeout(finish, 5000)
+    void work.then(async (text) => {
+      if (!text) return
+      // An explicit "打断" / stop wins over any model decision.
+      if (organizerRef.current !== organizer) return
+      if (parseQueueControl(text)) return
+      if (!sharedPlayer.busy() && scheduler.status().queued <= 1) return
+      const spoken = text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, '')
+      const plan = await organizer!.plan({
+        sessionId,
+        text: spoken,
+        lane,
+        playing: sharedPlayer.busy(),
+        queued: Math.max(0, scheduler.status().queued - 1),
+      })
+      if (settled || !plan || !organizer!.isCurrent(plan)) return
+      if (plan.action === 'interrupt') {
+        entry.setMode('steer')
+        sharedPlayer.cut(plan.version, (version) => organizer!.isCurrent(plan))
+      } else if (plan.action === 'ignore') {
+        entry.drop()
+      }
+    }).catch((failure: unknown) => {
+      console.warn('[dsh-voice-dialog] organizer skipped', failure)
+    }).finally(finish)
+  }
+
   /** Turn the two separated streams into two independently labelled lanes. */
   const enqueueSeparated = (
     result: SeparationResult,
@@ -803,7 +953,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     // Keep the earlier speaker first; if they started together, the owner goes first.
     tasks.sort((a, b) => a.onsetMs - b.onsetMs
       || (a.lane === b.lane ? 0 : a.lane === 'owner' ? -1 : 1))
-    for (const task of tasks) scheduler.enqueue(task.lane, task.canonical, task.work)
+    for (const task of tasks) enqueueWithOrganizer(task.lane, task.canonical, task.work, scheduler)
   }
 
   /** Identify a continuously separated lane, then queue its new text. */
@@ -843,7 +993,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         if (!fresh) return null
         return prefs.speakerPrefix && display ? '[声纹：' + display + '] ' + fresh : fresh
       })
-      scheduler.enqueue(lane, canonical, work)
+      enqueueWithOrganizer(lane, canonical, work, scheduler)
     }).catch((failure: unknown) => {
       console.warn('[dsh-voice-dialog] continuous speaker routing failed', failure)
     })
@@ -930,7 +1080,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           const text = await transcribeSamples(samples)
           return text ? prefix + text : null
         })
-    scheduler.enqueue(lane, canonical, work)
+    enqueueWithOrganizer(lane, canonical, work, scheduler)
   }
 
   const handleSegment = (
@@ -961,6 +1111,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     resolveSpeaker: (name) => speakerPolicy.resolve(sessionId, name),
     onControl: (control) => {
       if (control.action === 'interrupt') {
+        organizerRef.current?.cancel()
         sharedPlayer.control({ action: 'stop' })
         sharedPlayer.unmute()
         // With a follow-up request the scheduler sends it as a steer, which
@@ -1617,7 +1768,10 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       </select></label>
       <label className="dsh-vd-check"><input type="checkbox" checked={prefs.parallelAsr}
         onChange={(event) => { save({ parallelAsr: event.target.checked }) }} />并行识别多段语音（最多三路）</label>
+      <label className="dsh-vd-check"><input type="checkbox" checked={prefs.organizerEnabled}
+        onChange={(event) => { save({ organizerEnabled: event.target.checked }) }} />并行组织层（由模型判断打断、排队或忽略）</label>
       <p className="dsh-vd-muted">先后接话的多个人可以同时识别，互不阻塞。同一个瞬间两个人同时开口时，上面的本地分离会把它拆成两路再排队；三个人以上仍可能混在一起。</p>
+      <p className="dsh-vd-muted">并行组织层只处理我自己的新话：回答还在朗读时，让模型判断是立刻打断、继续排队，还是当作噪音忽略。判断超时或失败时按排队处理；明确说“打断”仍然优先。</p>
       <p className="dsh-vd-muted">最新一句说“打断 / 停一下”，会立刻停朗读并清掉还没送出的队列；说“忽略客人1 / 别理老婆”，会当场改策略并删掉那个人排队的句子；说“恢复”重新排队。</p>
       <p className="dsh-vd-muted">模型也能按声纹临时调整：如果某个客人总在插无关的话，可以让模型忽略他；也可以让模型给声纹起名，比如“这个是我老婆”，之后就用老婆称呼。主人不会被忽略。这些调整只在当前会话内存里生效，刷新页面就恢复默认。</p>
       <p className="dsh-vd-muted">没登记我的声纹时无法区分主人和客人，所有语音都按主人处理。</p>

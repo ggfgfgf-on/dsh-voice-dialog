@@ -2,7 +2,7 @@
 
 export interface SpeakableRequest {
   readonly sessionId?: string
-  readonly purpose?: 'compaction' | 'session-title'
+  readonly purpose?: 'compaction' | 'session-title' | 'voice-organizer'
 }
 
 export interface SpeakableChunk {

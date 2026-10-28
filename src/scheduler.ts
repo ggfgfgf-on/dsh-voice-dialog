@@ -29,6 +29,23 @@ export interface SpeechSchedulerOptions {
   onError?: (error: unknown) => void
 }
 
+export interface EnqueueOptions {
+  /**
+   * Keeps this entry at the head of the FIFO until the parallel organizer has
+   * decided. Later entries still cannot overtake it.
+   */
+  hold?: Promise<void>
+}
+
+/** A stable handle for a later organizer decision. */
+export interface SchedulerEntry {
+  readonly seq: number
+  /** Apply a delivery mode before this entry has been sent. */
+  setMode(mode: PromptMode): void
+  /** Drop only this entry; earlier/later entries keep their order. */
+  drop(): void
+}
+
 interface Entry {
   seq: number
   lane: SpeakerLane
@@ -36,7 +53,13 @@ interface Entry {
   ready: boolean
   text: string | null
   dropped: boolean
+  delivered: boolean
+  modeOverride?: PromptMode
+  hold?: Promise<void>
+  holdSettled: boolean
 }
+
+const NOOP_ENTRY: SchedulerEntry = { seq: -1, setMode: () => undefined, drop: () => undefined }
 
 /**
  * Every captured utterance gets a sequence number when it is enqueued, and the
@@ -56,8 +79,13 @@ export class SpeechScheduler {
   constructor(private readonly options: SpeechSchedulerOptions) {}
 
   /** Start tracking one utterance whose text will arrive asynchronously. */
-  enqueue(lane: SpeakerLane, label: string, work: Promise<string | null>): void {
-    if (this.closed) return
+  enqueue(
+    lane: SpeakerLane,
+    label: string,
+    work: Promise<string | null>,
+    enqueueOptions: EnqueueOptions = {},
+  ): SchedulerEntry {
+    if (this.closed) return NOOP_ENTRY
     if (lane === 'guest' && label) this.lastGuestLabel = label
     const entry: Entry = {
       seq: this.nextSeq++,
@@ -66,6 +94,9 @@ export class SpeechScheduler {
       ready: false,
       text: null,
       dropped: false,
+      delivered: false,
+      hold: enqueueOptions.hold,
+      holdSettled: enqueueOptions.hold === undefined,
     }
     this.entries.push(entry)
     this.active += 1
@@ -98,6 +129,12 @@ export class SpeechScheduler {
       this.emit()
       this.drain()
     })
+
+    return {
+      seq: entry.seq,
+      setMode: (mode) => { this.setMode(entry, mode) },
+      drop: () => { this.drop(entry) },
+    }
   }
 
   /** Send every ready utterance in order. Retained for compatibility. */
@@ -113,6 +150,20 @@ export class SpeechScheduler {
 
   status(): SchedulerStatus {
     return { active: this.active, queued: this.entries.length }
+  }
+
+  private setMode(entry: Entry, mode: PromptMode): void {
+    if (this.closed || entry.dropped || entry.delivered) return
+    entry.modeOverride = mode
+    this.drain()
+  }
+
+  private drop(entry: Entry): void {
+    if (entry.dropped || entry.delivered) return
+    entry.dropped = true
+    this.remove(entry)
+    this.emit()
+    this.drain()
   }
 
   private remove(entry: Entry): void {
@@ -167,14 +218,23 @@ export class SpeechScheduler {
     while (this.entries.length > 0) {
       const entry = this.entries[0]!
       if (!entry.ready) return
+      if (entry.hold && !entry.holdSettled) {
+        try { await entry.hold } catch { /* a failed plan must not wedge the queue */ }
+        entry.holdSettled = true
+        // The organizer may have dropped this entry while it was deciding.
+        if (!this.entries.includes(entry) || this.entries[0] !== entry) continue
+      }
       this.entries.shift()
+      entry.delivered = true
       if (entry.dropped || !entry.text) {
         this.emit()
         continue
       }
 
       let mode: PromptMode
-      if (entry.lane === 'owner') {
+      if (entry.modeOverride !== undefined) {
+        mode = entry.modeOverride
+      } else if (entry.lane === 'owner') {
         mode = this.options.ownerMode?.() ?? 'steer'
       } else {
         const guest = this.options.guestMode(entry.label)

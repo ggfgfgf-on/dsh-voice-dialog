@@ -101,6 +101,15 @@ await build({
 })
 
 await build({
+  entryPoints: ['src/organizer.ts'],
+  outfile: 'lib/organizer.js',
+  bundle: false,
+  format: 'esm',
+  platform: 'node',
+  logLevel: 'silent',
+})
+
+await build({
   entryPoints: ['src/queue-control.ts'],
   outfile: 'lib/queue-control.js',
   bundle: false,

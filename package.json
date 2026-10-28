@@ -1,6 +1,6 @@
 {
   "name": "dsh-voice-dialog",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Voice dialog for DeepSeek Harness: multi-speaker ASR, priority queuing, auto-read replies",
   "type": "module",
   "main": "lib/index.js",
