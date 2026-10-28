@@ -532,6 +532,20 @@ export function apply(ctx: Context, config: Config): void {
       const threshold = typeof body.threshold === 'number' ? body.threshold : undefined
       const samples = decodeWavBase64(audio)
       const result = await separation.separate(samples)
+      if (body.identify === false) {
+        writeJson(res, 200, {
+          ok: true,
+          separated: result.sources.length >= 2,
+          elapsedMs: result.elapsedMs,
+          sources: result.sources.map((source) => ({
+            audioBase64: encodeWavBase64(source.samples),
+            rms: source.rms,
+            onsetMs: source.onsetMs,
+            identity: null,
+          })),
+        })
+        return
+      }
       const loud = Math.max(...result.sources.map((source) => source.rms), 0)
       // One dominant stream is ordinary dictation: keep the untouched audio
       // and the normal voiceprint path instead of transcribing artifacts.

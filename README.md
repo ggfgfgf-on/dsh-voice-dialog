@@ -5,7 +5,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 ## What it does
 
 - **One microphone, no mode button.** The composer microphone starts and stops continuous listening. There is no floating panel and no second toolbar control.
-- **Continuous dictation.** A small VAD closes an utterance after ~1.4 s of silence and transcribes it through DSH speech-to-text. Speech from the enrolled owner is sent with `session.prompt(..., "queue")` by default, so it waits for the current reply; a setting switches it to `steer` for immediate barge-in. Other speakers are queued by default. Up to three utterances are transcribed in parallel; recognition is parallel, while delivery is one strict FIFO queue in speaking order. The microphone opening threshold is adjustable, so quiet speech can trigger sooner while a noisy room can be made less sensitive.
+- **Continuous dictation.** A small VAD closes an utterance after ~1.4 s of silence and transcribes it through DSH speech-to-text. With simultaneous-speech separation enabled, the endpoint is tracked per separated source: your lane closes after its own 1.6 s of silence even while someone next to you keeps talking. Speech from the enrolled owner is sent with `session.prompt(..., "queue")` by default, so it waits for the current reply; a setting switches it to `steer` for immediate barge-in. Other speakers are queued by default. Up to three utterances are transcribed in parallel; recognition is parallel, while delivery is one strict FIFO queue in speaking order. The microphone opening threshold is adjustable, so quiet speech can trigger sooner while a noisy room can be made less sensitive.
 - **Read-aloud while listening.** The host taps `llm/stream`, segments assistant text into sentences, synthesizes Edge TTS audio, and streams it over SSE. A long first sentence starts at its first natural comma once it has enough words, so the first audio does not wait for the final full stop. Playback is gated by the microphone: starting the mic enables it, stopping the mic stops accepting new sentences but drains the audio already queued. If Edge is unreachable, sentences use the platform speech voice instead of disappearing.
 - **Priority barge-in.** When you start speaking, the reply is ducked (not stopped). Owner speech is queued with `session.prompt(..., "queue")` by default, so the reply you are listening to is not cut off; the setting can switch it to `steer`. Guest speech enters the same FIFO queue in speaking order, so a nearby interjection does not derail the current answer; guests can also be made to steer immediately or be ignored.
 - **Queue-aware voice commands.** A leading “打断 / 停一下” stops playback, clears the not-yet-sent queue, and steers the remaining request in immediately. “忽略客人1 / 别理老婆” updates the speaker policy on the spot and removes that guest's waiting lines; “恢复” queues them again. Ordinary lines keep strict speaking order.
@@ -79,7 +79,7 @@ All preferences are in **Plugins → dsh-voice-dialog**:
 | Owner delivery, guest interjection policy, parallel ASR | Browser `localStorage` | Owner queues by default (or steers); guests queue (default), steer, or ignore; up to 3 ASR lanes, strict FIFO delivery |
 | Owner + named guest voiceprints | Host `~/.dsh/voice-dialog/voiceprint.json` | Embeddings only; original audio is not stored; up to 12 named guests |
 | Voiceprint model | Host `~/.dsh/voice-dialog/models/` | Downloaded from the settings page |
-| Simultaneous-speech separation | Browser `localStorage` + host model | Optional; splits two overlapping speakers into two labelled recognition lanes |
+| Simultaneous-speech separation | Browser `localStorage` + host model | Optional; splits two overlapping speakers into two labelled recognition lanes, each with its own 1.6 s endpoint |
 | Separation model | Host `~/.dsh/voice-dialog/models/mossformer2_ss_16k.onnx` | ~234 MB; downloaded from the settings page |
 
 The voice selector includes Mandarin, Cantonese, Taiwanese, English and Japanese Edge voices. **Audition** synthesizes a short sample through the host without touching the live reply queue; if Edge is unavailable it reads the sample with the system voice and shows a notice.
@@ -126,7 +126,7 @@ npm run build
 npm test
 ```
 
-`npm run build` creates the host ESM bundle, the client `__ModuleLoader__` closure, and plain-node test surfaces. `npm test` covers strict FIFO delivery, queue-aware voice commands, sentence segmentation, Markdown filtering, the no-CoT filter, WAV encoding, voice switching, the voiceprint WAV decoder/cosine helper, and the separation window/overlap logic with an injected runner. The native voiceprint and separation models are exercised separately in development; they are not downloaded by `npm test`.
+`npm run build` creates the host ESM bundle, the client `__ModuleLoader__` closure, and plain-node test surfaces. `npm test` covers strict FIFO delivery, queue-aware voice commands, sentence segmentation, Markdown filtering, the no-CoT filter, WAV encoding, voice switching, the voiceprint WAV decoder/cosine helper, the separation window/overlap logic, and continuous per-source 1.6 s endpointing with onset-order FIFO, all with injected runners. The native voiceprint and separation models are exercised separately in development; they are not downloaded by `npm test`.
 
 ## License
 

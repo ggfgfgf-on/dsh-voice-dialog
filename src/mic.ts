@@ -12,6 +12,10 @@ export interface MicOptions {
   maxSegmentMs?: number
   /** RMS opening threshold. */
   threshold?: number
+  /** Emit continuous 16 kHz frames instead of waiting for a global silence. */
+  continuous?: boolean
+  /** Every captured chunk, resampled to 16 kHz. Used by source separation. */
+  onFrame?: (samples: Float32Array) => void
   /** Preferred input device; empty uses the browser default. */
   deviceId?: string
   onLevel?: (level: number) => void
@@ -169,6 +173,44 @@ export class MicrophoneLoop {
       for (const sample of copy) sum += sample * sample
       const rms = Math.sqrt(sum / copy.length)
       this.options.onLevel?.(Math.min(1, rms / 0.25))
+      if (this.options.onFrame) {
+        try { this.options.onFrame(resample(copy, context.sampleRate, TARGET_RATE)) }
+        catch (error) { this.options.onError?.(error) }
+      }
+
+      if (this.options.continuous) {
+        if (!speaking) {
+          if (rms < this.options.threshold) return
+          speaking = true
+          speech = chunkMs
+          silence = 0
+          if (!announced && speech >= this.options.minSpeechMs) {
+            announced = true
+            try { this.options.onSpeechStart?.() } catch (error) { this.options.onError?.(error) }
+          }
+          return
+        }
+        if (rms >= this.options.threshold) {
+          speech += chunkMs
+          silence = 0
+          if (!announced && speech >= this.options.minSpeechMs) {
+            announced = true
+            try { this.options.onSpeechStart?.() } catch (error) { this.options.onError?.(error) }
+          }
+        } else {
+          silence += chunkMs
+        }
+        if (silence >= this.options.silenceMs) {
+          speaking = false
+          speech = 0
+          silence = 0
+          if (announced) {
+            announced = false
+            try { this.options.onSpeechEnd?.() } catch (error) { this.options.onError?.(error) }
+          }
+        }
+        return
+      }
 
       if (!speaking) {
         preRoll.push(copy)

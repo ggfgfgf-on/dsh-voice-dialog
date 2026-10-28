@@ -6,10 +6,11 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import speechRemote from './speech-remote.js'
 import { MicrophoneLoop, recordVoiceSample } from './mic.ts'
+import { ContinuousSeparation, dedupeTranscript, type ContinuousSegment } from './continuous-separation.ts'
 import { getPreferences, setPreferences, subscribePreferences, type VoiceDialogPreferences } from './preferences.ts'
 import { SpeechScheduler, type GuestMode } from './scheduler.ts'
 import { SpeakerPolicyStore } from './speaker-policy.ts'
-import { audioBase64, encodeWave } from './wav.ts'
+import { audioBase64, decodeWaveBase64, encodeWave } from './wav.ts'
 
 export const inject = ['remote']
 
@@ -196,7 +197,7 @@ async function warmSeparation(): Promise<void> {
 }
 
 async function separateSegment(
-  samples: Float32Array, sessionId: string, threshold: number,
+  samples: Float32Array, sessionId: string, threshold: number, identify = true,
 ): Promise<SeparationResult> {
   const response = await fetch(apiUrl('/separation/separate'), {
     method: 'POST',
@@ -205,6 +206,7 @@ async function separateSegment(
       audioBase64: audioBase64(encodeWave(samples)),
       sessionId,
       threshold,
+      identify,
     }),
   })
   if (!response.ok) throw await errorFrom(response, '同时说话分离失败')
@@ -641,6 +643,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const classifyRef = useRef<Promise<void>>(Promise.resolve())
   const separationReadyRef = useRef(false)
   const separationRetryAtRef = useRef(0)
+  const separatorRef = useRef<ContinuousSeparation | null>(null)
+  const lastLaneTextRef = useRef<Map<string, string>>(new Map())
   useAutoRead(sessionId)
   useLayoutEffect(() => {
     onActiveChange?.(active)
@@ -660,12 +664,30 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     return () => { window.removeEventListener('pagehide', onPageHide) }
   }, [sessionId])
 
+  const flushSeparator = async (): Promise<void> => {
+    const separator = separatorRef.current
+    separatorRef.current = null
+    if (!separator) return
+    try {
+      await separator.flush()
+      // Let the voiceprint/ASR chain enqueue the final lanes before dispose().
+      await classifyRef.current
+    } catch (failure) {
+      console.warn('[dsh-voice-dialog] continuous flush failed', failure)
+    } finally {
+      separator.close()
+    }
+  }
+
   const stop = async (): Promise<void> => {
     cancelRetainedStop()
     retainedMic = null
     retainedSession = null
     await micRef.current?.stop()
     micRef.current = null
+    // Continuous separation owns its own source buffers; flush them before
+    // closing the scheduler, or the last 1.6 s of speech would be lost.
+    await flushSeparator()
     // Keep already captured segments: stopping the microphone must not lose
     // the last sentence the user just spoke. The scheduler flushes guest lines
     // that are already waiting, then refuses new work.
@@ -715,10 +737,13 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         retainedMic = null
         retainedSession = null
         retainedStopTimer = null
-        void mic.stop()
-        reportVoiceState(sessionId, false)
-        sharedPlayer.endSession()
-        sharedPlayer.restore()
+        void (async () => {
+          await mic.stop()
+          await flushSeparator()
+          reportVoiceState(sessionId, false)
+          sharedPlayer.endSession()
+          sharedPlayer.restore()
+        })()
       }, 1200)
     }
   }, [sessionId])
@@ -779,6 +804,49 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     tasks.sort((a, b) => a.onsetMs - b.onsetMs
       || (a.lane === b.lane ? 0 : a.lane === 'owner' ? -1 : 1))
     for (const task of tasks) scheduler.enqueue(task.lane, task.canonical, task.work)
+  }
+
+  /** Identify a continuously separated lane, then queue its new text. */
+  const enqueueContinuous = (
+    segment: ContinuousSegment,
+    scheduler: SpeechScheduler,
+    runLimited: <T>(task: () => Promise<T>) => Promise<T>,
+  ): void => {
+    classifyRef.current = classifyRef.current.then(async () => {
+      const prefs = getPreferences()
+      let identity: SpeakerIdentity | null = null
+      try {
+        identity = await identifySpeaker(segment.samples, sessionId, prefs.speakerThreshold)
+      } catch {
+        // A short or noisy lane can still be transcribed without a voiceprint.
+      }
+      const fallback = '说话人' + (segment.slot + 1)
+      const canonical = identity?.label || fallback
+      const lane: 'owner' | 'guest' = identity
+        ? (identity.enrolled && !identity.owner ? 'guest' : 'owner')
+        : (segment.slot === 0 ? 'owner' : 'guest')
+      const display = displaySpeaker(sessionId, canonical)
+      if (prefs.speakerGate && identity?.owner !== true) {
+        setSpeaker('已忽略其他人的声音')
+        return
+      }
+      if (lane === 'guest' && effectiveGuestMode(sessionId, canonical) === 'ignore') {
+        setSpeaker('已忽略' + (display || '其他人'))
+        return
+      }
+      if (lane === 'guest') setSpeaker(display || '其他人')
+      const key = lane + ':' + canonical
+      const work = runLimited(async () => {
+        const text = await transcribeSamples(segment.samples)
+        const fresh = dedupeTranscript(lastLaneTextRef.current.get(key) ?? '', text)
+        lastLaneTextRef.current.set(key, text)
+        if (!fresh) return null
+        return prefs.speakerPrefix && display ? '[声纹：' + display + '] ' + fresh : fresh
+      })
+      scheduler.enqueue(lane, canonical, work)
+    }).catch((failure: unknown) => {
+      console.warn('[dsh-voice-dialog] continuous speaker routing failed', failure)
+    })
   }
 
   /** Identify first, then hand one lane to the scheduler. */
@@ -958,17 +1026,43 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       const scheduler = makeScheduler()
       schedulerRef.current = scheduler
       classifyRef.current = Promise.resolve()
+      lastLaneTextRef.current = new Map()
       setPending(0)
       setQueued(0)
       const runLimited = createLimit(prefs.parallelAsr ? 3 : 1)
+      const continuous = prefs.separateSpeakers && separationReadyRef.current
+      separatorRef.current?.close()
+      separatorRef.current = null
+      let separator: ContinuousSeparation | null = null
+      if (continuous) {
+        separator = new ContinuousSeparation({
+          sampleRate: 16_000,
+          separate: async (window) => {
+            const split = await separateSegment(window, sessionId, prefs.speakerThreshold, false)
+            return {
+              sources: split.sources.map((source) => ({
+                samples: decodeWaveBase64(source.audioBase64),
+                rms: source.rms,
+              })),
+            }
+          },
+          onSegment: (segment) => { enqueueContinuous(segment, scheduler, runLimited) },
+          onError: (failure) => {
+            console.warn('[dsh-voice-dialog] continuous separation failed', failure)
+          },
+        })
+        separatorRef.current = separator
+      }
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
         silenceMs: getPreferences().pauseMs,
         threshold: getPreferences().micThreshold,
+        continuous,
+        onFrame: continuous ? (samples) => { separator?.push(samples) } : undefined,
         onLevel: (value) => setLevel(value),
         onSpeechStart: () => { sharedPlayer.unmute(); sharedPlayer.duck() },
         onSpeechEnd: () => { sharedPlayer.restore() },
-        onSegment: (samples) => { handleSegment(samples, scheduler, runLimited) },
+        onSegment: continuous ? undefined : (samples) => { handleSegment(samples, scheduler, runLimited) },
         onError: (failure) => {
           setError(failure instanceof Error ? failure.message : String(failure))
         },
@@ -983,6 +1077,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       setActive(true)
       setPhase('listening')
     } catch (failure) {
+      separatorRef.current?.close()
+      separatorRef.current = null
       schedulerRef.current?.dispose()
       schedulerRef.current = null
       setError(failure instanceof Error ? failure.message : String(failure))

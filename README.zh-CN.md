@@ -56,7 +56,7 @@ dsh plugin --profile web add file:D:/path/to/dsh-voice-dialog
 ## 使用
 
 1. 打开会话，点输入框右侧的麦克风。
-2. 正常说话；停顿会自动结束一句并插入当前轮次。
+2. 正常说话；停顿会自动结束一句并插入当前轮次。开启同时说话分离时，停顿按每一路声源单独计算：你停 1.6 秒就切你这句，旁边的人继续说他那一路。
 3. 语音输入期间助手回复会自动朗读；关闭麦克风后不再读新内容，已经排队的剩余音频会读完。
 4. 再点一下红色麦克风（或展开行里的停止按钮）结束收音。说“轻一点/响一点/重复一遍/别说了”时，模型会调用 `voice_dialog` 调整朗读。
 
@@ -77,7 +77,7 @@ dsh plugin --profile web add file:D:/path/to/dsh-voice-dialog
 | 我说话时、其他人插话策略、并行识别 | 浏览器 `localStorage` | 我默认排队（也可立即插话）；其他人排队（默认）/ 直接插话 / 忽略；最多三路识别，投递严格按说话顺序 |
 | 本人和其他人的声纹、名字 | Host `~/.dsh/voice-dialog/voiceprint.json` | 只保存特征向量，不保存原始录音；其他人最多 12 个 |
 | 声纹模型 | Host `~/.dsh/voice-dialog/models/` | 从设置页下载 |
-| 同时说话分离 | 浏览器 `localStorage` + Host 模型 | 可选；把两个重叠说话的人拆成两路分别识别 |
+| 同时说话分离 | 浏览器 `localStorage` + Host 模型 | 可选；把两个重叠说话的人拆成两路分别识别；每一路按自己的 1.6 秒静音切句，旁边一直说也不会拖住你这句 |
 | 分离模型 | Host `~/.dsh/voice-dialog/models/mossformer2_ss_16k.onnx` | 约 234 MB；从设置页下载 |
 
 音色包含普通话、粤语、台湾国语、英语、日语等 Edge 声音；**试听**会通过 host 合成一小段，不会打扰正在播放的回复队列。Edge 不可达时会自动改用系统语音试听并显示提示。
@@ -124,7 +124,7 @@ npm run build
 npm test
 ```
 
-`npm run build` 生成 host ESM、客户端 `__ModuleLoader__` 闭包和测试用的纯 Node 模块；`npm test` 覆盖优先级车道、句子切分、Markdown 过滤、不读思维链、WAV 编码、音色切换、声纹 WAV 解码/余弦相似度，以及分离窗口/重叠对齐（用注入的 runner）。原生声纹和分离模型在开发时单独验证，`npm test` 不会下载模型。
+`npm run build` 生成 host ESM、客户端 `__ModuleLoader__` 闭包和测试用的纯 Node 模块；`npm test` 覆盖优先级车道、句子切分、Markdown 过滤、不读思维链、WAV 编码、音色切换、声纹 WAV 解码/余弦相似度，以及分离窗口/重叠对齐、连续分离的每路 1.6 秒端点与按开口顺序的 FIFO（用注入的 runner）。原生声纹和分离模型在开发时单独验证，`npm test` 不会下载模型。
 
 ## 许可
 

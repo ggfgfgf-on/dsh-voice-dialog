@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { audioBase64, encodeWave } from '../lib/wav.js'
+import { audioBase64, decodeWaveBase64, encodeWave } from '../lib/wav.js'
 
 test('encodes a canonical PCM16 mono WAV header', () => {
   const wav = encodeWave(new Float32Array([0, 1, -1]))
@@ -9,4 +9,11 @@ test('encodes a canonical PCM16 mono WAV header', () => {
   assert.equal(String.fromCharCode(...wav.slice(36, 40)), 'data')
   assert.equal(wav.length, 44 + 3 * 2)
   assert.equal(audioBase64(wav).length > 0, true)
+})
+
+test('decodes the canonical WAV back into the same samples', () => {
+  const input = new Float32Array([0, 0.5, -0.5, 0.25])
+  const decoded = decodeWaveBase64(audioBase64(encodeWave(input)))
+  assert.equal(decoded.length, input.length)
+  for (let i = 0; i < input.length; i++) assert.ok(Math.abs(decoded[i] - input[i]) < 2e-5)
 })

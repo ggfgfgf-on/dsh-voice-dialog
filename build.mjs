@@ -146,9 +146,27 @@ await build({
 })
 
 await build({
+  entryPoints: ['src/separation-align.ts'],
+  outfile: 'lib/separation-align.js',
+  bundle: false,
+  format: 'esm',
+  platform: 'node',
+  logLevel: 'silent',
+})
+
+await build({
   entryPoints: ['src/separation.ts'],
   outfile: 'lib/separation.js',
   bundle: false,
+  format: 'esm',
+  platform: 'node',
+  logLevel: 'silent',
+})
+
+await build({
+  entryPoints: ['src/continuous-separation.ts'],
+  outfile: 'lib/continuous-separation.js',
+  bundle: true,
   format: 'esm',
   platform: 'node',
   logLevel: 'silent',

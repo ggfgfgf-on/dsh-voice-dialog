@@ -8,6 +8,14 @@ import { dirname, join } from 'node:path'
 import { request as httpsRequest } from 'node:https'
 import { pipeline } from 'node:stream/promises'
 import * as httpsProxyAgent from 'https-proxy-agent'
+import {
+  SEPARATION_FADE as FADE,
+  SEPARATION_HOP as HOP,
+  SEPARATION_WINDOW as WINDOW,
+  shouldSwap,
+} from './separation-align.js'
+
+export { shouldSwap } from './separation-align.js'
 
 const require = createRequire(import.meta.url)
 
@@ -15,9 +23,6 @@ export const SEPARATION_MODEL_FILE = 'mossformer2_ss_16k.onnx'
 export const SEPARATION_MODEL_BYTES = 245_120_037
 const MODEL_URL = 'https://huggingface.co/mhavo/mossformer2-ss-16k-onnx/resolve/main/' + SEPARATION_MODEL_FILE
 const SAMPLE_RATE = 16_000
-const WINDOW = SAMPLE_RATE * 4
-const HOP = SAMPLE_RATE * 3.5
-const FADE = SAMPLE_RATE * 0.5
 /** A second stream below this share of the louder one is leakage, not a person. */
 const SOURCE_FLOOR = 0.1
 
@@ -103,28 +108,6 @@ function onsetMs(samples: Float32Array): number {
   return 0
 }
 
-function zeroMeanCorrelation(a: Float32Array, b: Float32Array, offset = 0): number {
-  const length = Math.min(a.length, b.length - offset)
-  if (length < 32) return 0
-  let meanA = 0
-  let meanB = 0
-  for (let i = 0; i < length; i++) { meanA += a[i]; meanB += b[offset + i] }
-  meanA /= length
-  meanB /= length
-  let dot = 0
-  let normA = 0
-  let normB = 0
-  for (let i = 0; i < length; i++) {
-    const x = a[i] - meanA
-    const y = b[offset + i] - meanB
-    dot += x * y
-    normA += x * x
-    normB += y * y
-  }
-  const denominator = Math.sqrt(normA * normB)
-  return denominator > 1e-9 ? dot / denominator : 0
-}
-
 export function planWindows(length: number): number[] {
   if (length <= WINDOW) return [0]
   const starts = [0]
@@ -139,24 +122,6 @@ export function planWindows(length: number): number[] {
     starts.push(next)
   }
   return starts
-}
-
-/** The model's output order is arbitrary per window; use the overlap to keep it stable. */
-export function shouldSwap(
-  previousA: Float32Array,
-  previousB: Float32Array,
-  currentA: Float32Array,
-  currentB: Float32Array,
-  overlap: number,
-): boolean {
-  const length = Math.min(overlap, FADE * 2)
-  if (length < 32) return false
-  const previousOffset = WINDOW - length
-  const same = zeroMeanCorrelation(previousA.subarray(previousOffset), currentA, 0)
-    + zeroMeanCorrelation(previousB.subarray(previousOffset), currentB, 0)
-  const swapped = zeroMeanCorrelation(previousA.subarray(previousOffset), currentB, 0)
-    + zeroMeanCorrelation(previousB.subarray(previousOffset), currentA, 0)
-  return swapped > same + 0.02
 }
 
 function edgeWeight(index: number, first: boolean, last: boolean): number {

@@ -21,3 +21,46 @@ export function audioBase64(bytes: Uint8Array): string {
   for (let i = 0; i < bytes.length; i += 8192) text += String.fromCharCode(...bytes.subarray(i, i + 8192))
   return btoa(text)
 }
+
+/** Decode the canonical 16 kHz mono PCM16 WAV produced by encodeWave. */
+export function decodeWaveBase64(value: string): Float32Array {
+  const binary = atob(value)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  if (bytes.length < 12
+    || String.fromCharCode(bytes[0]!, bytes[1]!, bytes[2]!, bytes[3]!) !== 'RIFF'
+    || String.fromCharCode(bytes[8]!, bytes[9]!, bytes[10]!, bytes[11]!) !== 'WAVE') {
+    throw new Error('不是有效的 WAV 数据')
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let format = 0
+  let channels = 0
+  let bits = 0
+  let dataOffset = 0
+  let dataLength = 0
+  let offset = 12
+  while (offset + 8 <= bytes.length) {
+    const id = String.fromCharCode(bytes[offset]!, bytes[offset + 1]!, bytes[offset + 2]!, bytes[offset + 3]!)
+    const size = view.getUint32(offset + 4, true)
+    const body = offset + 8
+    if (body + size > bytes.length) break
+    if (id === 'fmt ') {
+      format = view.getUint16(body, true)
+      channels = view.getUint16(body + 2, true)
+      bits = view.getUint16(body + 14, true)
+    } else if (id === 'data') {
+      dataOffset = body
+      dataLength = size
+      break
+    }
+    offset = body + size + (size % 2)
+  }
+  if (format !== 1 || channels !== 1 || bits !== 16 || dataLength === 0) {
+    throw new Error('只支持 16 kHz 单声道 16 位 WAV')
+  }
+  const samples = new Float32Array(Math.floor(dataLength / 2))
+  for (let i = 0; i < samples.length; i++) {
+    samples[i] = view.getInt16(dataOffset + i * 2, true) / 32768
+  }
+  return samples
+}
