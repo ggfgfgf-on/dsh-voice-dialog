@@ -42,6 +42,12 @@ interface HostConfig {
   enabled: boolean
 }
 
+interface VoiceprintProfile {
+  id: string
+  name: string
+  updatedAt: string
+}
+
 interface VoiceprintStatus {
   ready: boolean
   addonAvailable: boolean
@@ -49,6 +55,8 @@ interface VoiceprintStatus {
   enrolled: boolean
   modelPath: string
   modelBytes: number
+  speakers: VoiceprintProfile[]
+  speakerCount: number
   embeddingDim?: number
   error?: string
 }
@@ -173,6 +181,33 @@ async function identifySpeaker(
 
 async function forgetVoiceprint(): Promise<void> {
   const response = await fetch(apiUrl('/voiceprint/forget'), { method: 'POST' })
+  if (!response.ok) throw await errorFrom(response, '声纹删除失败')
+}
+
+async function enrollOtherVoiceprint(samples: Float32Array, name: string): Promise<void> {
+  const response = await fetch(apiUrl('/voiceprint/speakers/enroll'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ audioBase64: audioBase64(encodeWave(samples)), name }),
+  })
+  if (!response.ok) throw await errorFrom(response, '其他人声纹保存失败')
+}
+
+async function renameOtherVoiceprint(id: string, name: string): Promise<void> {
+  const response = await fetch(apiUrl('/voiceprint/speakers/rename'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, name }),
+  })
+  if (!response.ok) throw await errorFrom(response, '声纹重命名失败')
+}
+
+async function removeOtherVoiceprint(id: string): Promise<void> {
+  const response = await fetch(apiUrl('/voiceprint/speakers/remove'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id }),
+  })
   if (!response.ok) throw await errorFrom(response, '声纹删除失败')
 }
 
@@ -871,7 +906,10 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   const [actionError, setActionError] = useState('')
   const [voiceprint, setVoiceprint] = useState<VoiceprintStatus | null>(null)
   const [voiceprintError, setVoiceprintError] = useState('')
-  const [voiceprintBusy, setVoiceprintBusy] = useState<'' | 'prepare' | 'record' | 'forget'>('')
+  const [voiceprintBusy, setVoiceprintBusy] = useState<'' | 'prepare' | 'record' | 'record-other' | 'forget'>('')
+  const [recordingTarget, setRecordingTarget] = useState<'owner' | 'guest' | ''>('')
+  const [guestName, setGuestName] = useState('')
+  const [speakerBusy, setSpeakerBusy] = useState('')
   const [recording, setRecording] = useState(false)
   const [recordLevel, setRecordLevel] = useState(0)
   const recordAbort = useRef<AbortController | null>(null)
@@ -924,11 +962,12 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     }
   }
 
-  const recordMyVoice = async (): Promise<void> => {
-    setVoiceprintBusy('record')
+  const recordVoice = async (target: 'owner' | 'guest'): Promise<void> => {
+    setVoiceprintBusy(target === 'owner' ? 'record' : 'record-other')
     setVoiceprintError('')
     setActionError('')
     setRecording(true)
+    setRecordingTarget(target)
     setRecordLevel(0)
     const abort = new AbortController()
     recordAbort.current = abort
@@ -939,15 +978,55 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
         onLevel: setRecordLevel,
         signal: abort.signal,
       })
-      await enrollVoiceprint(samples)
+      if (target === 'owner') await enrollVoiceprint(samples)
+      else {
+        await enrollOtherVoiceprint(samples, guestName)
+        setGuestName('')
+      }
       setVoiceprint(await fetchVoiceprintStatus())
     } catch (failure) {
       setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
     } finally {
       setRecording(false)
+      setRecordingTarget('')
       setRecordLevel(0)
       setVoiceprintBusy('')
       recordAbort.current = null
+    }
+  }
+
+  const recordMyVoice = (): Promise<void> => recordVoice('owner')
+  const recordOtherVoice = (): Promise<void> => {
+    if (!guestName.trim()) { setVoiceprintError('先给这个人起个名字'); return Promise.resolve() }
+    return recordVoice('guest')
+  }
+
+  const renameSpeaker = async (profile: VoiceprintProfile): Promise<void> => {
+    const name = window.prompt('新的声纹名字', profile.name)?.trim()
+    if (!name || name === profile.name) return
+    setSpeakerBusy(profile.id)
+    setVoiceprintError('')
+    try {
+      await renameOtherVoiceprint(profile.id, name)
+      setVoiceprint(await fetchVoiceprintStatus())
+    } catch (failure) {
+      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setSpeakerBusy('')
+    }
+  }
+
+  const removeSpeaker = async (profile: VoiceprintProfile): Promise<void> => {
+    if (!window.confirm('删除「' + profile.name + '」的声纹？')) return
+    setSpeakerBusy(profile.id)
+    setVoiceprintError('')
+    try {
+      await removeOtherVoiceprint(profile.id)
+      setVoiceprint(await fetchVoiceprintStatus())
+    } catch (failure) {
+      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setSpeakerBusy('')
     }
   }
 
@@ -1184,6 +1263,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       {voiceprint && <div className="dsh-vd-vpStatus">
         <span>{voiceprint.ready ? '声纹模型已就绪' : voiceprint.modelPresent ? '缺少声纹组件' : '声纹模型未安装'}</span>
         <span>{voiceprint.enrolled ? '已登记我的声纹' : '尚未登记我的声纹'}</span>
+        <span>已登记其他人 {voiceprint.speakerCount ?? 0} 个</span>
         {voiceprint.modelBytes > 0 && <span>{(voiceprint.modelBytes / 1_000_000).toFixed(1)} MB</span>}
       </div>}
       {voiceprint && !voiceprint.addonAvailable && <p className="dsh-vd-error">缺少本地声纹组件：在 profile 目录执行 pnpm add sherpa-onnx-node，然后重启 DSH。</p>}
@@ -1194,14 +1274,36 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       <div className="dsh-vd-preview">
         <button type="button" className="dsh-vd-button" disabled={voiceprintBusy !== '' || recording || !voiceprint?.ready}
           onClick={() => { void recordMyVoice() }}>
-          {recording ? '录音中…' : voiceprint?.enrolled ? '重新录制我的声纹' : '录制我的声纹'}
+          {recording && recordingTarget === 'owner' ? '录音中…' : voiceprint?.enrolled ? '重新录制我的声纹' : '录制我的声纹'}
         </button>
         {voiceprint?.enrolled && <button type="button" className="dsh-vd-button" disabled={voiceprintBusy !== '' || recording}
-          onClick={() => { void removeVoiceprint() }}>{voiceprintBusy === 'forget' ? '删除中…' : '删除声纹'}</button>}
+          onClick={() => { void removeVoiceprint() }}>{voiceprintBusy === 'forget' ? '删除中…' : '删除我的声纹'}</button>}
+      </div>
+      <div className="dsh-vd-speakers">
+        <h4>其他人</h4>
+        <p className="dsh-vd-muted">录入后会用名字代替“客人1”，刷新页面、重启服务都还在。模型也能在对话里直接叫这个名字。</p>
+        {voiceprint && (voiceprint.speakers ?? []).length === 0 && <p className="dsh-vd-muted">还没有录入其他人。</p>}
+        {(voiceprint?.speakers ?? []).map((profile) => <div key={profile.id} className="dsh-vd-speakerRow">
+          <span>{profile.name}</span>
+          <button type="button" className="dsh-vd-button" disabled={speakerBusy !== '' || recording}
+            onClick={() => { void renameSpeaker(profile) }}>{speakerBusy === profile.id ? '处理中…' : '重命名'}</button>
+          <button type="button" className="dsh-vd-button" disabled={speakerBusy !== '' || recording}
+            onClick={() => { void removeSpeaker(profile) }}>删除</button>
+        </div>)}
+        <div className="dsh-vd-preview">
+          <input value={guestName} maxLength={12} placeholder="这个人的名字，例如 老婆"
+            onChange={(event) => { setGuestName(event.target.value) }} />
+          <button type="button" className="dsh-vd-button" disabled={voiceprintBusy !== '' || recording || !guestName.trim() || !voiceprint?.ready}
+            onClick={() => { void recordOtherVoice() }}>
+            {recording && recordingTarget === 'guest' ? '录音中…' : '录制这个人的声纹'}
+          </button>
+        </div>
       </div>
       {recording && <>
         <div className="dsh-vd-recordBar"><span style={{ width: `${Math.max(4, Math.round(recordLevel * 100))}%` }} /></div>
-        <p className="dsh-vd-muted">请用平常音量说一句话，例如：今天天气不错，我在和你说话。录音六秒后自动保存。</p>
+        <p className="dsh-vd-muted">{recordingTarget === 'guest'
+          ? '请让这个人用平常音量说一句话，录音六秒后自动保存。'
+          : '请用平常音量说一句话，例如：今天天气不错，我在和你说话。录音六秒后自动保存。'}</p>
       </>}
       {voiceprintError && <p className="dsh-vd-error" role="alert">{voiceprintError}</p>}
       <p className="dsh-vd-muted">带「客人」前缀的是其他人；只有登记过我的声纹，才能启用「只回应我的声音」。每次判定是你的声音，会用它慢慢强化声纹；其他人的声音不会写进去。</p>
@@ -1282,6 +1384,11 @@ const SETTINGS_CSS = `
 .dsh-vd-button:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
 .dsh-vd-button:disabled { opacity: .5; cursor: default; }
 .dsh-vd-vpStatus { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--dsw-alias-label-secondary); }
+.dsh-vd-speakers { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; border-top: 1px solid var(--dsw-alias-border-l1); }
+.dsh-vd-speakers h4 { margin: 4px 0 0; font-size: 13px; }
+.dsh-vd-speakerRow { display: flex; align-items: center; gap: 8px; }
+.dsh-vd-speakerRow > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-vd-speakers .dsh-vd-button { padding: 4px 9px; }
 .dsh-vd-recordBar { height: 6px; overflow: hidden; border-radius: 3px; background: var(--dsw-alias-interactive-bg-hover); }
 .dsh-vd-recordBar span { display: block; height: 100%; border-radius: 3px; background: var(--dsw-alias-state-business-primary); transition: width .08s linear; }
 `

@@ -473,12 +473,47 @@ export function apply(ctx: Context, config: Config): void {
     voiceprint.forget()
     writeJson(res, 200, { ok: true })
   }
+  const voiceprintEnrollSpeaker = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req as IncomingMessage, 4 * 1024 * 1024)
+      const audio = typeof body.audioBase64 === 'string' ? body.audioBase64 : ''
+      const name = typeof body.name === 'string' ? body.name : ''
+      if (!audio) throw new Error('缺少录音数据')
+      const result = await voiceprint.enrollSpeaker(decodeWavBase64(audio), name)
+      writeJson(res, 200, { ok: true, ...result })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  const voiceprintRenameSpeaker = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req as IncomingMessage)
+      const id = typeof body.id === 'string' ? body.id : ''
+      const name = typeof body.name === 'string' ? body.name : ''
+      writeJson(res, 200, { ok: true, ...voiceprint.renameSpeaker(id, name) })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  const voiceprintRemoveSpeaker = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req as IncomingMessage)
+      const id = typeof body.id === 'string' ? body.id : ''
+      voiceprint.removeSpeaker(id)
+      writeJson(res, 200, { ok: true })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
   const voiceprintRoutes: Array<[string, (req: unknown, res: ServerResponse) => void | Promise<void>]> = [
     ['/voiceprint/status', voiceprintStatus],
     ['/voiceprint/prepare', voiceprintPrepare],
     ['/voiceprint/enroll', voiceprintEnroll],
     ['/voiceprint/identify', voiceprintIdentify],
     ['/voiceprint/forget', voiceprintForget],
+    ['/voiceprint/speakers/enroll', voiceprintEnrollSpeaker],
+    ['/voiceprint/speakers/rename', voiceprintRenameSpeaker],
+    ['/voiceprint/speakers/remove', voiceprintRemoveSpeaker],
   ]
   for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
     for (const [route, handler] of voiceprintRoutes) {

@@ -1,4 +1,5 @@
 /** Local speaker verification and online speaker labeling (CAM++ via sherpa-onnx). */
+import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -31,6 +32,15 @@ const OWNER_SOFT_FLOOR_AFTER_OWNER = 0.35
 const OWNER_GUEST_MARGIN = 0.06
 const OWNER_HISTORY_FLOOR = 0.45
 const MAX_SESSION_LABELS = 128
+const NAMED_THRESHOLD_FLOOR = 0.55
+const MAX_NAMED_SPEAKERS = 12
+const MAX_SPEAKER_NAME = 12
+
+export interface VoiceprintProfile {
+  id: string
+  name: string
+  updatedAt: string
+}
 
 export interface VoiceprintStatus {
   addonAvailable: boolean
@@ -39,6 +49,8 @@ export interface VoiceprintStatus {
   ready: boolean
   modelPath: string
   modelBytes: number
+  speakers: VoiceprintProfile[]
+  speakerCount: number
   embeddingDim?: number
   error?: string
 }
@@ -50,11 +62,21 @@ export interface IdentifyResult {
   similarity: number
 }
 
-interface StoredVoiceprint {
+interface StoredSpeaker {
+  id: string
+  name: string
   embedding: number[]
+  updatedAt: string
+}
+
+interface StoredVoiceprint {
+  /** The owner template; absent when only named guests are enrolled. */
+  embedding?: number[]
   /** Optional for compatibility with files written before adaptive updates. */
   updates?: number
-  updatedAt: string
+  updatedAt?: string
+  /** Persistently enrolled guests. Older files simply omit this field. */
+  speakers?: StoredSpeaker[]
 }
 
 interface SpeakerCluster {
@@ -63,7 +85,7 @@ interface SpeakerCluster {
   count: number
 }
 
-interface Extractor {
+export interface Extractor {
   createStream(): {
     acceptWaveform(input: { sampleRate: number; samples: Float32Array }): void
   }
@@ -132,6 +154,17 @@ export function decodeWavBase64(base64: string): Float32Array {
   return samples
 }
 
+function cleanSpeakerName(value: unknown): string {
+  if (typeof value !== 'string') throw new Error('声纹名字必须是文字')
+  const name = value.trim()
+  if (!name) throw new Error('请给这个声纹起个名字')
+  if ([...name].length > MAX_SPEAKER_NAME) throw new Error('声纹名字最多 ' + MAX_SPEAKER_NAME + ' 个字')
+  if (name === '我' || name === '*') throw new Error('这个名字不能用作其他人的声纹')
+  if (/[\[\]\r\n:：]/u.test(name)) throw new Error('声纹名字不能包含括号、冒号或换行')
+  if (/^(?:客人|说话人)\d+$/u.test(name)) throw new Error('这个名字容易和临时声纹编号混淆')
+  return name
+}
+
 function proxyUrl(): string | undefined {
   const raw = process.env.DSH_VOICE_MODEL_PROXY ?? process.env.HTTPS_PROXY ?? process.env.https_proxy
     ?? process.env.HTTP_PROXY ?? process.env.http_proxy
@@ -173,18 +206,70 @@ export class VoiceprintService {
   private extractorError: string | undefined
   private owner: Float32Array | null | undefined
   private ownerUpdates = 0
+  private speakersCache: StoredSpeaker[] | undefined
   private readonly clusters = new Map<string, SpeakerCluster[]>()
   private readonly lastSpeakerLabels = new Map<string, string>()
   private chain: Promise<unknown> = Promise.resolve()
+  private readonly injectedExtractor: Extractor | undefined
 
-  constructor(options: { dataDir?: string; modelPath?: string } = {}) {
+  constructor(options: { dataDir?: string; modelPath?: string; extractor?: Extractor } = {}) {
     this.dataDir = options.dataDir ?? join(homedir(), '.dsh', 'voice-dialog')
     this.modelPath = options.modelPath
       ?? process.env.DSH_VOICE_MODEL
       ?? join(this.dataDir, 'models', MODEL_FILE)
+    this.injectedExtractor = options.extractor
   }
 
   private get storePath(): string { return join(this.dataDir, 'voiceprint.json') }
+
+  private readStore(): StoredVoiceprint {
+    try {
+      const raw = JSON.parse(readFileSync(this.storePath, 'utf8')) as StoredVoiceprint
+      return raw && typeof raw === 'object' ? raw : {}
+    } catch {
+      return {}
+    }
+  }
+
+  private writeStore(store: StoredVoiceprint): void {
+    mkdirSync(this.dataDir, { recursive: true })
+    writeFileSync(this.storePath, JSON.stringify(store), 'utf8')
+    this.speakersCache = undefined
+  }
+
+  /** Named guests are persisted; embeddings never leave this machine. */
+  private loadSpeakers(): StoredSpeaker[] {
+    if (this.speakersCache) return this.speakersCache
+    const raw = this.readStore()
+    const list = Array.isArray(raw.speakers) ? raw.speakers : []
+    this.speakersCache = list.filter((item): item is StoredSpeaker => Boolean(
+      item
+      && typeof item.id === 'string' && item.id
+      && typeof item.name === 'string' && item.name.trim()
+      && Array.isArray(item.embedding) && item.embedding.length >= 64
+      && typeof item.updatedAt === 'string'
+    ))
+    return this.speakersCache
+  }
+
+  private speakerProfiles(): VoiceprintProfile[] {
+    return this.loadSpeakers().map((item) => ({ id: item.id, name: item.name, updatedAt: item.updatedAt }))
+  }
+
+  private bestNamed(speakers: StoredSpeaker[], embedding: Float32Array): { speaker?: StoredSpeaker; similarity: number } {
+    let best: StoredSpeaker | undefined
+    let bestSimilarity = -1
+    for (const speaker of speakers) {
+      const vector = Float32Array.from(speaker.embedding)
+      if (vector.length !== embedding.length) continue
+      const similarity = cosineSimilarity(embedding, vector)
+      if (similarity > bestSimilarity) {
+        best = speaker
+        bestSimilarity = similarity
+      }
+    }
+    return { speaker: best, similarity: bestSimilarity }
+  }
 
   status(): VoiceprintStatus {
     let addonAvailable = false
@@ -198,13 +283,17 @@ export class VoiceprintService {
     try { modelBytes = statSync(this.modelPath).size } catch { /* missing */ }
     let enrolled = false
     try { enrolled = this.ownerEmbedding() !== null } catch { /* invalid JSON */ }
+    const speakers = this.speakerProfiles()
+    const ready = this.injectedExtractor !== undefined || (addonAvailable && modelBytes > 1_000_000)
     return {
       addonAvailable,
       modelPresent: modelBytes > 1_000_000,
       enrolled,
-      ready: addonAvailable && modelBytes > 1_000_000,
+      ready,
       modelPath: this.modelPath,
       modelBytes,
+      speakers,
+      speakerCount: speakers.length,
       ...(this.extractor?.dim ? { embeddingDim: this.extractor.dim } : {}),
       ...(addonAvailable ? {} : { error: '缺少本地声纹组件 sherpa-onnx-node' }),
     }
@@ -219,6 +308,7 @@ export class VoiceprintService {
   }
 
   private ensureExtractor(): Extractor {
+    if (this.injectedExtractor) return this.injectedExtractor
     if (this.extractor) return this.extractor
     if (this.extractorError) throw new Error(this.extractorError)
     if (!existsSync(this.modelPath) || statSync(this.modelPath).size < 1_000_000) {
@@ -266,7 +356,7 @@ export class VoiceprintService {
   private ownerEmbedding(): Float32Array | null {
     if (this.owner !== undefined) return this.owner
     try {
-      const raw = JSON.parse(readFileSync(this.storePath, 'utf8')) as StoredVoiceprint
+      const raw = this.readStore()
       if (!Array.isArray(raw.embedding) || raw.embedding.length < 64) {
         this.owner = null
         this.ownerUpdates = 0
@@ -288,13 +378,11 @@ export class VoiceprintService {
     const owner = this.owner
     if (!owner) return
     try {
-      mkdirSync(this.dataDir, { recursive: true })
-      const stored: StoredVoiceprint = {
-        embedding: Array.from(owner),
-        updates: this.ownerUpdates,
-        updatedAt: new Date().toISOString(),
-      }
-      writeFileSync(this.storePath, JSON.stringify(stored), 'utf8')
+      const stored = this.readStore()
+      stored.embedding = Array.from(owner)
+      stored.updates = this.ownerUpdates
+      stored.updatedAt = new Date().toISOString()
+      this.writeStore(stored)
     } catch {
       // Identification should remain usable if the data directory is temporarily unwritable.
     }
@@ -362,13 +450,11 @@ export class VoiceprintService {
   async enroll(samples: Float32Array): Promise<{ dim: number }> {
     if (samples.length < MIN_ENROLL_SAMPLES) throw new Error('录音太短，请说满两秒再试')
     const embedding = await this.compute(samples)
-    mkdirSync(this.dataDir, { recursive: true })
-    const stored: StoredVoiceprint = {
-      embedding: Array.from(embedding),
-      updates: 0,
-      updatedAt: new Date().toISOString(),
-    }
-    writeFileSync(this.storePath, JSON.stringify(stored), 'utf8')
+    const stored = this.readStore()
+    stored.embedding = Array.from(embedding)
+    stored.updates = 0
+    stored.updatedAt = new Date().toISOString()
+    this.writeStore(stored)
     this.owner = embedding
     this.ownerUpdates = 0
     this.clusters.clear()
@@ -376,12 +462,62 @@ export class VoiceprintService {
     return { dim: embedding.length }
   }
 
+  /** Enroll one named guest. The owner template and other guests are preserved. */
+  async enrollSpeaker(samples: Float32Array, name: string): Promise<{ id: string; name: string; dim: number }> {
+    if (samples.length < MIN_ENROLL_SAMPLES) throw new Error('录音太短，请说满两秒再试')
+    const clean = cleanSpeakerName(name)
+    const speakers = this.loadSpeakers()
+    if (speakers.length >= MAX_NAMED_SPEAKERS) throw new Error('最多只能录入 ' + MAX_NAMED_SPEAKERS + ' 个其他人的声纹')
+    if (speakers.some((item) => item.name.toLocaleLowerCase() === clean.toLocaleLowerCase())) {
+      throw new Error('这个声纹名字已经存在')
+    }
+    const embedding = await this.compute(samples)
+    const stored = this.readStore()
+    const list = this.loadSpeakers().slice()
+    const id = randomUUID()
+    list.push({ id, name: clean, embedding: Array.from(embedding), updatedAt: new Date().toISOString() })
+    stored.speakers = list
+    this.writeStore(stored)
+    return { id, name: clean, dim: embedding.length }
+  }
+
+  renameSpeaker(id: string, name: string): VoiceprintProfile {
+    const clean = cleanSpeakerName(name)
+    if (!id) throw new Error('缺少声纹编号')
+    const speakers = this.loadSpeakers()
+    if (!speakers.some((item) => item.id === id)) throw new Error('找不到这个声纹')
+    if (speakers.some((item) => item.id !== id && item.name.toLocaleLowerCase() === clean.toLocaleLowerCase())) {
+      throw new Error('这个声纹名字已经存在')
+    }
+    const stored = this.readStore()
+    const updatedAt = new Date().toISOString()
+    stored.speakers = speakers.map((item) => item.id === id ? { ...item, name: clean, updatedAt } : item)
+    this.writeStore(stored)
+    return { id, name: clean, updatedAt }
+  }
+
+  removeSpeaker(id: string): void {
+    if (!id) throw new Error('缺少声纹编号')
+    const speakers = this.loadSpeakers()
+    if (!speakers.some((item) => item.id === id)) throw new Error('找不到这个声纹')
+    const stored = this.readStore()
+    stored.speakers = speakers.filter((item) => item.id !== id)
+    this.writeStore(stored)
+  }
+
   forget(): void {
     this.owner = null
     this.ownerUpdates = 0
     this.clusters.clear()
     this.lastSpeakerLabels.clear()
-    try { unlinkSync(this.storePath) } catch { /* already absent */ }
+    const stored = this.readStore()
+    delete stored.embedding
+    delete stored.updates
+    stored.updatedAt = new Date().toISOString()
+    if (stored.speakers && stored.speakers.length > 0) this.writeStore(stored)
+    else {
+      try { unlinkSync(this.storePath) } catch { /* already absent */ }
+    }
   }
 
   async identify(
@@ -395,10 +531,16 @@ export class VoiceprintService {
     const sessionId = (options.sessionId ?? '').trim() || 'default'
     const previousLabel = this.lastSpeakerLabels.get(sessionId)
     const guest = this.bestGuest(sessionId, embedding)
+    const namedSpeakers = this.loadSpeakers()
+    const named = this.bestNamed(namedSpeakers, embedding)
+    const namedThreshold = Math.max(NAMED_THRESHOLD_FLOOR, threshold)
+    const namedIsClearlyStronger = owner !== null && named.speaker !== undefined
+      && named.similarity >= namedThreshold
+      && named.similarity > cosineSimilarity(embedding, owner) + OWNER_GUEST_MARGIN
 
     if (owner) {
       const similarity = cosineSimilarity(embedding, owner)
-      if (similarity >= threshold) {
+      if (similarity >= threshold && !namedIsClearlyStronger) {
         this.adaptOwner(embedding, OWNER_ADAPT_WEIGHT)
         this.rememberLabel(sessionId, '我')
         return { enrolled: true, owner: true, label: '我', similarity }
@@ -410,9 +552,10 @@ export class VoiceprintService {
       const softFloor = previousLabel === '我'
         ? OWNER_SOFT_FLOOR_AFTER_OWNER
         : OWNER_SOFT_FLOOR
-      const guestIsClearlyStronger = guest.cluster !== undefined
-        && guest.similarity > similarity + OWNER_GUEST_MARGIN
+      const guestIsClearlyStronger = (guest.cluster !== undefined
+        && guest.similarity > similarity + OWNER_GUEST_MARGIN) || namedIsClearlyStronger
       const priorOwnerException = previousLabel === '我' && similarity >= OWNER_HISTORY_FLOOR
+        && !namedIsClearlyStronger
       if (similarity >= softFloor && (!guestIsClearlyStronger || priorOwnerException)) {
         this.adaptOwner(embedding, OWNER_SOFT_ADAPT_WEIGHT)
         this.rememberLabel(sessionId, '我')
@@ -420,6 +563,12 @@ export class VoiceprintService {
       }
     }
 
+    if (named.speaker && named.similarity >= namedThreshold) {
+      this.rememberLabel(sessionId, named.speaker.name)
+      return { enrolled: true, owner: false, label: named.speaker.name, similarity: named.similarity }
+    }
+
+    const hasEnrollment = owner !== null || namedSpeakers.length > 0
     const list = this.sessionClusters(sessionId)
     if (guest.cluster && guest.similarity >= CLUSTER_THRESHOLD) {
       const best = guest.cluster
@@ -431,17 +580,17 @@ export class VoiceprintService {
       best.centroid = normalize(merged)
       best.count = count
       this.rememberLabel(sessionId, best.label)
-      return { enrolled: owner !== null, owner: false, label: best.label, similarity: guest.similarity }
+      return { enrolled: hasEnrollment, owner: false, label: best.label, similarity: guest.similarity }
     }
     const prefix = owner ? '客人' : '说话人'
     if (list.length < MAX_CLUSTERS) {
       const label = prefix + (list.length + 1)
       list.push({ label, centroid: embedding, count: 1 })
       this.rememberLabel(sessionId, label)
-      return { enrolled: owner !== null, owner: false, label, similarity: Math.max(0, guest.similarity) }
+      return { enrolled: hasEnrollment, owner: false, label, similarity: Math.max(0, guest.similarity) }
     }
     const label = owner ? '其他客人' : '其他说话人'
     this.rememberLabel(sessionId, label)
-    return { enrolled: owner !== null, owner: false, label, similarity: guest.similarity }
+    return { enrolled: hasEnrollment, owner: false, label, similarity: guest.similarity }
   }
 }
