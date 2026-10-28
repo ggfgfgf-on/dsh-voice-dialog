@@ -1,0 +1,19 @@
+# dsh-voice-dialog bundle: continuous voice dialog + auto-read assistant replies.
+#
+# The host speech stack is composed here so this plugin does not need the
+# built-in voice-input bundle (and its one-shot microphone UI) to be enabled.
+# If that bundle is already active, disable it first: it declares the same
+# three host rows below.
+- insert:
+    - id: speech-to-text
+      name: '@deepseek-ai/dsh-experimental-speech-to-text'
+      config:
+        defaultProvider: sensevoice-local
+    - id: speech-to-text-sensevoice
+      name: '@deepseek-ai/dsh-experimental-speech-to-text-sensevoice'
+      config:
+        dataRoot: !!js dshHomePath('speech-to-text', 'sensevoice')
+    - id: api-speech-to-text
+      name: '@deepseek-ai/dsh-experimental-api-speech-to-text'
+    - id: voice-dialog
+      name: dsh-voice-dialog

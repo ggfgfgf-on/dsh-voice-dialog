@@ -1,0 +1,23 @@
+# NOTICE
+
+dsh-voice-dialog is MIT-licensed. It contains adapted material from these
+MIT-licensed projects:
+
+- **haoku123/dsh-voice** — sentence segmentation and the Edge TTS queue
+  (`src/segmenter.ts`, `src/tts-queue.ts`). Copyright (c) 2026 haoku123.
+  https://github.com/haoku123/dsh-voice
+
+- **deepseek-ai/deepseek-harness** — microphone capture, WAV encoding and the
+  composer microphone design (`src/mic.ts`, `src/wav.ts`, `src/client.tsx`).
+  The generated speech Remote contribution in `src/speech-remote.js` is taken
+  from `@deepseek-ai/dsh-experimental-api-speech-to-text`
+  (`lib/typert.remote-client.js`). Copyright (c) DeepSeek.
+  https://github.com/deepseek-ai/deepseek-harness
+
+- **1624318455/dsh-plugin-tts** — the Edge voice catalog and the settings-page
+  pattern (voice selector + preview) are modeled on this plugin. No source file
+  was copied. Copyright (c) 2026 1624318455.
+  https://github.com/1624318455/dsh-plugin-tts
+
+The bundled npm dependencies keep their own licenses; see
+node_modules/<package>/LICENSE after installation.
