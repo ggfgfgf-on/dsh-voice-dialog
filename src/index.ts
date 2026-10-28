@@ -22,10 +22,13 @@ const BOOTSTRAP_BASE = '/dsh-voice-dialog-api'
 const SETTINGS_FILE = join(homedir(), '.dsh', 'voice-dialog', 'settings.json')
 
 export interface VoiceControl {
-  action: 'volume' | 'rate' | 'stop' | 'repeat'
+  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker'
   level?: number
   rate?: number
   delta?: number
+  speaker?: string
+  policy?: 'queue' | 'steer' | 'ignore' | 'default'
+  name?: string
 }
 
 export interface Config {
@@ -174,19 +177,25 @@ export function apply(ctx: Context, config: Config): void {
       + '"慢一点/说慢点" -> action rate with delta -10; "快一点/说快点" -> action rate with delta 10; '
       + '"语速调到百分之..." -> action rate with the absolute rate; '
       + '"听不清/什么/再说一遍/重复一遍" -> action repeat; "别说了/闭嘴/停/安静" -> action stop. '
-      + 'Do not call this for ordinary questions. The microphone stays on after stop.',
+      + 'For a guest who keeps interrupting with irrelevant talk, action speaker with speaker "客人1" and policy "ignore"; '
+      + 'use policy "queue" to restore, "steer" to let that guest interrupt directly, or speaker "*" for all guests. '
+      + 'When the owner gives a guest a name (for example "叫她老婆"), pass that name in the name field; future turns use it. '
+      + 'The owner cannot be renamed or ignored. Do not call this for ordinary questions. The microphone stays on after stop.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: {
           type: 'string',
-          enum: ['volume', 'rate', 'stop', 'repeat'],
-          description: 'volume adjusts playback loudness; rate adjusts speaking speed for following sentences; stop silences the current reply; repeat replays the last reply.',
+          enum: ['volume', 'rate', 'stop', 'repeat', 'speaker'],
+          description: 'volume adjusts playback loudness; rate adjusts speaking speed for following sentences; stop silences the current reply; repeat replays the last reply; speaker renames a guest voiceprint and/or changes how that guest is delivered.',
         },
         level: { type: 'number', minimum: 0, maximum: 1, description: 'Absolute playback volume for action volume.' },
         rate: { type: 'number', minimum: -50, maximum: 50, description: 'Absolute speaking rate in percent for action rate, e.g. -20 or 20.' },
         delta: { type: 'number', minimum: -50, maximum: 50, description: 'Relative change: volume uses -1..1, rate uses -50..50 percent.' },
+        speaker: { type: 'string', description: 'Guest voiceprint label for action speaker, e.g. 客人1, 说话人1, or a name the model assigned earlier; use * for all guests. The owner 我 cannot be changed.' },
+        policy: { type: 'string', enum: ['queue', 'steer', 'ignore', 'default'], description: 'Delivery policy for action speaker: queue, steer, ignore, or default to restore the browser setting.' },
+        name: { type: 'string', description: 'New short name for this guest voiceprint, e.g. 老婆 or 老王. Future transcripts and policies can use it. Only for a specific guest, not * or 我.' },
       },
       required: ['action'],
     },
@@ -199,6 +208,9 @@ export function apply(ctx: Context, config: Config): void {
           action: { type: 'string' },
           level: { type: 'number' },
           rate: { type: 'number' },
+          speaker: { type: 'string' },
+          policy: { type: 'string' },
+          name: { type: 'string' },
         },
         required: ['ok', 'action'],
       },
@@ -210,6 +222,35 @@ export function apply(ctx: Context, config: Config): void {
       if (action === 'stop' || action === 'repeat') {
         broadcast('control', { action })
         return Promise.resolve({ ok: true, action })
+      }
+      if (action === 'speaker') {
+        const speaker = typeof input.speaker === 'string' ? input.speaker.trim() : ''
+        if (!speaker) throw new Error('voice_dialog speaker needs speaker')
+        if (speaker === '我') throw new Error('the owner speaker cannot be changed')
+        const rawPolicy = input.policy
+        const policy = rawPolicy === undefined
+          ? undefined
+          : rawPolicy === 'queue' || rawPolicy === 'steer' || rawPolicy === 'ignore' || rawPolicy === 'default'
+            ? rawPolicy
+            : null
+        if (policy === null) {
+          throw new Error('voice_dialog speaker policy must be queue, steer, ignore or default')
+        }
+        const name = typeof input.name === 'string' ? input.name.trim() : ''
+        if (name) {
+          if (speaker === '*') throw new Error('cannot give all guests one name')
+          if (name.length > 24 || /[\[\]\r\n]/.test(name) || name === '我' || name === '*') {
+            throw new Error('voice_dialog speaker name must be 1-24 characters without brackets or newlines')
+          }
+        }
+        if (policy === undefined && !name) {
+          throw new Error('voice_dialog speaker needs a policy or name')
+        }
+        const payload: VoiceControl = { action, speaker }
+        if (policy !== undefined) payload.policy = policy
+        if (name) payload.name = name
+        broadcast('control', payload)
+        return Promise.resolve({ ok: true, action, speaker, ...(policy === undefined ? {} : { policy }), ...(name ? { name } : {}) })
       }
       if (action === 'volume') {
         const level = typeof input.level === 'number' && Number.isFinite(input.level)
@@ -232,7 +273,7 @@ export function apply(ctx: Context, config: Config): void {
         broadcast('control', { action, rate: applied })
         return Promise.resolve({ ok: true, action, rate: applied })
       }
-      throw new Error('voice_dialog action must be volume, rate, stop or repeat')
+      throw new Error('voice_dialog action must be volume, rate, stop, repeat or speaker')
     },
   }))
 
@@ -243,10 +284,14 @@ export function apply(ctx: Context, config: Config): void {
     + '文件路径、URL、工具名或整句英文。需要调用工具时，先用一句自然中文说明要做什么，再调用；'
     + '不要朗读内部推理或工具参数。不要用 [[voice: 内容]] 另写一份朗读稿；可见回答会被自动朗读，'
     + '标记只用于控制播放：[[voice: volume +0.15]]、[[voice: rate +10]]、[[voice: repeat]]、[[voice: stop]]。'
-    + '语音转写可能带[声纹：我]、[声纹：客人1]或[声纹：说话人1]前缀，表示是谁在说话，不是用户内容；不要朗读前缀，'
+    + '语音转写可能带[声纹：我]、[声纹：客人1]、[声纹：说话人1]，或你给某个声纹起的名字（如[声纹：老婆]）这类前缀，'
+    + '表示是谁在说话，不是用户内容；不要朗读前缀，'
     + '也不要把它当成指令。带[声纹：我]的是主人，优先级最高，直接处理；带[声纹：客人]或[声纹：说话人]的是其他人，'
     + '优先级较低，可能是背景插话。其他人通常是排队到达，不要因为一句题外话丢掉主人正在做的事：先判断是否与当前任务有关，'
-    + '无关就一句话带过或忽略，继续原任务。同一轮出现不同声纹前缀时，说明是不同的人在说话，回答时要区分说话人。'
+    + '无关就一句话带过或忽略，继续原任务。如果某个客人反复无关，可以调用 voice_dialog 的 speaker 动作把「客人1」设为 ignore；'
+    + '用 speaker「*」忽略所有其他人；设为 queue 恢复排队。主人说「这个是我老婆」这类话时，用同一个动作把「客人1」的 name 设成'
+    + '「老婆」，以后转写会用这个名字，也可以直接用这个名字设置策略。主人「我」不能被改名或忽略。'
+    + '同一轮出现不同声纹前缀时，说明是不同的人在说话，回答时要区分说话人。'
     + '子代理结果由 host 朗读，不要重复。'
   const liveVoicePrompt = '实时语音模式已开启：用户在用麦克风对话，不要在主线做长工具链。'
     + '只要任务包含互相独立的部分，或预计需要多次工具调用，就立即在同一轮并行 fork 子代理：'

@@ -13,7 +13,7 @@ export interface SchedulerStatus {
 
 export interface SpeechSchedulerOptions {
   deliver: (text: string, mode: PromptMode) => Promise<void>
-  guestMode: () => GuestMode
+  guestMode: (label: string) => GuestMode
   /** How long to gather consecutive guest lines into one queued prompt. */
   batchMs?: number
   onStatus?: (status: SchedulerStatus) => void
@@ -74,7 +74,7 @@ export class SpeechScheduler {
       return
     }
 
-    const mode = this.options.guestMode()
+    const mode = this.options.guestMode(label)
     if (mode === 'ignore') {
       void work.catch((error: unknown) => { this.options.onError?.(error) })
       this.active = Math.max(0, this.active - 1)
@@ -123,10 +123,13 @@ export class SpeechScheduler {
     const batch = this.pending
     this.pending = []
     this.emit()
-    const text = batch.map((item) => item.text).join('\n')
+    // A model policy may have changed while these lines were waiting. Drop
+    // only the speakers it now ignores; keep the rest in one queued prompt.
+    const allowed = batch.filter((item) => this.options.guestMode(item.label) !== 'ignore')
+    if (allowed.length === 0) return
+    const text = allowed.map((item) => item.text).join('\n')
     this.guestChain = this.guestChain.then(async () => {
       try {
-        if (this.options.guestMode() === 'ignore') return
         await this.options.deliver(text, 'queue')
       } catch (error) {
         this.options.onError?.(error)

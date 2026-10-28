@@ -7,7 +7,8 @@ import {
 import speechRemote from './speech-remote.js'
 import { MicrophoneLoop, recordVoiceSample } from './mic.ts'
 import { getPreferences, setPreferences, subscribePreferences, type VoiceDialogPreferences } from './preferences.ts'
-import { SpeechScheduler } from './scheduler.ts'
+import { SpeechScheduler, type GuestMode } from './scheduler.ts'
+import { SpeakerPolicyStore } from './speaker-policy.ts'
 import { audioBase64, encodeWave } from './wav.ts'
 
 export const inject = ['remote']
@@ -25,10 +26,13 @@ interface VoiceFrame {
 }
 
 interface VoiceControl {
-  action: 'volume' | 'rate' | 'stop' | 'repeat'
+  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker'
   level?: number
   rate?: number
   delta?: number
+  speaker?: string
+  policy?: GuestMode | 'default'
+  name?: string
 }
 
 interface HostConfig {
@@ -391,6 +395,22 @@ class TtsPlayer {
 
 const sharedPlayer = new TtsPlayer()
 
+/** Names and guest policies are model-issued and kept in memory per session. */
+const speakerPolicy = new SpeakerPolicyStore()
+
+function applySpeakerPolicy(sessionId: string, control: VoiceControl): void {
+  if (control.action !== 'speaker') return
+  speakerPolicy.apply(sessionId, control)
+}
+
+function effectiveGuestMode(sessionId: string, label: string): GuestMode {
+  return speakerPolicy.effective(sessionId, label, getPreferences().guestMode)
+}
+
+function displaySpeaker(sessionId: string, label: string): string {
+  return speakerPolicy.display(sessionId, label)
+}
+
 function useAutoRead(sessionId: string): void {
   useEffect(() => {
     let closed = false
@@ -414,7 +434,9 @@ function useAutoRead(sessionId: string): void {
         })
         source.addEventListener('control', (event) => {
           try {
-            sharedPlayer.control(JSON.parse((event as MessageEvent<string>).data) as VoiceControl)
+            const control = JSON.parse((event as MessageEvent<string>).data) as VoiceControl
+            applySpeakerPolicy(sessionId, control)
+            sharedPlayer.control(control)
           } catch {
             // A malformed control frame must not tear down the stream.
           }
@@ -630,10 +652,11 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   ): Promise<void> => {
     const prefs = getPreferences()
     let identity: SpeakerIdentity | null = null
-    if (prefs.speakerPrefix || prefs.speakerGate || prefs.guestMode !== 'steer') {
+    if (prefs.speakerPrefix || prefs.speakerGate || prefs.guestMode !== 'steer'
+      || speakerPolicy.hasCustomization(sessionId)) {
       try {
         identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold)
-        setSpeaker(identity.label)
+        setSpeaker(displaySpeaker(sessionId, identity.label))
       } catch (failure) {
         // A missing model must not break normal dictation; the gate is
         // stricter because it is an explicit "only me" promise.
@@ -654,18 +677,20 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     // Without an enrolled voiceprint there is no priority signal. Keep the
     // previous behaviour: treat dictation as the owner instead of queueing it.
     const lane = identity?.enrolled === true && !identity.owner ? 'guest' : 'owner'
-    if (lane === 'guest' && prefs.guestMode === 'ignore') {
+    const canonical = identity?.label ?? ''
+    const display = canonical ? displaySpeaker(sessionId, canonical) : ''
+    if (lane === 'guest' && effectiveGuestMode(sessionId, canonical) === 'ignore') {
       setSpeaker('已忽略其他人的声音')
       return
     }
-    if (lane === 'guest') setSpeaker(identity?.label ?? '其他人')
+    if (lane === 'guest') setSpeaker(display || '其他人')
 
-    const prefix = prefs.speakerPrefix && identity?.label ? '[声纹：' + identity.label + '] ' : ''
+    const prefix = prefs.speakerPrefix && display ? '[声纹：' + display + '] ' : ''
     const work = runLimited(async () => {
       const text = await transcribeSamples(samples)
       return text ? prefix + text : null
     })
-    scheduler.enqueue(lane, identity?.label ?? '', work)
+    scheduler.enqueue(lane, canonical, work)
   }
 
   const handleSegment = (
@@ -691,7 +716,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       const sent = await session.prompt([{ type: 'text', text }], mode)
       if (!sent.ok) throw new Error(sent.error?.message ?? '发送失败')
     },
-    guestMode: () => getPreferences().guestMode,
+    guestMode: (label) => effectiveGuestMode(sessionId, label),
     batchMs: 900,
     onStatus: ({ active, queued }) => {
       setPending(active)
@@ -1175,6 +1200,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       <label className="dsh-vd-check"><input type="checkbox" checked={prefs.parallelAsr}
         onChange={(event) => { save({ parallelAsr: event.target.checked }) }} />并行识别多段语音（最多三路）</label>
       <p className="dsh-vd-muted">先后接话的多个人可以同时识别，互不阻塞。同一个瞬间两个人同时开口，仍可能被当成一段音频；完全分离需要双麦克风或额外的声源分离。</p>
+      <p className="dsh-vd-muted">模型也能按声纹临时调整：如果某个客人总在插无关的话，可以让模型忽略他；也可以让模型给声纹起名，比如“这个是我老婆”，之后就用老婆称呼。主人不会被忽略。这些调整只在当前会话内存里生效，刷新页面就恢复默认。</p>
       <p className="dsh-vd-muted">没登记我的声纹时无法区分主人和客人，所有语音都按主人处理。</p>
     </section>
 

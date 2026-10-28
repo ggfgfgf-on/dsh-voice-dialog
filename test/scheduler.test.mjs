@@ -71,6 +71,38 @@ test('guest ignore mode never delivers', async () => {
   assert.deepEqual(scheduler.status(), { active: 0, queued: 0 })
 })
 
+test('per-speaker policy only drops the ignored label', async () => {
+  const deliveries = []
+  const modes = new Map([['客人1', 'ignore'], ['客人2', 'queue']])
+  const scheduler = new SpeechScheduler({
+    deliver: async (text, mode) => { deliveries.push({ text, mode }) },
+    guestMode: (label) => modes.get(label) ?? 'queue',
+    batchMs: 5,
+  })
+  scheduler.enqueue('guest', '客人1', Promise.resolve('[声纹：客人1] 不要'))
+  scheduler.enqueue('guest', '客人2', Promise.resolve('[声纹：客人2] 要'))
+  await tick(40)
+  assert.deepEqual(deliveries, [{ text: '[声纹：客人2] 要', mode: 'queue' }])
+})
+
+test('a waiting guest line is dropped when its policy becomes ignore', async () => {
+  const deliveries = []
+  let mode = 'queue'
+  const scheduler = new SpeechScheduler({
+    deliver: async (text, value) => { deliveries.push({ text, value }) },
+    guestMode: () => mode,
+    batchMs: 500,
+  })
+  scheduler.enqueue('guest', '客人1', Promise.resolve('本来要排队'))
+  await tick(10)
+  assert.deepEqual(scheduler.status(), { active: 0, queued: 1 })
+  mode = 'ignore'
+  scheduler.flushGuests()
+  await tick(30)
+  assert.deepEqual(deliveries, [])
+  assert.deepEqual(scheduler.status(), { active: 0, queued: 0 })
+})
+
 test('dispose flushes guest lines already waiting', async () => {
   const deliveries = []
   const scheduler = new SpeechScheduler({
