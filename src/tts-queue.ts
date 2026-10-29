@@ -46,6 +46,19 @@ export interface TtsCancelResult {
   active: boolean
 }
 
+/** Read-only view of the host-side synthesis queue for the page. */
+export interface TtsQueueSnapshot {
+  /** The synthesizer is working, opening, or waiting out a retry. */
+  busy: boolean
+  /** A sentence is currently being synthesized. */
+  active: boolean
+  /** Sentences waiting behind the current one. */
+  pending: number
+  /** Current sentence text, bounded for display. */
+  text?: string
+  replyId?: string
+}
+
 const MP3_MAGIC = 0xff
 /** First retry delay after a failed TTS handshake; doubles every attempt. */
 const RETRY_BASE_MS = 1000
@@ -332,6 +345,22 @@ export class TtsQueue {
       }
     }
     return { pending: before - q.pending.length + (active ? 1 : 0), active }
+  }
+
+  /** Read-only snapshot used by the page's live status line. */
+  snapshot(sessionId: string): TtsQueueSnapshot {
+    const q = this.queues.get(sessionId)
+    if (!q) return { busy: false, active: false, pending: 0 }
+    const current = q.current
+    return {
+      busy: q.busy,
+      active: current !== null,
+      pending: q.pending.length,
+      ...(current === null ? {} : {
+        text: current.text.slice(0, 120),
+        ...(current.replyId === undefined ? {} : { replyId: current.replyId }),
+      }),
+    }
   }
 
   /** True when a pending/current sentence was invalidated by a cancel call. */

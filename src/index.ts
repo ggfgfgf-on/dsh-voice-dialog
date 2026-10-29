@@ -672,6 +672,28 @@ export function apply(ctx: Context, config: Config): void {
     )
   }
 
+  const ttsStateHandler = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req)
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+      if (!sessionId) { writeJson(res, 400, { error: 'missing sessionId' }); return }
+      const clientId = typeof body.clientId === 'string' ? body.clientId.trim() : ''
+      const owner = voiceOwner.get(sessionId)
+      if (owner !== undefined && clientId !== '' && owner.clientId !== clientId) {
+        writeJson(res, 409, { error: 'another tab owns this voice session' })
+        return
+      }
+      writeJson(res, 200, { ok: true, ...queue.snapshot(sessionId) })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
+    ctx.effect(() =>
+      ctx.webServer.register({ kind: 'exact', path: `${prefix}/tts-state`, handler: ttsStateHandler }),
+    )
+  }
+
   // Persisted voice selection. The client owns the catalog; the host only
   // validates the id, switches the live queue and stores the choice.
   ctx.effect(() =>

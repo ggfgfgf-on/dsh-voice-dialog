@@ -223,3 +223,41 @@ test('cancel stops the whole session and reports active plus pending work', asyn
   assert.deepEqual(frames, [])
   await queue.close()
 })
+
+test('snapshot exposes the current sentence and the waiting count', async () => {
+  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural', synthAttempts: 1 })
+  const gate = deferred()
+  const started = deferred()
+  queue.tts = {
+    setMetadata: async () => undefined,
+    toStream: async () => {
+      started.resolve()
+      return {
+        audioStream: (async function* () {
+          await gate.promise
+          yield magicMp3()
+        })(),
+      }
+    },
+    close: async () => undefined,
+  }
+  queue.enqueue('session-state', '正在合成的一句', 'reply-state')
+  queue.enqueue('session-state', '后面排队的一句', 'reply-state')
+  await started.promise
+  assert.deepEqual(queue.snapshot('session-state'), {
+    busy: true,
+    active: true,
+    pending: 1,
+    text: '正在合成的一句',
+    replyId: 'reply-state',
+  })
+  queue.cancel('session-state')
+  gate.resolve()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.deepEqual(queue.snapshot('session-state'), {
+    busy: false,
+    active: false,
+    pending: 0,
+  })
+  await queue.close()
+})
