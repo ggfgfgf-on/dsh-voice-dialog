@@ -83,6 +83,14 @@ const SYNTH_ATTEMPTS = 3
 const SYNTH_RETRY_DELAY_MS = 250
 /** The WebSocket host whose traffic should follow the configured proxy. */
 const EDGE_TTS_HOST = 'speech.platform.bing.com'
+/** Longest single sentence that may join an adjacent one in one TTS request. */
+const MERGE_ITEM_MAX_CHARS = 40
+/** Hard cap for one merged TTS request; longer runs start a new request. */
+const MERGE_RUN_MAX_CHARS = 160
+/** Hard cap on how many queue items may share one merged TTS request. */
+const MERGE_RUN_MAX_ITEMS = 6
+/** Comma inserted between short lines that have no punctuation at the seam. */
+const MERGE_JOINER = '，'
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -177,6 +185,96 @@ export function withSpeechPause(text: string): string {
   if (!clean) return clean
   if (/[，、；：,;:。！？!?…\s]$/u.test(clean)) return clean
   return clean + '，'
+}
+
+/** One Edge TTS request may represent several consecutive short queue items. */
+export interface MergedSynthesisRun {
+  /** Text to synthesize in one request. */
+  text: string
+  /** Number of leading queue items represented by `text` (always 1 or more). */
+  count: number
+}
+
+const BOUNDARY_PUNCTUATION = /[\p{P}\p{S}]/u
+const JOIN_SEPARATOR = /[，,、；;：:。.!！?？…]/u
+const TERMINAL_PUNCTUATION = /[。.!！?？…]/u
+const CLAUSE_SEPARATOR = /[；;：:]/u
+
+/** Count user-visible characters, not UTF-16 code units. */
+function characterCount(text: string): number {
+  return Array.from(text).length
+}
+
+function punctuationRank(char: string): number {
+  if (TERMINAL_PUNCTUATION.test(char)) return 3
+  if (CLAUSE_SEPARATOR.test(char)) return 2
+  if (JOIN_SEPARATOR.test(char)) return 1
+  return 0
+}
+
+function dropLastCharacter(text: string): string {
+  const chars = Array.from(text)
+  chars.pop()
+  return chars.join('')
+}
+
+/**
+ * Join two short lines for a single TTS request. Add a Chinese comma only when
+ * neither side already provides punctuation; when both sides have a joining
+ * mark at the seam, keep one (the stronger one) instead of doubling it.
+ */
+function joinSynthesisText(left: string, right: string): string {
+  const before = left.trimEnd()
+  const after = right.trimStart()
+  if (!before) return after
+  if (!after) return before
+
+  const leftMark = before.at(-1) ?? ''
+  const rightChars = Array.from(after)
+  const rightMark = rightChars[0] ?? ''
+  const leftPunctuated = BOUNDARY_PUNCTUATION.test(leftMark)
+  const rightPunctuated = rightMark !== '' && BOUNDARY_PUNCTUATION.test(rightMark)
+
+  if (!leftPunctuated && !rightPunctuated) return before + MERGE_JOINER + after
+  if (!leftPunctuated || !rightPunctuated) return before + after
+
+  // Both sides already have punctuation. A leading separator on the right
+  // would duplicate the seam when the left already ends a clause or sentence.
+  if (JOIN_SEPARATOR.test(rightMark)) {
+    if (JOIN_SEPARATOR.test(leftMark) && punctuationRank(rightMark) > punctuationRank(leftMark)) {
+      return dropLastCharacter(before) + after
+    }
+    return before + rightChars.slice(1).join('')
+  }
+  return before + after
+}
+
+/**
+ * Fold a run of consecutive short queue items from the head into one TTS
+ * request. Stops at a different reply, a long item, 6 items, or 160 chars.
+ * A non-mergeable head is still returned with count 1 so the pump can consume
+ * it through the same path as a merged run.
+ */
+export function mergeSynthesisRun(items: readonly TtsQueueItem[]): MergedSynthesisRun {
+  const first = items[0]
+  if (!first) return { text: '', count: 0 }
+
+  let text = first.text
+  let count = 1
+  if (characterCount(first.text.trim()) > MERGE_ITEM_MAX_CHARS) {
+    return { text, count }
+  }
+
+  while (count < MERGE_RUN_MAX_ITEMS && count < items.length) {
+    const next = items[count]
+    if (!next || next.replyId !== first.replyId) break
+    if (characterCount(next.text.trim()) > MERGE_ITEM_MAX_CHARS) break
+    const joined = joinSynthesisText(text, next.text)
+    if (characterCount(joined) > MERGE_RUN_MAX_CHARS) break
+    text = joined
+    count += 1
+  }
+  return { text, count }
 }
 
 interface SessionQueue {
@@ -396,6 +494,19 @@ export class TtsQueue {
   }
 
   /**
+   * Remove the exact queue-item objects consumed by a merged synthesis run.
+   * Matching by identity keeps items appended during the await (or re-enqueued
+   * after a cancel) intact.
+   */
+  private dropPendingItems(q: SessionQueue, items: QueuedSentence[]): void {
+    if (items.length === 0) return
+    const consumed = new Set(items)
+    if (q.pending.some((item) => consumed.has(item))) {
+      q.pending = q.pending.filter((item) => !consumed.has(item))
+    }
+  }
+
+  /**
    * Re-run the pump after an exponential backoff.
    *
    * `ensureReady()` rejects whenever the Edge TTS handshake fails (offline,
@@ -441,69 +552,79 @@ export class TtsQueue {
       await this.ensureReady()
       q.failures = 0
       while (q.pending.length > 0) {
+        const run = mergeSynthesisRun(q.pending)
         const item = q.pending.shift()!
-        if (this.isCancelled(q, item)) continue
+        // The head becomes `current` as before. The rest of a merged run stays
+        // in pending until its one request settles, so snapshot/cancel counts
+        // keep their historical meaning while synthesis is in flight.
+        const mergedTail = run.count > 1 ? q.pending.slice(0, run.count - 1) : []
         q.current = item
         let buf: Buffer | undefined
         let lastError: unknown
-        for (let attempt = 1; attempt <= this.synthAttempts; attempt++) {
-          try {
-            // A reset cleared the handshake, so later attempts dial again.
-            if (attempt > 1) await this.ensureReady()
-            const { audioStream } = await this.tts.toStream(withSpeechPause(item.text), this.prosody)
-            const chunks: Buffer[] = []
-            for await (const chunk of audioStream) {
-              if (this.isCancelled(q, item)) break
-              chunks.push(chunk as Buffer)
-            }
-            buf = Buffer.concat(chunks)
-            break
-          } catch (e) {
-            lastError = e
-            const message = e instanceof Error ? e.message : String(e)
-            if (attempt === this.synthAttempts) break
-            // The socket may still look open after a reset. Re-dial instead of
-            // sending every remaining sentence through a dead connection.
-            // eslint-disable-next-line no-console
-            console.warn('[dsh-voice-dialog] synthesis attempt ' + attempt + ' failed (' + message + '), retrying on a fresh socket')
-            this.resetConnection()
-            await sleep(this.retryDelayMs)
-          }
-        }
         try {
           if (this.isCancelled(q, item)) continue
-          if (!buf) throw lastError instanceof Error ? lastError : new Error(String(lastError))
-          // A valid MP3 frame starts with a sync word; drop metadata garbage.
-          if (buf.length === 0 || buf[0] !== MP3_MAGIC) continue
-          // Barge-in happened while this sentence was synthesizing: drop it.
-          if (item.epoch !== q.epoch) continue
-          const frame: VoiceFrame = {
-            sessionId,
-            seq: q.seq++,
-            epoch: item.round,
-            replyId: item.replyId,
-            ...(item.sentenceId === undefined ? {} : { sentenceId: item.sentenceId }),
-            ...(item.chunkIndex === undefined ? {} : { chunkIndex: item.chunkIndex }),
-            text: item.text,
-            audio: buf.toString('base64'),
-          }
-          for (const fn of this.listeners) {
+          for (let attempt = 1; attempt <= this.synthAttempts; attempt++) {
             try {
-              fn(frame)
-            } catch {
-              // listener errors must not kill the pump
+              // A reset cleared the handshake, so later attempts dial again.
+              if (attempt > 1) await this.ensureReady()
+              const { audioStream } = await this.tts.toStream(withSpeechPause(run.text), this.prosody)
+              const chunks: Buffer[] = []
+              for await (const chunk of audioStream) {
+                if (this.isCancelled(q, item)) break
+                chunks.push(chunk as Buffer)
+              }
+              buf = Buffer.concat(chunks)
+              break
+            } catch (e) {
+              lastError = e
+              const message = e instanceof Error ? e.message : String(e)
+              if (attempt === this.synthAttempts) break
+              // The socket may still look open after a reset. Re-dial instead of
+              // sending every remaining sentence through a dead connection.
+              // eslint-disable-next-line no-console
+              console.warn('[dsh-voice-dialog] synthesis attempt ' + attempt + ' failed (' + message + '), retrying on a fresh socket')
+              this.resetConnection()
+              await sleep(this.retryDelayMs)
             }
           }
-        } catch (e) {
-          // One failed sentence must not stop the queue; report it and let the
-          // browser read that sentence with the system voice instead.
-          const message = e instanceof Error ? e.message : String(e)
-          // eslint-disable-next-line no-console
-          console.warn('[dsh-voice-dialog] synthesis failed: ' + message)
-          if (!this.isCancelled(q, item)) {
-            this.emitFailure(sessionId, q, item.text, item.replyId, message, item.round, item)
+          try {
+            if (this.isCancelled(q, item)) continue
+            if (!buf) throw lastError instanceof Error ? lastError : new Error(String(lastError))
+            // A valid MP3 frame starts with a sync word; drop metadata garbage.
+            if (buf.length === 0 || buf[0] !== MP3_MAGIC) continue
+            // Barge-in happened while this sentence was synthesizing: drop it.
+            if (item.epoch !== q.epoch) continue
+            const frame: VoiceFrame = {
+              sessionId,
+              seq: q.seq++,
+              epoch: item.round,
+              replyId: item.replyId,
+              ...(item.sentenceId === undefined ? {} : { sentenceId: item.sentenceId }),
+              ...(item.chunkIndex === undefined ? {} : { chunkIndex: item.chunkIndex }),
+              text: run.text,
+              audio: buf.toString('base64'),
+            }
+            for (const fn of this.listeners) {
+              try {
+                fn(frame)
+              } catch {
+                // listener errors must not kill the pump
+              }
+            }
+          } catch (e) {
+            // One failed sentence must not stop the queue; report it and let the
+            // browser read that sentence with the system voice instead.
+            const message = e instanceof Error ? e.message : String(e)
+            // eslint-disable-next-line no-console
+            console.warn('[dsh-voice-dialog] synthesis failed: ' + message)
+            if (!this.isCancelled(q, item)) {
+              this.emitFailure(sessionId, q, run.text, item.replyId, message, item.round, item)
+            }
           }
         } finally {
+          // enqueue() may have appended work while toStream was awaited. Remove
+          // this run by identity, never by a stale prefix length.
+          this.dropPendingItems(q, mergedTail)
           if (q.current === item) q.current = null
         }
       }

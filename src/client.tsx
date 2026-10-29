@@ -9,6 +9,9 @@ import speechRemote from './speech-remote.js'
 import { MicrophoneLoop, recordVoiceSample, type MicPlaybackSnapshot } from './mic.ts'
 import { ContinuousSeparation, dedupeTranscript, type ContinuousSegment } from './continuous-separation.ts'
 import {
+  createUtteranceCoalescer, UTTERANCE_COALESCE_WINDOW_MS, type UtteranceCoalescer,
+} from './utterance-coalescer.ts'
+import {
   getPreferences, setPreferences, subscribePreferences,
   SPEAKER_THRESHOLD_MAX, SPEAKER_THRESHOLD_MIN, type VoiceDialogPreferences,
 } from './preferences.ts'
@@ -132,6 +135,17 @@ interface SpeakerIdentity {
   owner: boolean
   label: string
   similarity: number
+}
+
+type SpeakerLane = 'owner' | 'guest'
+
+/** Metadata carried while one lane's adjacent short segments are coalesced. */
+interface CoalescedVoiceSegment {
+  scheduler: SpeechScheduler
+  utteranceEnd: number
+  timing: UtteranceTiming
+  fastPath: boolean
+  prefix: string
 }
 
 interface SeparationStatus {
@@ -423,6 +437,43 @@ async function identifySpeaker(
   })
   if (!response.ok) throw await errorFrom(response, '声纹识别失败')
   return await response.json() as SpeakerIdentity
+}
+
+const VOICEPRINT_SAMPLE_RATE = 16_000
+const VOICEPRINT_MIN_VOICE_MS = 700
+
+/** Estimate the non-silent part with cheap 20 ms RMS frames. */
+function estimateActiveVoiceMs(samples: Float32Array): number {
+  if (samples.length === 0) return 0
+  const frameSamples = Math.max(1, Math.round(VOICEPRINT_SAMPLE_RATE * 0.02))
+  const levels: number[] = []
+  let peak = 0
+  for (let start = 0; start < samples.length; start += frameSamples) {
+    const end = Math.min(samples.length, start + frameSamples)
+    let sum = 0
+    for (let index = start; index < end; index++) {
+      const value = samples[index] ?? 0
+      sum += value * value
+    }
+    const level = Math.sqrt(sum / Math.max(1, end - start))
+    levels.push(level)
+    if (level > peak) peak = level
+  }
+  // A relative floor ignores room noise while keeping quiet speech eligible.
+  const floor = Math.max(0.0025, peak * 0.12)
+  let activeSamples = 0
+  for (const level of levels) if (level >= floor) activeSamples += frameSamples
+  return Math.min(samples.length, activeSamples) * 1000 / VOICEPRINT_SAMPLE_RATE
+}
+
+/** Voiceprint needs a stable embedding, so very short lanes use cached history. */
+function hasEnoughVoiceprintAudio(samples: Float32Array): boolean {
+  return samples.length * 1000 / VOICEPRINT_SAMPLE_RATE >= VOICEPRINT_MIN_VOICE_MS
+    && estimateActiveVoiceMs(samples) >= VOICEPRINT_MIN_VOICE_MS
+}
+
+function laneForIdentity(identity: SpeakerIdentity): SpeakerLane {
+  return identity.owner === true ? 'owner' : 'guest'
 }
 
 async function probeSpeakerOverlap(samples: Float32Array): Promise<OverlapProbe> {
@@ -1397,6 +1448,11 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const planLedgerRef = useRef(new PlanLedger())
   const organizerOrderRef = useRef(0)
   const lastLaneTextRef = useRef<Map<string, string>>(new Map())
+  /** One coalescer per capture; continuous and fast-single both append to it. */
+  const utteranceCoalescerRef = useRef<UtteranceCoalescer<CoalescedVoiceSegment> | null>(null)
+  /** Successful identities are remembered per lane only for this capture. */
+  const identityCacheRef = useRef<Map<SpeakerLane, SpeakerIdentity>>(new Map())
+  const lastIdentityLaneRef = useRef<SpeakerLane | null>(null)
   /** Last accepted owner transcript, for the input gate's duplicate rule. */
   const lastOwnerInputRef = useRef('')
   /** Mixed tail kept from the moment speech ended, for a single-speaker ASR. */
@@ -1409,6 +1465,29 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const speechSelectionRef = useRef<{ at: number; value: { providerId: string; language: string } } | null>(null)
   /** Idempotency gate: one continuously separated segment reaches the model once. */
   const deliveredIdsRef = useRef<Set<string>>(new Set())
+  const rememberSpeakerIdentity = (
+    identity: SpeakerIdentity | null | undefined,
+  ): SpeakerIdentity | null => {
+    if (!identity || !identity.label) return identity ?? null
+    identityCacheRef.current.set(laneForIdentity(identity), identity)
+    lastIdentityLaneRef.current = laneForIdentity(identity)
+    return identity
+  }
+  const identifySpeakerForLane = async (
+    samples: Float32Array,
+    laneHint: SpeakerLane,
+    prefs: VoiceDialogPreferences,
+  ): Promise<SpeakerIdentity | null> => {
+    // Below 700 ms of voiced audio an embedding is unstable; reuse the last
+    // successful identity for this lane instead of inventing an owner.
+    if (!hasEnoughVoiceprintAudio(samples)) {
+      return identityCacheRef.current.get(laneHint) ?? null
+    }
+    const identity = await identifySpeaker(
+      samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin,
+    )
+    return rememberSpeakerIdentity(identity)
+  }
   useAutoRead(sessionId)
   useLayoutEffect(() => {
     onActiveChange?.(active)
@@ -1479,16 +1558,20 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const flushSeparator = async (): Promise<void> => {
     const separator = separatorRef.current
     separatorRef.current = null
-    if (!separator) return
     try {
-      await separator.flush()
-      reportSeparationPressure(separator)
-      // Let the voiceprint/ASR chain enqueue the final lanes before dispose().
+      if (separator) {
+        await separator.flush()
+        reportSeparationPressure(separator)
+      }
+      // Let the voiceprint/ASR chain append its final lanes before flushing.
       await classifyRef.current
     } catch (failure) {
       console.warn('[dsh-voice-dialog] continuous flush failed', failure)
     } finally {
-      separator.close()
+      // stop/endSession must submit pending text immediately, including the
+      // fast path that has no ContinuousSeparation instance.
+      utteranceCoalescerRef.current?.flushAll()
+      separator?.close()
     }
   }
 
@@ -1501,6 +1584,10 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     // Continuous separation owns its own source buffers; flush them before
     // closing the scheduler, or the last 1.6 s of speech would be lost.
     await flushSeparator()
+    utteranceCoalescerRef.current?.dispose()
+    utteranceCoalescerRef.current = null
+    identityCacheRef.current = new Map()
+    lastIdentityLaneRef.current = null
     // An explicit later command must not be overridden by a plan still in
     // flight. Pending holds are released by the organizer's finally block.
     organizerRef.current?.cancel()
@@ -1885,9 +1972,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       timing: UtteranceTiming
     }> = []
     result.sources.forEach((source, index) => {
-      const identity = source.identity
+      const identity = rememberSpeakerIdentity(source.identity)
       const canonical = identity?.label || '说话人' + (index + 1)
-      const lane: 'owner' | 'guest' = identity?.enrolled === true && !identity.owner ? 'guest' : 'owner'
+      const lane: SpeakerLane = identity ? laneForIdentity(identity) : 'guest'
       const display = displaySpeaker(sessionId, canonical)
       if (prefs.speakerGate && identity?.owner !== true) {
         setSpeaker('已忽略其他人的声音')
@@ -1972,17 +2059,20 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     void transcription.catch(() => undefined)
     classifyRef.current = classifyRef.current.then(async () => {
       const prefs = getPreferences()
+      const slotLane: SpeakerLane = segment.slot === 0 ? 'owner' : 'guest'
       let identity: SpeakerIdentity | null = null
       try {
-        identity = await identifySpeaker(segment.samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin)
+        identity = await identifySpeakerForLane(segment.samples, slotLane, prefs)
       } catch {
-        // A short or noisy lane can still be transcribed without a voiceprint.
+        // A failed/noisy lane can still be transcribed; reuse its last identity.
+        identity = identityCacheRef.current.get(slotLane) ?? null
       }
+      if (!identity) identity = identityCacheRef.current.get(slotLane) ?? null
       const fallback = '说话人' + (segment.slot + 1)
       const canonical = identity?.label || fallback
-      const lane: 'owner' | 'guest' = identity
-        ? (identity.enrolled && !identity.owner ? 'guest' : 'owner')
-        : (segment.slot === 0 ? 'owner' : 'guest')
+      // No history is never an owner: only an explicit owner match (or slot 0
+      // with a cached owner identity) can take the owner lane.
+      const lane: SpeakerLane = identity ? laneForIdentity(identity) : 'guest'
       const display = displaySpeaker(sessionId, canonical)
       if (prefs.speakerGate && identity?.owner !== true) {
         setSpeaker('已忽略其他人的声音')
@@ -1993,13 +2083,26 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         return
       }
       if (lane === 'guest') setSpeaker(display || '其他人')
+      const prefix = prefs.speakerPrefix && display ? '[声纹：' + display + '] ' : ''
+      const coalescer = utteranceCoalescerRef.current
+      if (coalescer) {
+        coalescer.append({
+          lane,
+          canonical,
+          text: transcription,
+          at: arrivedAt,
+          meta: { scheduler, utteranceEnd, timing, fastPath: false, prefix },
+        })
+        return
+      }
+      // Defensive fallback for an unexpected call outside a capture.
       const key = lane + ':' + canonical
       const work = runLimited(async () => {
         const text = await transcription
         const fresh = dedupeTranscript(lastLaneTextRef.current.get(key) ?? '', text)
         lastLaneTextRef.current.set(key, text)
         if (!fresh) return null
-        return prefs.speakerPrefix && display ? '[声纹：' + display + '] ' + fresh : fresh
+        return prefix + fresh
       })
       enqueueWithOrganizer(lane, canonical, work, scheduler, utteranceEnd, true, timing)
     }).catch((failure: unknown) => {
@@ -2017,19 +2120,35 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     fastPath: boolean,
     prefs: VoiceDialogPreferences,
   ): void => {
-    if (prefs.speakerGate && identity?.owner !== true) {
+    const cachedIdentity = identity
+      ?? identityCacheRef.current.get(lastIdentityLaneRef.current ?? 'guest')
+      ?? null
+    const knownIdentity = rememberSpeakerIdentity(cachedIdentity)
+    if (prefs.speakerGate && knownIdentity?.owner !== true) {
       setSpeaker('已忽略其他人的声音')
       return
     }
-    const lane: 'owner' | 'guest' = identity?.enrolled === true && !identity.owner ? 'guest' : 'owner'
-    const canonical = identity?.label ?? ''
-    const display = canonical ? displaySpeaker(sessionId, canonical) : ''
+    // A missing identity is an unknown guest, never an implicit owner.
+    const lane: SpeakerLane = knownIdentity ? laneForIdentity(knownIdentity) : 'guest'
+    const canonical = knownIdentity?.label || '说话人1'
+    const display = displaySpeaker(sessionId, canonical)
     if (lane === 'guest' && effectiveGuestMode(sessionId, canonical) === 'ignore') {
       setSpeaker('已忽略' + (display || '其他人'))
       return
     }
     if (lane === 'guest') setSpeaker(display || '其他人')
     const prefix = prefs.speakerPrefix && display ? '[声纹：' + display + '] ' : ''
+    const coalescer = utteranceCoalescerRef.current
+    if (coalescer) {
+      coalescer.append({
+        lane,
+        canonical,
+        text: transcription,
+        at: Date.now(),
+        meta: { scheduler, utteranceEnd, timing, fastPath, prefix },
+      })
+      return
+    }
     const work = transcription.then((text) => text ? prefix + text : null)
     void work.catch(() => undefined)
     enqueueWithOrganizer(lane, canonical, work, scheduler, utteranceEnd, true, timing, fastPath)
@@ -2075,8 +2194,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       timing.separationDoneAt = gateDoneAt
       timing.separation = base
       if (verdict?.singleSpeaker === true) {
-        const identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin)
-          .catch(() => null)
+        const laneHint = lastIdentityLaneRef.current ?? 'guest'
+        const identity = await identifySpeakerForLane(samples, laneHint, prefs)
+          .catch(() => identityCacheRef.current.get(laneHint) ?? null)
         enqueueFastSingle(identity, transcription, timing, scheduler, utteranceEnd, true, prefs)
         return
       }
@@ -2107,9 +2227,10 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       }
       // The model found one dominant stream, or failed. The raw transcript is
       // already in flight, so this is a zero-extra-inference safety net.
-      const sourceIdentity = split?.sources?.[0]?.identity ?? null
-      const identity = sourceIdentity ?? await identifySpeaker(samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin)
-        .catch(() => null)
+      const sourceIdentity = rememberSpeakerIdentity(split?.sources?.[0]?.identity ?? null)
+      const laneHint = lastIdentityLaneRef.current ?? 'guest'
+      const identity = sourceIdentity ?? await identifySpeakerForLane(samples, laneHint, prefs)
+        .catch(() => identityCacheRef.current.get(laneHint) ?? null)
       enqueueFastSingle(identity, transcription, timing, scheduler, utteranceEnd, false, prefs)
     }).catch((failure: unknown) => {
       console.warn('[dsh-voice-dialog] fast speaker gate failed', failure)
@@ -2142,7 +2263,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           enqueueSeparated(split, scheduler, runLimited)
           return
         }
-        identity = split.sources[0]?.identity ?? null
+        identity = rememberSpeakerIdentity(split.sources[0]?.identity ?? null)
         if (identity) {
           setSpeaker(displaySpeaker(sessionId, identity.label))
           reportSpeech(sessionId, 'speaker', displaySpeaker(sessionId, identity.label))
@@ -2160,9 +2281,12 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     if (!identity && (prefs.speakerPrefix || prefs.speakerGate || prefs.guestMode !== 'steer'
       || speakerPolicy.hasCustomization(sessionId))) {
       try {
-        identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin)
-        setSpeaker(displaySpeaker(sessionId, identity.label))
-        reportSpeech(sessionId, 'speaker', displaySpeaker(sessionId, identity.label))
+        const laneHint = lastIdentityLaneRef.current ?? 'guest'
+        identity = await identifySpeakerForLane(samples, laneHint, prefs)
+        if (identity) {
+          setSpeaker(displaySpeaker(sessionId, identity.label))
+          reportSpeech(sessionId, 'speaker', displaySpeaker(sessionId, identity.label))
+        }
       } catch (failure) {
         // A missing model must not break normal dictation; the gate is
         // stricter because it is an explicit "only me" promise.
@@ -2180,11 +2304,10 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       return
     }
 
-    // Without an enrolled voiceprint there is no priority signal. Keep the
-    // previous behaviour: treat dictation as the owner instead of queueing it.
-    const lane = identity?.enrolled === true && !identity.owner ? 'guest' : 'owner'
-    const canonical = identity?.label ?? ''
-    const display = canonical ? displaySpeaker(sessionId, canonical) : ''
+    // An unknown/too-short lane is an unknown guest, not an implicit owner.
+    const lane: SpeakerLane = identity ? laneForIdentity(identity) : 'guest'
+    const canonical = identity?.label || '说话人1'
+    const display = displaySpeaker(sessionId, canonical)
     if (lane === 'guest' && effectiveGuestMode(sessionId, canonical) === 'ignore') {
       setSpeaker('已忽略其他人的声音')
       return
@@ -2323,6 +2446,28 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       classifyRef.current = Promise.resolve()
       lastLaneTextRef.current = new Map()
       lastOwnerInputRef.current = ''
+      utteranceCoalescerRef.current?.dispose()
+      utteranceCoalescerRef.current = createUtteranceCoalescer<CoalescedVoiceSegment>({
+        windowMs: UTTERANCE_COALESCE_WINDOW_MS,
+        dedupeTranscript,
+        submit: (batch) => {
+          const first = batch.entries[0]
+          if (!first) return
+          const work = batch.text.then((text) => text ? first.meta.prefix + text : null)
+          enqueueWithOrganizer(
+            batch.lane,
+            batch.canonical,
+            work,
+            first.meta.scheduler,
+            first.meta.utteranceEnd,
+            true,
+            first.meta.timing,
+            first.meta.fastPath,
+          )
+        },
+      })
+      identityCacheRef.current = new Map()
+      lastIdentityLaneRef.current = null
       setPending(0)
       setQueued(0)
       const runLimited = createLimit(prefs.parallelAsr ? 3 : 1)
@@ -2447,6 +2592,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       clearTimeout(startGuard)
       separatorRef.current?.close()
       separatorRef.current = null
+      utteranceCoalescerRef.current?.dispose()
+      utteranceCoalescerRef.current = null
       schedulerRef.current?.dispose()
       schedulerRef.current = null
       setError(failureText(failure))
@@ -2470,19 +2617,21 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
 
   if (active) return <>
     <style>{MIC_CSS}</style>
-    <div className="dsh-vd-captureRow" data-voice-activity={activeActivity ? 'transcribing' : 'recording'}>
-      <Button type="button" className="dsh-vd-round" size="sm" aria-label="关闭语音对话"
-        title="关闭收音，当前朗读不打断"
-        onClick={() => { void stop() }}><IconCloseOutlineRegular size={14} /></Button>
-      {activeActivity || error
-        ? <span className="dsh-vd-activity" role="status">{error || activeActivity}</span>
-        : <LiveWave level={level} />}
-      <Button type="button" className="dsh-vd-round" size="sm" aria-label="挂断并停止朗读"
-        title="挂断，同时打断当前朗读"
-        onClick={() => {
-          sharedPlayer.control({ action: 'stop' })
-          void stop()
-        }}><IconStopFillRegular size={14} /></Button>
+    <div className="dsh-vd-captureStack">
+      <div className="dsh-vd-captureRow" data-voice-activity={activeActivity ? 'transcribing' : 'recording'}>
+        <Button type="button" className="dsh-vd-round" size="sm" aria-label="关闭语音对话"
+          title="关闭收音，当前朗读不打断"
+          onClick={() => { void stop() }}><IconCloseOutlineRegular size={14} /></Button>
+        {activeActivity || error
+          ? <span className="dsh-vd-activity" role="status">{error || activeActivity}</span>
+          : <LiveWave level={level} />}
+        <Button type="button" className="dsh-vd-round" size="sm" aria-label="挂断并停止朗读"
+          title="挂断，同时打断当前朗读"
+          onClick={() => {
+            sharedPlayer.control({ action: 'stop' })
+            void stop()
+          }}><IconStopFillRegular size={14} /></Button>
+      </div>
     </div>
   </>
 
@@ -2513,6 +2662,7 @@ const MIC_CSS = `
 .dsh-vd-anchor { position: relative; display: inline-flex; flex: none; }
 .dsh-vd-row { display: inline-flex; align-items: center; gap: 6px; }
 .dsh-vd-mic { width: 28px; padding: 0; flex: none; }
+.dsh-vd-captureStack { display: flex; flex-direction: column; gap: 4px; width: 100%; min-width: 0; }
 .dsh-vd-captureRow { display: flex; align-items: center; gap: 12px; width: 100%; min-width: 0; min-height: 34px; }
 .dsh-vd-round { width: 32px; height: 32px; padding: 0; border-radius: 50%; flex: none;
   background: var(--dsw-specific-selector); }

@@ -165,7 +165,9 @@ const SAME_SPEAKER_SIMILARITY = 0.62
     persistVoiceSettings()
     return rate
   }
-  const unsubscribe = queue.subscribe((frame) => { broadcast('audio', frame) })
+  const unsubscribe = queue.subscribe((frame) => {
+    broadcast('audio', frame)
+  })
   ctx.effect(() => unsubscribe)
   ctx.effect(() => async () => { await queue.close() })
   ctx.effect(() => () => { void separation.close() })
