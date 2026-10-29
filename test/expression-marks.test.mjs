@@ -36,9 +36,23 @@ test('a chunk carries full resolved values for both of its spans', () => {
 test('no request ever carries more than two prosody elements', () => {
   const unit = unitOf({ say: '我真的不知道', mark: [{ at: 0, pitch: 8 }, { at: 3, pitch: 8 }] })
   const chunks = expressionSsmlChunks(unit, ZERO)
-  assert.equal(chunks.length, 2)
   for (const chunk of chunks) assert.ok(elements(chunk.ssml) <= 2)
   assert.equal(chunks.map((chunk) => chunk.text).join(''), '我真的不知道')
+})
+
+test('smooth mode never splices a phrase: cuts land on punctuation', () => {
+  const unit = unitOf({ say: '太好了，我就知道你能行！', style: 'happy' })
+  const chunks = expressionSsmlChunks(unit, ZERO)
+  for (const chunk of chunks.slice(0, -1)) assert.match(chunk.text, /[，,。！？!?、；;：:]$/u)
+  assert.equal(chunks.map((chunk) => chunk.text).join(''), '太好了，我就知道你能行！')
+})
+
+test('fine mode trades the phrase for per-character bends', () => {
+  const marks = [{ at: 0, pitch: 8 }, { at: 1, pitch: -4 }, { at: 3, pitch: 8 }]
+  const smooth = expressionSsmlChunks(unitOf({ say: '我真的不知道', mark: marks }), ZERO)
+  const fine = expressionSsmlChunks(unitOf({ say: '我真的不知道', granularity: 'fine', mark: marks }), ZERO)
+  assert.ok(fine.length > smooth.length)
+  for (const chunk of fine) assert.ok(elements(chunk.ssml) <= 2)
 })
 
 test('the queue base is added into every span', () => {

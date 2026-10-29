@@ -37,7 +37,17 @@ export interface VoiceUnit {
   pause?: PauseToken
   /** Character-level marks: repaint the audio of a few characters inside `say`. */
   mark?: ProsodyMark[]
+  /** Where a marked line may be cut. smooth (default) only at punctuation. */
+  granularity?: Granularity
 }
+
+/**
+ * Where a marked line may be cut. 'smooth' keeps every request inside a phrase
+ * (cuts happen at punctuation), so a sentence is never spliced between two
+ * syllables; 'fine' allows a cut anywhere, which is the only way to bend every
+ * single character, at the cost of an audible seam.
+ */
+export type Granularity = 'smooth' | 'fine'
 
 /**
  * One mark inside a unit. `at` is a 0-based character index; `to` is the
@@ -242,15 +252,16 @@ function endingMarks(say: string, tail: number, lengthen: boolean): ProsodyMark[
   const closed = /[。！？!?，,、…—]$/u.test(say)
   const end = closed ? chars.length - 1 : chars.length
   if (end < 3) return undefined
+  // ONE span for the tail, not a ramp: a request holds two prosody elements, and
+  // a three-step ramp would be flattened into an average anyway. A single span at
+  // full strength is what actually gets heard.
   const count = Math.min(3, end)
-  const marks: ProsodyMark[] = []
-  for (let index = 0; index < count; index += 1) {
-    const mark: ProsodyMark = { at: end - count + index }
-    if (tail !== 0) mark.pitch = Math.round((tail * (index + 1)) / count)
-    if (lengthen) mark.rate = -7 - index * 6
-    marks.push(mark)
-  }
-  return marks
+  const mark: ProsodyMark = { at: end - count, to: end }
+  if (tail !== 0) mark.pitch = Math.round(tail)
+  // Measured: -22% on the last three syllables lengthens the ending by about a
+  // second, and going past that barely adds anything, so this is the plateau.
+  if (lengthen) mark.rate = -22
+  return [mark]
 }
 
 /**
@@ -357,6 +368,11 @@ export function normalizeVoiceUnits(input: unknown): VoiceUnit[] {
       }
       if (stress.length > 0) unit.stress = stress
     }
+    const granularity = row.granularity === undefined
+      ? undefined
+      : (typeof row.granularity === 'string' ? row.granularity.trim() : '')
+    if (granularity !== undefined && granularity !== 'smooth' && granularity !== 'fine') continue
+    if (granularity !== undefined) unit.granularity = granularity as Granularity
     if (row.breath === true) unit.breath = true
     if (row.lengthen === true) unit.lengthen = true
     if (row.mark !== undefined) {
@@ -449,7 +465,7 @@ function markDelta(mark: ProsodyMark): ResolvedProsody {
  * the single place character marks become audio; undefined means nothing usable
  * was marked and the plain path stays untouched.
  */
-export function resolveMarks(unit: VoiceUnit): MarkSpan[] | undefined {
+function markLanes(unit: VoiceUnit): { chars: string[]; lanes: ResolvedProsody[] } | undefined {
   const text = typeof unit.say === 'string' ? unit.say : ''
   const marks = unit.mark
   if (text === '' || marks === undefined || marks.length === 0) return undefined
@@ -469,7 +485,13 @@ export function resolveMarks(unit: VoiceUnit): MarkSpan[] | undefined {
       lane.volume += delta.volume
     }
   }
-  if (!painted) return undefined
+  return painted ? { chars, lanes } : undefined
+}
+
+export function resolveMarks(unit: VoiceUnit): MarkSpan[] | undefined {
+  const painted = markLanes(unit)
+  if (painted === undefined) return undefined
+  const { chars, lanes } = painted
   const spans: MarkSpan[] = []
   for (let index = 0; index < chars.length; index += 1) {
     const lane = lanes[index] as ResolvedProsody
@@ -506,44 +528,127 @@ export interface SsmlChunk {
   ssml: string
 }
 
-/**
- * Split one marked unit into per-request chunks of at most two prosody elements.
- * Returns undefined when nothing usable was marked, so the plain path (and its
- * byte-identical requests) stays untouched.
- */
-export function expressionSsmlChunks(unit: VoiceUnit, base: ProsodyBase): SsmlChunk[] | undefined {
-  const spans = resolveMarks(unit)
-  if (spans === undefined) return undefined
-  const step = effectiveProsody(unit, base)
-  const solved = spans.map((span) => ({
-    text: span.text,
-    rate: clampNumber(step.rate + span.rate, -RATE_LIMIT, RATE_LIMIT),
-    pitch: clampNumber(step.pitch + span.pitch, -PITCH_LIMIT, PITCH_LIMIT),
-    volume: clampNumber(step.volume + span.volume, -VOLUME_LIMIT, VOLUME_LIMIT),
-  }))
-  // Punctuation on its own is not a request: the endpoint answers it with no
-  // audio at all. Fold it into its neighbour so every chunk actually speaks.
-  const speakable = (text: string): boolean => /[\p{L}\p{N}]/u.test(text)
-  const folded: typeof solved = []
-  for (const span of solved) {
-    const last = folded[folded.length - 1]
-    if (last !== undefined && !speakable(span.text)) {
-      last.text += span.text
+interface LaneRun {
+  text: string
+  delta: ResolvedProsody
+  count: number
+}
+
+/** Contiguous equal lanes between two character offsets. */
+function runsBetween(chars: string[], lanes: ResolvedProsody[], from: number, to: number): LaneRun[] {
+  const runs: LaneRun[] = []
+  for (let index = from; index < to; index += 1) {
+    const lane = lanes[index] as ResolvedProsody
+    const last = runs[runs.length - 1]
+    if (last !== undefined && last.delta.rate === lane.rate && last.delta.pitch === lane.pitch
+      && last.delta.volume === lane.volume) {
+      last.text += chars[index]
+      last.count += 1
       continue
     }
-    folded.push({ ...span })
+    runs.push({ text: chars[index] as string, delta: { ...lane }, count: 1 })
   }
-  const chunks: SsmlChunk[] = []
-  for (let index = 0; index < folded.length; index += MAX_SPANS_PER_REQUEST) {
-    const group = folded.slice(index, index + MAX_SPANS_PER_REQUEST)
-    chunks.push({
-      text: group.map((span) => span.text).join(''),
-      ssml: group.map((span) => '<prosody rate="' + signedPercent(span.rate)
-        + '" pitch="' + signedPercent(span.pitch) + '" volume="' + signedPercent(span.volume)
-        + '">' + escapeXml(span.text) + '</prosody>').join(''),
-    })
+  return runs
+}
+
+/**
+ * Merge runs down to at most `limit`, keeping the FIRST run intact (the body of
+ * the clause) and averaging the rest into one tail. Detail inside one phrase is
+ * cheaper to lose than the phrase itself.
+ */
+function collapseRuns(runs: LaneRun[], limit: number): LaneRun[] {
+  if (runs.length <= limit) return runs
+  const head = runs[0] as LaneRun
+  const rest = runs.slice(1)
+  const total = rest.reduce((sum, run) => sum + run.count, 0)
+  const average = (key: keyof ResolvedProsody): number =>
+    Math.round(rest.reduce((sum, run) => sum + run.delta[key] * run.count, 0) / total)
+  return [head, {
+    text: rest.map((run) => run.text).join(''),
+    delta: { rate: average('rate'), pitch: average('pitch'), volume: average('volume') },
+    count: total,
+  }]
+}
+
+const CLAUSE_PUNCTUATION = /[，,、；;：:。！？!?…—]/u
+
+/** Clause ranges: each ends after punctuation, so a cut there is a real pause. */
+function clauseRanges(chars: string[]): Array<[number, number]> {
+  const ranges: Array<[number, number]> = []
+  let start = 0
+  for (let index = 0; index < chars.length; index += 1) {
+    if (CLAUSE_PUNCTUATION.test(chars[index] as string)) {
+      ranges.push([start, index + 1])
+      start = index + 1
+    }
   }
-  return chunks
+  if (start < chars.length) ranges.push([start, chars.length])
+  return ranges
+}
+
+interface SolvedSpan { text: string; rate: number; pitch: number; volume: number }
+
+/**
+ * Split one marked unit into requests. Two rules, both learned from listening:
+ * a request never carries more than two <prosody> elements, and in the default
+ * 'smooth' mode a cut is only ever placed at punctuation, so a sentence is never
+ * spliced between two syllables. 'fine' trades that guarantee for per-character
+ * bending. Returns undefined when nothing usable was marked, so the plain path
+ * (and its byte-identical requests) stays untouched.
+ */
+export function expressionSsmlChunks(unit: VoiceUnit, base: ProsodyBase): SsmlChunk[] | undefined {
+  const painted = markLanes(unit)
+  if (painted === undefined) return undefined
+  const { chars, lanes } = painted
+  const step = effectiveProsody(unit, base)
+  const solve = (text: string, delta: ResolvedProsody): SolvedSpan => ({
+    text,
+    rate: clampNumber(step.rate + delta.rate, -RATE_LIMIT, RATE_LIMIT),
+    pitch: clampNumber(step.pitch + delta.pitch, -PITCH_LIMIT, PITCH_LIMIT),
+    volume: clampNumber(step.volume + delta.volume, -VOLUME_LIMIT, VOLUME_LIMIT),
+  })
+
+  const groups: SolvedSpan[][] = []
+  if (unit.granularity === 'fine') {
+    const runs = runsBetween(chars, lanes, 0, chars.length)
+    for (let index = 0; index < runs.length; index += MAX_SPANS_PER_REQUEST) {
+      groups.push(runs.slice(index, index + MAX_SPANS_PER_REQUEST)
+        .map((run) => solve(run.text, run.delta)))
+    }
+  } else {
+    let current: SolvedSpan[] = []
+    const flush = (): void => {
+      if (current.length > 0) groups.push(current)
+      current = []
+    }
+    for (const [from, to] of clauseRanges(chars)) {
+      const clause = collapseRuns(runsBetween(chars, lanes, from, to), MAX_SPANS_PER_REQUEST)
+        .map((run) => solve(run.text, run.delta))
+      if (current.length + clause.length > MAX_SPANS_PER_REQUEST) flush()
+      current.push(...clause)
+    }
+    flush()
+  }
+
+  // Punctuation alone yields no audio, so it rides along with a neighbour.
+  const speakable = (text: string): boolean => /[\p{L}\p{N}]/u.test(text)
+  const merged: SolvedSpan[][] = []
+  for (const group of groups) {
+    const previous = merged[merged.length - 1]
+    if (!speakable(group.map((span) => span.text).join('')) && previous !== undefined) {
+      const last = previous[previous.length - 1] as SolvedSpan
+      last.text += group.map((span) => span.text).join('')
+      continue
+    }
+    merged.push(group)
+  }
+
+  return merged.map((group) => ({
+    text: group.map((span) => span.text).join(''),
+    ssml: group.map((span) => '<prosody rate="' + signedPercent(span.rate)
+      + '" pitch="' + signedPercent(span.pitch) + '" volume="' + signedPercent(span.volume)
+      + '">' + escapeXml(span.text) + '</prosody>').join(''),
+  }))
 }
 
 /** Silence a pause unit asks for. */

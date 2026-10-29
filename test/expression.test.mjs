@@ -115,9 +115,9 @@ test('a lengthen slows the tail instead of adding a pause', () => {
   assert.equal(applyExpression(unit), '好的我是说。')
   const [normalized] = normalizeVoiceUnits([unit])
   const marks = normalized.mark ?? []
-  assert.equal(marks.length, 3)
-  assert.ok(marks.every((mark) => (mark.rate ?? 0) < 0))
-  assert.ok((marks[2].rate ?? 0) < (marks[0].rate ?? 0))
+  assert.equal(marks.length, 1)
+  assert.ok((marks[0].rate ?? 0) <= -12)
+  assert.equal(marks[0].to, 5)
 })
 
 test('text constructs stay idempotent', () => {

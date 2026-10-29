@@ -33,14 +33,14 @@ const samples = [
     { say: '也许可以吧。', style: 'hesitant' },
   ] },
   { name: '笑意', units: [{ say: '你这也太逗了，我笑个不停。', style: 'amused' }] },
-  { name: '逐字上扬', units: [{ say: '一二三四五六。', mark: [
+  { name: '逐字上扬', units: [{ say: '一二三四五六。', granularity: 'fine', mark: [
     { at: 0, pitch: -14 }, { at: 1, pitch: -8 }, { at: 2, pitch: -3 },
     { at: 3, pitch: 4 }, { at: 4, pitch: 11 }, { at: 5, pitch: 18 }] }] },
-  { name: '逐字下落', units: [{ say: '十、九、八、七。', mark: [
+  { name: '逐字下落', units: [{ say: '十、九、八、七。', granularity: 'fine', mark: [
     { at: 0, pitch: 18 }, { at: 2, pitch: 9 }, { at: 4, pitch: 0 }, { at: 6, pitch: -12 }] }] },
-  { name: '句内先快后慢', units: [{ say: '前面我走得很快，后面就慢下来了。', mark: [
+  { name: '句内先快后慢', units: [{ say: '前面我走得很快，后面就慢下来了。', granularity: 'fine', mark: [
     { at: 0, to: 8, rate: 22 }, { at: 8, to: 14, rate: -18 }] }] },
-  { name: '句内先慢后快', units: [{ say: '前面我走得很慢，后面就快起来了。', mark: [
+  { name: '句内先慢后快', units: [{ say: '前面我走得很慢，后面就快起来了。', granularity: 'fine', mark: [
     { at: 0, to: 8, rate: -18 }, { at: 8, to: 14, rate: 22 }] }] },
   { name: '拖长句尾', units: [{ say: '那我先走了，回头见。', lengthen: true, style: 'tender' }] },
   { name: '同样句子加停顿', units: [{ say: '那我先走了，回头见。', style: 'tender' }, { pause: 'long' }] },

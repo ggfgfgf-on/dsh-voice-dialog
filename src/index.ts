@@ -365,6 +365,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
               },
               pace: { type: 'string', enum: [...EXPRESS_TOKENS.pace], description: 'Local pace intent for this step.' },
               stress: { type: 'array', items: { type: 'string' }, maxItems: 4, description: 'Words inside say to lean on; each becomes a short emphasised fragment.' },
+              granularity: { type: 'string', enum: ['smooth', 'fine'], description: 'Where a marked line may be cut. smooth (default) cuts only at punctuation, so a phrase is never spliced; fine allows a cut anywhere to bend every single character, and that seam is audible.' },
               breath: { type: 'boolean', description: 'Breathy delivery: a soft seam and a trailing pause.' },
               lengthen: { type: 'boolean', description: 'Draw the tail out instead of closing it hard.' },
               mark: {
@@ -432,6 +433,10 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             adjustments: ADJUSTMENTS,
             constructs: CONSTRUCTS,
             mark: MARK_LIMITS,
+            granularity: {
+              smooth: '默认：只在标点处断句，一句话不会被从中间劈开。',
+              fine: '允许在任意两个字之间断开，能逐字改音高，代价是接缝听起来像被切开。',
+            },
             styles: STYLE_TOKENS.map((value) => ({ value, meaning: STYLES[value].meaning })),
           },
           base: queue.prosodyBase(),
