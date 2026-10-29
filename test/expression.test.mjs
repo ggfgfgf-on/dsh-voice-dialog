@@ -30,8 +30,13 @@ test('capabilities publish all three layers from the same constants', () => {
 })
 
 test('intent tokens map to the documented acoustics', () => {
-  assert.deepEqual(effectiveProsody({ say: 'x', tone: 'soft' }, ZERO), { rate: 0, pitch: -6, volume: -12 })
-  assert.deepEqual(effectiveProsody({ say: 'x', tone: 'urgent' }, ZERO), { rate: 12, pitch: 4, volume: 0 })
+  const tone = (name) => ({
+    rate: TONE_DELTAS[name].rate ?? 0,
+    pitch: TONE_DELTAS[name].pitch ?? 0,
+    volume: TONE_DELTAS[name].volume ?? 0,
+  })
+  assert.deepEqual(effectiveProsody({ say: 'x', tone: 'soft' }, ZERO), tone('soft'))
+  assert.deepEqual(effectiveProsody({ say: 'x', tone: 'urgent' }, ZERO), tone('urgent'))
   assert.deepEqual(effectiveProsody({ say: 'x', pace: 'slower' }, ZERO), { rate: -10, pitch: 0, volume: 0 })
   assert.deepEqual(effectiveProsody({ say: 'x' }, ZERO), ZERO)
 })
@@ -43,9 +48,9 @@ test('numbers are adjustments on top of a non-default base', () => {
 
 test('numbers then tokens, clamped once at the end', () => {
   const base = { rate: 10, pitch: 0, volume: 0 }
-  // 10 base + 20 step + 12 urgent = 42
-  assert.equal(effectiveProsody({ say: 'x', rate: 20, tone: 'urgent' }, base).rate, 42)
-  // 45 base + 40 step + 12 urgent = 97 -> clamped to 50
+  // 10 base + 20 step + 14 urgent = 44
+  assert.equal(effectiveProsody({ say: 'x', rate: 20, tone: 'urgent' }, base).rate, 44)
+  // 45 base + 40 step + 14 urgent = 99 -> clamped to 50
   assert.equal(effectiveProsody({ say: 'x', rate: 40, tone: 'urgent' }, { rate: 45, pitch: 0, volume: 0 }).rate, 50)
   assert.equal(effectiveProsody({ say: 'x', volume: 90 }, { rate: 0, pitch: 0, volume: 90 }).volume, 100)
 })

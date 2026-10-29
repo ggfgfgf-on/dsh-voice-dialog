@@ -64,12 +64,15 @@ export interface ResolvedProsody { rate: number; pitch: number; volume: number }
 
 /** Plugin-owned acoustics. Tunable data, never model input. */
 export const TONE_DELTAS: Record<Tone, { rate?: number; pitch?: number; volume?: number }> = {
+  // Pitch stays inside a few percent on purpose: past that the voice stops
+  // sounding like the same person. Character comes from rate, volume and the
+  // ending contour instead.
   neutral: {},
-  warm: { pitch: 4, volume: 2 },
-  soft: { pitch: -6, volume: -12 },
-  firm: { rate: -4, volume: 10 },
-  urgent: { rate: 12, pitch: 4 },
-  bright: { pitch: 8, rate: 4 },
+  warm: { rate: -2, pitch: 3 },
+  soft: { rate: -3, pitch: -3, volume: -8 },
+  firm: { rate: -4, volume: 9 },
+  urgent: { rate: 14, pitch: 2, volume: 4 },
+  bright: { rate: 5, pitch: 6 },
 }
 
 export const PACE_DELTAS: Record<Pace, { rate?: number }> = {
@@ -77,6 +80,51 @@ export const PACE_DELTAS: Record<Pace, { rate?: number }> = {
   slower: { rate: -10 },
   faster: { rate: 10 },
 }
+
+/**
+ * A named delivery, published to the model so it never has to guess numbers.
+ * A style is a SEQUENCE: tokens plus an ending contour, resolved under whatever
+ * the step itself declares.
+ */
+export interface StylePreset {
+  tone?: Tone
+  pace?: Pace
+  rate?: number
+  pitch?: number
+  volume?: number
+  breath?: boolean
+  lengthen?: boolean
+  /** Ending contour: positive rises, negative falls, painted on the last characters. */
+  tail?: number
+  meaning: string
+}
+
+export type StyleToken =
+  | 'tender' | 'coy' | 'happy' | 'surprised' | 'hurt' | 'shy' | 'serious' | 'stern'
+  | 'hurried' | 'sleepy' | 'playful' | 'comforting' | 'disappointed' | 'whisper'
+  | 'hesitant' | 'amused'
+
+export const STYLES: Record<StyleToken, StylePreset> = {
+  tender: { tone: 'warm', pace: 'slower', pitch: 1, meaning: '温柔：慢一点、音高略抬，像在近处说话。' },
+  coy: { pace: 'slower', pitch: 4, tail: 8, meaning: '撒娇：拖慢、偏高，句尾往上带。' },
+  happy: { tone: 'bright', pace: 'faster', tail: 4, meaning: '开心：轻快明亮，句尾上扬。' },
+  surprised: { pitch: 3, rate: 3, tail: 10, meaning: '惊讶：起音偏高，句尾明显上扬。' },
+  hurt: { tone: 'soft', pace: 'slower', volume: -3, tail: -6, meaning: '委屈：放轻放慢，句尾往下沉。' },
+  shy: { tone: 'soft', pace: 'slower', volume: -5, breath: true, meaning: '害羞：气声多、音量小，中间有一下换气。' },
+  serious: { tone: 'firm', meaning: '认真：结实清楚，不加装饰。' },
+  stern: { tone: 'firm', rate: -4, pitch: -1, meaning: '严肃：更低更慢，压着说。' },
+  hurried: { tone: 'urgent', pace: 'faster', meaning: '急促：明显加快，句子短促。' },
+  sleepy: { pace: 'slower', rate: -12, pitch: -2, volume: -6, lengthen: true, meaning: '困倦：拖慢放软，句尾散掉，音高几乎不动。' },
+  playful: { tone: 'bright', pace: 'faster', tail: 6, meaning: '俏皮：快而跳，句尾上挑。' },
+  comforting: { tone: 'warm', pace: 'slower', rate: -3, volume: -4, meaning: '安慰：放慢压低一点，句尾收软。' },
+  disappointed: { tone: 'soft', pace: 'slower', lengthen: true, tail: -8, meaning: '失望：慢、软，句尾落下去。' },
+  whisper: { tone: 'soft', volume: -12, breath: true, meaning: '低语：音量明显收小，带一下换气。' },
+  hesitant: { pace: 'slower', volume: -3, tail: -3, meaning: '犹豫：慢，句尾没底气。' },
+  amused: { tone: 'bright', rate: 3, breath: true, meaning: '笑意：明亮，带一点笑的换气。' },
+}
+
+/** Published style names, derived from the same table the resolver reads. */
+export const STYLE_TOKENS = Object.keys(STYLES) as StyleToken[]
 
 /** Bounds and meaning of the optional per-step numeric adjustments. */
 export const STEP_LIMITS = {
@@ -184,6 +232,40 @@ const toNumber = (value: unknown, min: number, max: number): number | undefined 
   return clampNumber(Math.round(number), min, max)
 }
 
+/** Ending contour for a style: a short ramp over the last characters. */
+function tailMarks(say: string, tail: number): ProsodyMark[] | undefined {
+  const chars = Array.from(say)
+  const closed = /[。！？!?，,、…—]$/u.test(say)
+  const end = closed ? chars.length - 1 : chars.length
+  if (end < 4) return undefined
+  const count = Math.min(3, end)
+  const marks: ProsodyMark[] = []
+  for (let index = 0; index < count; index += 1) {
+    marks.push({ at: end - count + index, pitch: Math.round((tail * (index + 1)) / count) })
+  }
+  return marks
+}
+
+/**
+ * Layer a published style UNDER the step's own fields: whatever the step says
+ * wins, the style fills the rest. An explicit mark sequence owns the contour, so
+ * the preset only paints one when the step left it empty.
+ */
+function applyStylePreset(unit: VoiceUnit, style: StyleToken): void {
+  const preset = STYLES[style]
+  if (preset.tone !== undefined && unit.tone === undefined) unit.tone = preset.tone
+  if (preset.pace !== undefined && unit.pace === undefined) unit.pace = preset.pace
+  if (preset.rate !== undefined && unit.rate === undefined) unit.rate = preset.rate
+  if (preset.pitch !== undefined && unit.pitch === undefined) unit.pitch = preset.pitch
+  if (preset.volume !== undefined && unit.volume === undefined) unit.volume = preset.volume
+  if (preset.breath === true && unit.breath === undefined) unit.breath = true
+  if (preset.lengthen === true && unit.lengthen === undefined) unit.lengthen = true
+  if (preset.tail !== undefined && unit.mark === undefined) {
+    const mark = tailMarks(unit.say ?? '', preset.tail)
+    if (mark !== undefined) unit.mark = mark
+  }
+}
+
 /** Read a model-declared mark sequence; unusable marks are dropped, not repaired. */
 function normalizeMarks(input: unknown): ProsodyMark[] | undefined {
   if (!Array.isArray(input)) return undefined
@@ -240,6 +322,9 @@ export function normalizeVoiceUnits(input: unknown): VoiceUnit[] {
       : (typeof row.text === 'string' ? row.text.replace(/\s+/gu, ' ').trim() : '')
     if (collapsed === '') continue
 
+    const style = row.style === undefined ? undefined : (typeof row.style === 'string' ? row.style.trim() : '')
+    if (style !== undefined && !(style in STYLES)) continue
+
     const tone = row.tone === undefined ? undefined : (typeof row.tone === 'string' ? row.tone.trim() : '')
     if (tone !== undefined && !TONES.has(tone)) continue
     const pace = row.pace === undefined ? undefined : (typeof row.pace === 'string' ? row.pace.trim() : '')
@@ -271,6 +356,7 @@ export function normalizeVoiceUnits(input: unknown): VoiceUnit[] {
       const mark = normalizeMarks(row.mark)
       if (mark !== undefined) unit.mark = mark
     }
+    if (style !== undefined) applyStylePreset(unit, style as StyleToken)
     units.push(unit)
   }
   return units
@@ -423,9 +509,21 @@ export function expressionSsmlChunks(unit: VoiceUnit, base: ProsodyBase): SsmlCh
     pitch: clampNumber(step.pitch + span.pitch, -PITCH_LIMIT, PITCH_LIMIT),
     volume: clampNumber(step.volume + span.volume, -VOLUME_LIMIT, VOLUME_LIMIT),
   }))
+  // Punctuation on its own is not a request: the endpoint answers it with no
+  // audio at all. Fold it into its neighbour so every chunk actually speaks.
+  const speakable = (text: string): boolean => /[\p{L}\p{N}]/u.test(text)
+  const folded: typeof solved = []
+  for (const span of solved) {
+    const last = folded[folded.length - 1]
+    if (last !== undefined && !speakable(span.text)) {
+      last.text += span.text
+      continue
+    }
+    folded.push({ ...span })
+  }
   const chunks: SsmlChunk[] = []
-  for (let index = 0; index < solved.length; index += MAX_SPANS_PER_REQUEST) {
-    const group = solved.slice(index, index + MAX_SPANS_PER_REQUEST)
+  for (let index = 0; index < folded.length; index += MAX_SPANS_PER_REQUEST) {
+    const group = folded.slice(index, index + MAX_SPANS_PER_REQUEST)
     chunks.push({
       text: group.map((span) => span.text).join(''),
       ssml: group.map((span) => '<prosody rate="' + signedPercent(span.rate)
@@ -491,6 +589,33 @@ const breathe = (text: string): string => {
   }
   if (!/[。！？!?…—]$/u.test(next)) next += BREATH_TAIL
   return next
+}
+
+/** Silence left where `breath` puts its soft seam, in ms. */
+export const BREATH_GAP_MS = 200
+
+/**
+ * Split a line at the breath seam so the gap is AUDIBLE: the text already got a
+ * comma from `breathe`, this returns the two halves around it. A breath the
+ * engine cannot voice is at least a real pause in the right place.
+ */
+export function breathSeam(text: string): [string, string] | undefined {
+  const chars = Array.from(text)
+  if (chars.length < 6) return undefined
+  const cut = Math.floor((chars.length * 2) / 3)
+  // Nearest seam to the two-thirds point, on either side: a short sentence often
+  // puts its comma before that point.
+  const seams: number[] = []
+  for (let index = 1; index < chars.length - 1; index += 1) {
+    if (/[，,、…—]/u.test(chars[index] as string)) seams.push(index)
+  }
+  const first = seams[0]
+  if (first === undefined) return undefined
+  let at = first
+  for (const seam of seams) {
+    if (Math.abs(seam - cut) < Math.abs(at - cut)) at = seam
+  }
+  return [chars.slice(0, at + 1).join(''), chars.slice(at + 1).join('')]
 }
 
 /**

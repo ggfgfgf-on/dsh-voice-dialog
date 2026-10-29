@@ -56,6 +56,14 @@ test('marked text is escaped before it reaches SSML', () => {
     + '<prosody rate="default" pitch="default" volume="default">&amp;b&lt;c</prosody>')
 })
 
+test('a punctuation-only region folds into its neighbour instead of silencing a request', () => {
+  const chunks = expressionSsmlChunks(unitOf({ say: '好的。', mark: [{ at: 0, pitch: 8 }] }), ZERO)
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].text, '好的。')
+  assert.equal((chunks[0].ssml.match(/<prosody/gu) ?? []).length, 2)
+  assert.ok(chunks[0].ssml.includes('>的。</prosody>'))
+})
+
 test('an unmarked step has no SSML at all and keeps the plain path', () => {
   assert.equal(expressionSsmlChunks(unitOf({ say: '真好' }), ZERO), undefined)
 })

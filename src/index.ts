@@ -21,8 +21,9 @@ import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { VisibleVoiceFilter } from './voice-marker.ts'
 import { createEdgeTts, rateToProsody, TtsQueue, type VoiceFrame } from './tts-queue.ts'
 import {
-  ADJUSTMENTS, applyExpression, CONSTRUCTS, EXPRESS_TOKENS, expressionProsody, expressionSsmlChunks,
-  MARK_LIMITS, normalizeVoiceUnits, pauseMsFor, splitStress, STEP_LIMITS, VOCABULARY, type VoiceUnit,
+  ADJUSTMENTS, applyExpression, BREATH_GAP_MS, breathSeam, CONSTRUCTS, EXPRESS_TOKENS, expressionProsody,
+  expressionSsmlChunks, MARK_LIMITS, normalizeVoiceUnits, pauseMsFor, splitStress, STEP_LIMITS, STYLES,
+  STYLE_TOKENS, VOCABULARY, type VoiceUnit,
 } from './expression.ts'
 import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
@@ -357,6 +358,11 @@ const SAME_SPEAKER_SIMILARITY = 0.62
               pitch: { type: 'number', minimum: STEP_LIMITS.pitch.min, maximum: STEP_LIMITS.pitch.max, description: STEP_LIMITS.pitch.meaning },
               volume: { type: 'number', minimum: STEP_LIMITS.volume.min, maximum: STEP_LIMITS.volume.max, description: STEP_LIMITS.volume.meaning },
               tone: { type: 'string', enum: [...EXPRESS_TOKENS.tone], description: 'Delivery colour; the plugin maps it to acoustics.' },
+              style: {
+                type: 'string',
+                enum: [...STYLE_TOKENS],
+                description: 'A named delivery sequence the plugin already tuned (tender, coy, hurt, sleepy, whisper…). It fills tone, pace, numbers and an ending contour; anything this step declares itself wins. Prefer this over hand-picked numbers.',
+              },
               pace: { type: 'string', enum: [...EXPRESS_TOKENS.pace], description: 'Local pace intent for this step.' },
               stress: { type: 'array', items: { type: 'string' }, maxItems: 4, description: 'Words inside say to lean on; each becomes a short emphasised fragment.' },
               breath: { type: 'boolean', description: 'Breathy delivery: a soft seam and a trailing pause.' },
@@ -426,6 +432,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             adjustments: ADJUSTMENTS,
             constructs: CONSTRUCTS,
             mark: MARK_LIMITS,
+            styles: STYLE_TOKENS.map((value) => ({ value, meaning: STYLES[value].meaning })),
           },
           base: queue.prosodyBase(),
         })
@@ -483,10 +490,19 @@ const SAME_SPEAKER_SIMILARITY = 0.62
           flush()
           const prosody = expressionProsody(step, base)
           const chunks = expressionSsmlChunks(step, base)
-          buffered = chunks === undefined
+          if (chunks !== undefined) {
+            buffered = chunks.map((chunk) => ({ text: chunk.text, ssml: chunk.ssml, prosody, gapAfterMs: 0 }))
+          } else {
             // A marked step keeps its text verbatim: rewriting it would move the marks.
-            ? [{ text: applyExpression(step), prosody, gapAfterMs: 0 }]
-            : chunks.map((chunk) => ({ text: chunk.text, ssml: chunk.ssml, prosody, gapAfterMs: 0 }))
+            const text = applyExpression(step)
+            const seam = step.breath === true ? breathSeam(text) : undefined
+            buffered = seam === undefined
+              ? [{ text, prosody, gapAfterMs: 0 }]
+              : [
+                { text: seam[0], prosody, gapAfterMs: BREATH_GAP_MS },
+                { text: seam[1], prosody, gapAfterMs: 0 },
+              ]
+          }
           spoken += 1
         }
         flush()
