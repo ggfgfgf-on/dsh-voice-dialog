@@ -34,6 +34,7 @@ const TEST_SURFACES = [
   'gate-prompt',
   'gates',
   'input-gate',
+  'interruption',
   'latency',
   'organizer',
   'organizer-compact',

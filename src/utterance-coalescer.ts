@@ -32,6 +32,8 @@ export interface UtteranceCoalescer<Meta = unknown> {
 
 export interface UtteranceCoalescerOptions<Meta = unknown> {
   windowMs?: number
+  /** Labels that are guesses (说话人N) rather than an enrolled identity. */
+  isTentativeCanonical?: (canonical: string) => boolean
   dedupeTranscript: (previous: string, next: string) => string
   submit: (batch: UtteranceCoalescerBatch<Meta>) => void
   now?: () => number
@@ -49,6 +51,12 @@ interface PendingBatch<Meta> {
 
 const keyOf = (lane: CoalescerLane, canonical: string): string => lane + ':' + canonical
 
+/** A slot label is a guess; only enrolled names count as a speaker change. */
+const DEFAULT_TENTATIVE_CANONICAL = (canonical: string): boolean => {
+  const label = canonical.trim()
+  return label === '' || /^说话人\d*$/.test(label) || /^speaker\d*$/i.test(label)
+}
+
 /**
  * Time-keyed batching behind the existing enqueueWithOrganizer path.
  *
@@ -61,6 +69,7 @@ export function createUtteranceCoalescer<Meta = unknown>(
 ): UtteranceCoalescer<Meta> {
   const windowMs = Math.max(0, Math.floor(options.windowMs ?? UTTERANCE_COALESCE_WINDOW_MS))
   const now = options.now ?? (() => Date.now())
+  const isTentative = options.isTentativeCanonical ?? DEFAULT_TENTATIVE_CANONICAL
   const setTimer = options.setTimer
     ?? ((callback: () => void, delayMs: number) => setTimeout(callback, delayMs))
   const clearTimer = options.clearTimer
@@ -133,11 +142,19 @@ export function createUtteranceCoalescer<Meta = unknown>(
       const at = entry.at ?? now()
       if (pending) {
         const gapMs = Math.max(0, at - pending.lastAt)
-        const keyChanged = pending.lane !== entry.lane || pending.canonical !== entry.canonical
-        if (keyChanged || gapMs > windowMs) flush()
+        const laneChanged = pending.lane !== entry.lane
+        // A placeholder label is a guess, not a new person: a flip between a
+        // guess and a real identity must not split one sentence into two turns.
+        const speakerChanged = pending.canonical !== entry.canonical
+          && !isTentative(pending.canonical)
+          && !isTentative(entry.canonical)
+        if (laneChanged || speakerChanged || gapMs > windowMs) flush()
       }
       if (!pending) {
         pending = { lane: entry.lane, canonical: entry.canonical, firstAt: at, lastAt: at, entries: [] }
+      } else if (isTentative(pending.canonical) && !isTentative(entry.canonical)) {
+        // Keep the first definite identity the batch learned.
+        pending.canonical = entry.canonical
       }
       pending.entries.push(entry)
       pending.lastAt = Math.max(pending.lastAt, at)

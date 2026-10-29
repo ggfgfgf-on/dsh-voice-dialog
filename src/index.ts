@@ -64,7 +64,9 @@ const lastUserSpeech = new Map<string, string>()
 let fastLaneEnabled = true
 
 export interface VoiceControl {
-  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker'
+  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker' | 'yield'
+  /** Interruption contract for the assistant's own speech; only for action yield. */
+  mode?: 'sentence' | 'immediate' | 'never'
   level?: number
   rate?: number
   delta?: number
@@ -296,6 +298,9 @@ const SAME_SPEAKER_SIMILARITY = 0.62
       + 'For a guest who keeps interrupting with irrelevant talk, action speaker with speaker "客人1" and policy "ignore"; '
       + 'use policy "queue" to restore, "steer" to let that guest interrupt directly, or speaker "*" for all guests. '
       + 'When the owner gives a guest a name (for example "叫她老婆"), pass that name in the name field; future turns use it. '
+      + 'Action yield declares how your OWN speech may be interrupted while it is read aloud: mode sentence finishes the '
+      + 'sentence being spoken and then drops the rest (default for normal answers), immediate cuts at once, '
+      + 'never keeps playing to the end. Declare it before or during a long answer when the listener is likely to talk over you. '
       + 'The owner cannot be renamed or ignored. Do not call this for ordinary questions. The microphone stays on after stop.',
     parameters: {
       type: 'object',
@@ -303,8 +308,8 @@ const SAME_SPEAKER_SIMILARITY = 0.62
       properties: {
         action: {
           type: 'string',
-          enum: ['volume', 'rate', 'stop', 'repeat', 'speaker'],
-          description: 'volume adjusts playback loudness; rate adjusts speaking speed for following sentences; stop silences the current reply; repeat replays the last reply; speaker renames a guest voiceprint and/or changes how that guest is delivered.',
+          enum: ['volume', 'rate', 'stop', 'repeat', 'speaker', 'yield'],
+          description: 'volume adjusts playback loudness; rate adjusts speaking speed for following sentences; stop silences the current reply; repeat replays the last reply; speaker renames a guest voiceprint and/or changes how that guest is delivered; yield declares how your own read-aloud speech may be interrupted.',
         },
         level: { type: 'number', minimum: 0, maximum: 1, description: 'Absolute playback volume for action volume.' },
         rate: { type: 'number', minimum: -50, maximum: 50, description: 'Absolute speaking rate in percent for action rate, e.g. -20 or 20.' },
@@ -312,6 +317,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         speaker: { type: 'string', description: 'Guest voiceprint label for action speaker, e.g. 客人1, 说话人1, or a name the model assigned earlier; use * for all guests. The owner 我 cannot be changed.' },
         policy: { type: 'string', enum: ['queue', 'steer', 'ignore', 'default'], description: 'Delivery policy for action speaker: queue, steer, ignore, or default to restore the browser setting.' },
         name: { type: 'string', description: 'New short name for this guest voiceprint, e.g. 老婆 or 老王. Future transcripts and policies can use it. Only for a specific guest, not * or 我.' },
+        mode: { type: 'string', enum: ['sentence', 'immediate', 'never'], description: 'Interruption contract for action yield: sentence finishes the audible sentence then drops the rest (default), immediate cuts now, never lets the reply finish uninterrupted.' },
       },
       required: ['action'],
     },
@@ -327,6 +333,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
           speaker: { type: 'string' },
           policy: { type: 'string' },
           name: { type: 'string' },
+          mode: { type: 'string' },
         },
         required: ['ok', 'action'],
       },
@@ -335,6 +342,19 @@ const SAME_SPEAKER_SIMILARITY = 0.62
     execute: (args: unknown) => {
       const input = (args ?? {}) as Record<string, unknown>
       const action = input.action
+      if (action === 'yield') {
+        const rawMode = input.mode
+        const mode = rawMode === undefined
+          ? 'sentence'
+          : rawMode === 'sentence' || rawMode === 'immediate' || rawMode === 'never'
+            ? rawMode
+            : null
+        if (mode === null) {
+          throw new Error('voice_dialog yield mode must be sentence, immediate or never')
+        }
+        broadcast('control', { action: 'yield', mode })
+        return Promise.resolve({ ok: true, action: 'yield', mode })
+      }
       if (action === 'stop' || action === 'repeat') {
         broadcast('control', { action })
         return Promise.resolve({ ok: true, action })
@@ -389,7 +409,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         broadcast('control', { action, rate: applied })
         return Promise.resolve({ ok: true, action, rate: applied })
       }
-      throw new Error('voice_dialog action must be volume, rate, stop, repeat or speaker')
+      throw new Error('voice_dialog action must be volume, rate, stop, repeat, speaker or yield')
     },
   }))
 

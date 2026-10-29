@@ -46,9 +46,9 @@ export interface VoiceDialogPreferences {
 
 const STORAGE_KEY = 'dsh-voice-dialog.preferences'
 
-/** The owner's measured average sits near 0.56, so 0.55 is the safe ceiling. */
+/** The owner's measured average sits near 0.56; 1 is the ceiling of the similarity score itself. */
 export const SPEAKER_THRESHOLD_MIN = 0.35
-export const SPEAKER_THRESHOLD_MAX = 0.55
+export const SPEAKER_THRESHOLD_MAX = 1
 export const SPEAKER_THRESHOLD_DEFAULT = 0.5
 
 const DEFAULTS: VoiceDialogPreferences = {

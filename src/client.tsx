@@ -12,6 +12,14 @@ import {
   createUtteranceCoalescer, UTTERANCE_COALESCE_WINDOW_MS, type UtteranceCoalescer,
 } from './utterance-coalescer.ts'
 import {
+  decideBoundaryHold,
+  decideInterruption,
+  decideSpeechOnsetYield,
+  DEFAULT_INTERRUPTION_MODE,
+  isInterruptionMode,
+  type InterruptionMode,
+} from './interruption.ts'
+import {
   getPreferences, setPreferences, subscribePreferences,
   SPEAKER_THRESHOLD_MAX, SPEAKER_THRESHOLD_MIN, type VoiceDialogPreferences,
 } from './preferences.ts'
@@ -95,7 +103,9 @@ interface VoiceFrame {
 }
 
 interface VoiceControl {
-  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker'
+  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker' | 'yield'
+  /** Model-declared interruption contract for its own speech. */
+  mode?: InterruptionMode
   level?: number
   rate?: number
   delta?: number
@@ -549,6 +559,10 @@ class TtsPlayer {
   private muted = false
   private cutting = false
   private afterCut: VoiceFrame[] = []
+  /** How the model declared its own speech may be interrupted; default finishes the sentence. */
+  private interruptionMode: InterruptionMode = DEFAULT_INTERRUPTION_MODE
+  /** A 'sentence' contract asked to hold; it fires at the next boundary, never mid-sentence. */
+  private pendingBoundaryYield = false
   private cutReplyId: string | undefined
   /** Owner barge-in is waiting for the current sentence to finish. */
   private bargeInActive = false
@@ -625,6 +639,7 @@ class TtsPlayer {
   /** Read-aloud is only live while the microphone is listening. */
   beginSession(sessionId: string): void {
     this.abandonYield()
+    this.pendingBoundaryYield = false
     // A different conversation starts a new frame sequence; the same session
     // must keep its watermark, otherwise a stopped/cut reply could revive.
     if (this.sessionId !== undefined && this.sessionId !== sessionId) this.frameWindow.reset()
@@ -645,6 +660,7 @@ class TtsPlayer {
   endSession(): void {
     this.active = false
     this.abandonYield()
+    this.pendingBoundaryYield = false
     this.resetBargeIn(true)
   }
 
@@ -686,12 +702,23 @@ class TtsPlayer {
   }
 
   /**
-   * Mark an owner barge-in. Playback keeps running through the current
-   * sentence; only later sentences are held. No audio is cut mid-sentence.
+   * The listener started speaking while the assistant was being read aloud.
+   * What this costs the audio is the contract the model declared through
+   * voice_dialog action yield: 'sentence' finishes the sentence already
+   * audible and drops the rest, 'immediate' cuts at once, 'never' keeps
+   * playing to the end.
    */
   beginOwnerBargeIn(): boolean {
-    if (!this.active || this.muted || this.cutting) return false
-    if (!this.playing || !this.currentFrame) return false
+    const decision = decideInterruption(this.interruptionMode, {
+      playing: this.playing && this.currentFrame !== undefined,
+      cutting: this.cutting,
+      muted: this.muted,
+      active: this.active,
+    })
+    // 'keep' is either the declared contract or a guard: only a 'never'
+    // declaration counts as a handled barge-in when nothing is touched.
+    if (decision === 'keep') return this.interruptionMode === 'never'
+    if (!this.currentFrame) return false
     if (this.bargeInActive) {
       this.abandonYield()
       return true
@@ -701,13 +728,13 @@ class TtsPlayer {
     this.bargeInOldReplyId = current.replyId
     this.bargeInNewReplyId = undefined
     this.clearDeferredTimer()
-    // The owner took the floor: the sentence stops where the listener's voice
-    // caught it, and no part of the old answer follows the new one. Finishing
-    // that sentence first is what read as a mechanical hand-off.
+    // The owner took the floor: no part of the old answer follows the new one.
     this.abandonYield()
     this.queue.length = 0
     this.deferred.length = 0
-    this.dropCurrent()
+    this.afterCut = []
+    // 'drain' lets the sentence that is already audible reach its own end.
+    if (decision === 'cut') this.dropCurrent()
     return true
   }
 
@@ -806,6 +833,10 @@ class TtsPlayer {
 
   /** Apply a control broadcast from the model-facing voice_dialog tool. */
   control(control: VoiceControl): void {
+    if (control.action === 'yield') {
+      if (isInterruptionMode(control.mode)) this.interruptionMode = control.mode
+      return
+    }
     if (control.action === 'stop') { this.stopAll(); return }
     if (control.action === 'repeat') { this.repeatLast(); return }
     if (control.action === 'volume') {
@@ -846,6 +877,7 @@ class TtsPlayer {
 
   private halt(): void {
     this.abandonYield()
+    this.pendingBoundaryYield = false
     this.queue.length = 0
     this.afterCut = []
     this.resetBargeIn(true)
@@ -902,6 +934,21 @@ class TtsPlayer {
    * assistant read over the first words of every new sentence.
    */
   yieldToOwner(): boolean {
+    if (!this.prefs.autoRead) return false
+    const decision = decideSpeechOnsetYield(this.interruptionMode, {
+      playing: this.playing && this.currentFrame !== undefined,
+      muted: this.muted,
+      active: this.active,
+      cutting: this.cutting,
+    })
+    // 'never' leaves the audio alone; the guards mean there is nothing to hold.
+    if (decision === 'ignore') return false
+    if (decision === 'atBoundary') {
+      // The audible sentence keeps playing; the hold lands when it ends.
+      if (this.yielded) return true
+      this.pendingBoundaryYield = true
+      return true
+    }
     if (!this.canHold()) return false
     if (this.yielded) return true
     if (this.audio.paused) return false
@@ -1215,6 +1262,13 @@ class TtsPlayer {
   }
 
   private playNext(): void {
+    // The sentence that was audible just ended: this is the boundary the
+    // model's 'sentence' contract named. Hold here and drop the rest.
+    if (decideBoundaryHold(this.pendingBoundaryYield, 'sentence') === 'hold') {
+      this.pendingBoundaryYield = false
+      this.settleBoundaryYield()
+      return
+    }
     const frame = this.queue.shift()
     if (!frame) {
       this.playing = false
@@ -1242,6 +1296,25 @@ class TtsPlayer {
       this.playing = false
       this.blocked = true
     })
+  }
+
+  /**
+   * The 'sentence' hold reached a boundary: stop there and make sure no part of
+   * the abandoned reply can resume after the owner's turn starts.
+   */
+  private settleBoundaryYield(): void {
+    this.bargeInActive = true
+    this.bargeInOldReplyId = this.currentFrame?.replyId ?? this.bargeInOldReplyId
+    this.bargeInNewReplyId = undefined
+    this.clearDeferredTimer()
+    this.abandonYield()
+    this.queue.length = 0
+    this.deferred.length = 0
+    this.afterCut = []
+    this.playing = false
+    this.currentFrame = undefined
+    this.cleanupUrl()
+    if (this.onPlayback) { try { this.onPlayback(false, this.sessionId) } catch { /* logging only */ } }
   }
 
   private cleanupUrl(): void {
