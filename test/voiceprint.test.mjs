@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { cosineSimilarity, decodeWavBase64 } from '../lib/voiceprint.js'
+import { cosineSimilarity, decodeWavBase64, VoiceprintService } from '../lib/voiceprint.js'
 import { encodeWave } from '../lib/wav.js'
 
 test('cosine similarity is 1 for the same direction and 0 for orthogonal vectors', () => {
@@ -8,6 +8,30 @@ test('cosine similarity is 1 for the same direction and 0 for orthogonal vectors
   assert.equal(cosineSimilarity(a, a), 1)
   assert.equal(cosineSimilarity(a, Float32Array.from([0, 1, 0])), 0)
   assert.equal(cosineSimilarity(Float32Array.from([0, 0, 0]), a), 0)
+})
+
+test('pair similarity tells one voice split in half from two speakers', async () => {
+  // Every clip embeds to the direction of its dominant polarity.
+  const extractor = {
+    dim: 2,
+    createStream() {
+      const stream = { samples: new Float32Array(0) }
+      stream.acceptWaveform = ({ samples }) => { stream.samples = samples }
+      return stream
+    },
+    compute(stream) {
+      let positive = 0
+      for (const value of stream.samples) if (value > 0) positive++
+      const share = positive / Math.max(1, stream.samples.length)
+      return share > 0.5 ? Float32Array.from([1, 0]) : Float32Array.from([0, 1])
+    },
+  }
+  const service = new VoiceprintService({ extractor })
+  const rising = Float32Array.from({ length: 16000 }, (_, i) => (i % 20 < 14 ? 0.3 : -0.3))
+  const falling = Float32Array.from(rising, (value) => -value)
+  assert.equal(await service.pairSimilarity(rising, rising), 1)
+  assert.equal(await service.pairSimilarity(rising, falling), 0)
+  assert.equal(await service.pairSimilarity(rising.subarray(0, 100), rising), 0)
 })
 
 test('decodes the client WAV back into the same samples', () => {

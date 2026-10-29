@@ -22,6 +22,8 @@ const SAMPLE_RATE = 16000
 const MIN_ENROLL_SAMPLES = SAMPLE_RATE
 /** Segments shorter than this cannot produce a stable speaker embedding. */
 const MIN_IDENTIFY_SAMPLES = Math.floor(SAMPLE_RATE * 0.35)
+/** Shorter clips embed too noisily to compare two of them. */
+const MIN_PAIR_SAMPLES = Math.floor(SAMPLE_RATE * 0.5)
 const DEFAULT_THRESHOLD = 0.5
 const CLUSTER_THRESHOLD = 0.55
 const MAX_CLUSTERS = 4
@@ -527,6 +529,18 @@ export class VoiceprintService {
     })
     this.chain = run.then(() => undefined, () => undefined)
     return run
+  }
+
+  /**
+   * Cosine similarity between two clips. A "separation" that only splits one
+   * voice into two complementary halves embeds both halves to the same
+   * speaker, so this rejects it instead of transcribing the same words twice.
+   */
+  async pairSimilarity(first: Float32Array, second: Float32Array): Promise<number> {
+    if (first.length < MIN_PAIR_SAMPLES || second.length < MIN_PAIR_SAMPLES) return 0
+    const a = await this.compute(first)
+    const b = await this.compute(second)
+    return cosineSimilarity(a, b)
   }
 
   async enroll(samples: Float32Array): Promise<{ dim: number }> {

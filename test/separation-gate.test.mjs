@@ -19,7 +19,7 @@ function concat(parts) {
 }
 
 test('speech window selector trims silence and returns two separated chunks', () => {
-  const result = selectSpeechWindows(concat([silence(0.4), speech(2.4), silence(0.4)]))
+  const result = selectSpeechWindows(concat([silence(0.6), speech(3.2), silence(0.6)]))
   assert.equal(result.reason, 'ok')
   assert.equal(result.windows.length, 2)
   assert.ok(result.windows[0].samples.length >= 5600)
@@ -54,9 +54,14 @@ test('same voice and confirmed owner is the only single-speaker decision', () =>
   assert.equal(uncertain.reason, 'uncertain')
 })
 
-test('insufficient audio always falls back to separation', () => {
+test('insufficient audio stays one speaker instead of running the model', () => {
   const decision = decideSpeakerGate({ selfSimilarities: [] })
-  assert.equal(decision.singleSpeaker, false)
-  assert.equal(decision.suspected, true)
+  assert.equal(decision.singleSpeaker, true)
+  assert.equal(decision.suspected, false)
   assert.equal(decision.confident, false)
+})
+
+test('the one-second window floor keeps short clips out of the model', () => {
+  assert.equal(selectSpeechWindows(concat([silence(0.3), speech(1.5), silence(0.3)])).reason, 'too-short')
+  assert.equal(selectSpeechWindows(concat([silence(1), speech(3), silence(1)])).reason, 'ok')
 })

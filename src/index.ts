@@ -128,6 +128,8 @@ function storedRate(fallback: number): number {
 /** Apply the read-aloud stream and its transport. */
 export function apply(ctx: Context, config: Config): void {
   const base = config.basePath.replace(/\/+$/, '') || BOOTSTRAP_BASE
+/** Two "separated" streams this similar are one voice split in half. */
+const SAME_SPEAKER_SIMILARITY = 0.62
   let voice = storedVoice(config.voice)
   let rate = storedRate(config.rate)
   type SseSend = (event: 'audio' | 'control', data: VoiceFrame | VoiceControl) => void
@@ -918,9 +920,16 @@ export function apply(ctx: Context, config: Config): void {
         return
       }
       const loud = Math.max(...result.sources.map((source) => source.rms), 0)
+      // A single voice split into two complementary halves reconstructs the
+      // input and embeds back to one speaker; transcribing both halves would
+      // duplicate the sentence and invent a second speaker.
+      const pair = result.sources.length >= 2
+        ? await voiceprint.pairSimilarity(result.sources[0]!.samples, result.sources[1]!.samples)
+          .catch(() => 0)
+        : 0
       // One dominant stream is ordinary dictation: keep the untouched audio
       // and the normal voiceprint path instead of transcribing artifacts.
-      if (result.sources.length < 2 || loud < 0.002) {
+      if (result.sources.length < 2 || loud < 0.002 || pair >= SAME_SPEAKER_SIMILARITY) {
         let identity: unknown = null
         try { identity = await voiceprint.identify(samples, { sessionId, threshold, margin }) } catch { /* optional */ }
         writeJson(res, 200, {

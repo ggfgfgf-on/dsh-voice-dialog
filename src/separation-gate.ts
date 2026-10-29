@@ -37,7 +37,8 @@ export interface OverlapDecision {
 const FRAME_MS = 100
 const MIN_ACTIVE_MS = 700
 const TARGET_WINDOW_MS = 1600
-const MIN_WINDOW_SAMPLES = 5600
+/** One second of voiced audio is the shortest window whose embedding holds up. */
+const MIN_WINDOW_SAMPLES = 16000
 const DEFAULT_SINGLE_THRESHOLD = 0.62
 const DEFAULT_SUSPECT_THRESHOLD = 0.48
 const DEFAULT_OWNER_FLOOR = 0.5
@@ -119,7 +120,9 @@ export function decideSpeakerGate(input: {
   const ownerFloor = input.ownerFloor ?? DEFAULT_OWNER_FLOOR
   const similarities = input.selfSimilarities.filter((value) => Number.isFinite(value))
   if (similarities.length === 0) {
-    return { suspected: true, singleSpeaker: false, confident: false, reason: 'insufficient-audio', threshold: singleThreshold }
+    // Too little stable audio to judge. Running the model here used to split a
+    // single speaker into two halves, so short clips stay on the single lane.
+    return { suspected: false, singleSpeaker: true, confident: false, reason: 'insufficient-audio', threshold: singleThreshold }
   }
   const minSimilarity = Math.min(...similarities)
   const ownerSimilarity = typeof input.ownerSimilarity === 'number' && Number.isFinite(input.ownerSimilarity)
