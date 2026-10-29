@@ -386,6 +386,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
           lines: { type: 'number' },
           expressAvailable: { type: 'boolean' },
           vocabulary: { type: 'object' },
+          base: { type: 'object' },
         },
         required: ['ok', 'action'],
       },
