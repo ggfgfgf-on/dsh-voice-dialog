@@ -2,8 +2,8 @@
 import * as React from 'react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
-  Button, IconCloseOutlineRegular, IconMicrophoneOutlineRegular, IconSettingsOutlineRegular,
-  IconStopFillRegular, Modal, Tooltip,
+  Button, IconCloseOutlineRegular, IconMicrophoneOutlineRegular, IconPauseOutlineRegular,
+  IconSettingsOutlineRegular, IconStopFillRegular, Modal, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import speechRemote from './speech-remote.js'
 import { MicrophoneLoop, recordVoiceSample, type MicPlaybackSnapshot } from './mic.ts'
@@ -1414,6 +1414,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const [pending, setPending] = useState(0)
   const [queued, setQueued] = useState(0)
   const [hostTts, setHostTts] = useState<HostTtsState | null>(null)
+  const [reading, setReading] = useState(false)
   const [error, setError] = useState('')
   const [speaker, setSpeaker] = useState('')
   /** A failure must be readable without hovering: phones have no tooltips. */
@@ -1480,6 +1481,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       })
     }
     sharedPlayer.onPlayback = (playing, sessionId) => {
+      setReading(playing)
       if (sessionId) reportPlayback(sessionId, playing)
     }
     sharedPlayer.onCancelTts = (sessionId, replyId) => cancelHostTts(sessionId, replyId)
@@ -2517,6 +2519,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     : queued > 0 ? `语音排队（${queued}）…` : ''
   const hostActivity = (hostTts?.pending ?? 0) > 0 ? `后台还有 ${hostTts?.pending} 句待读` : ''
   const activeActivity = activity || hostActivity
+  const canStopReading = reading || (hostTts?.busy ?? false)
   const label = error || (active
     ? activeActivity || (speaker ? `正在听…（${speaker}）` : '正在听…点击结束')
     : '语音对话：点一下开始，多人插话按优先级排队，回答自动朗读')
@@ -2524,14 +2527,16 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   if (active) return <>
     <style>{MIC_CSS}</style>
     <div className="dsh-vd-captureRow" data-voice-activity={activeActivity ? 'transcribing' : 'recording'}>
-      <Button type="button" className="dsh-vd-round" size="sm" aria-label="结束语音对话"
-        onClick={() => { void stop() }}><IconCloseOutlineRegular size={14} /></Button>
+      <Button type="button" className="dsh-vd-round" size="sm" aria-label="暂停朗读"
+        title={canStopReading ? '暂停朗读，麦克风继续保持收听' : '当前没有在朗读'}
+        disabled={!canStopReading}
+        onClick={() => sharedPlayer.control({ action: 'stop' })}><IconPauseOutlineRegular size={14} /></Button>
       {activeActivity || error
         ? <span className="dsh-vd-activity" role="status">{error || activeActivity}</span>
         : <LiveWave level={level} />}
-      <Button type="button" className="dsh-vd-round" size="sm" aria-label="停止朗读"
-        title="停止朗读，麦克风继续保持收听"
-        onClick={() => sharedPlayer.control({ action: 'stop' })}><IconStopFillRegular size={14} /></Button>
+      <Button type="button" className="dsh-vd-round" size="sm" aria-label="结束语音对话"
+        title="结束语音对话"
+        onClick={() => { void stop() }}><IconStopFillRegular size={14} /></Button>
     </div>
   </>
 
