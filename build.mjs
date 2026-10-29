@@ -1,8 +1,13 @@
 // dsh-voice-dialog build: host ESM + client __ModuleLoader__ closure.
 import { build } from 'esbuild'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 
 const PKG_ID = 'dsh-voice-dialog'
+const LIB = 'lib'
+const REQUIRE_BANNER = [
+  "import { createRequire as __dshCreateRequire } from 'node:module';",
+  'const require = __dshCreateRequire(import.meta.url);',
+].join('\n')
 const PLATFORM_EXTERNALS = [
   'react',
   'react/jsx-runtime',
@@ -16,13 +21,85 @@ const PLATFORM_EXTERNALS = [
   '@deepseek-ai/dsh-client-schema-form',
 ]
 
-mkdirSync('lib', { recursive: true })
+// Plain-node modules imported directly by test/*.test.mjs. They share one
+// transpile-only build because bundling each module separately is unnecessary
+// and makes it easy to forget a new surface.
+const TEST_SURFACES = [
+  'arrange',
+  'audio-transport',
+  'barge-in',
+  'continuous-separation',
+  'fast-lane',
+  'frame-order',
+  'gate-prompt',
+  'gates',
+  'input-gate',
+  'latency',
+  'organizer',
+  'organizer-compact',
+  'organizer-history',
+  'planner',
+  'queue-control',
+  'rewriter',
+  'routing',
+  'scheduler',
+  'segmenter',
+  'separation',
+  'separation-align',
+  'separation-gate',
+  'separation-worker',
+  'speaker',
+  'speaker-policy',
+  'speech-filter',
+  'tts-queue',
+  'voice-marker',
+  'voice-protocol',
+  'voiceprint',
+  'volume-gain',
+  'volume-log',
+  'volume-report',
+  'wav',
+  'yield',
+]
+
+// These have runtime-only peers or are forked as standalone workers, so they
+// keep their own bundle options.
+const SPECIAL_SURFACES = [
+  {
+    entry: 'attention',
+    options: {
+      target: 'node22',
+      bundle: true,
+      external: ['node:*', '@deepseek-ai/*', 'msedge-tts'],
+      logLevel: 'warning',
+    },
+  },
+  {
+    entry: 'continuous-separation',
+    options: { bundle: true, logLevel: 'silent' },
+  },
+  {
+    entry: 'separation-worker',
+    options: {
+      bundle: true,
+      external: ['onnxruntime-node', 'node:*'],
+      banner: { js: REQUIRE_BANNER },
+      logLevel: 'silent',
+    },
+  },
+]
+
+mkdirSync(LIB, { recursive: true })
+
+async function runBuild(options) {
+  await build(options)
+}
 
 // Host: msedge-tts is bundled because dsh's CJS router breaks on its
 // browser-polyfill specifiers; axios also needs a dynamic require shim.
-await build({
+await runBuild({
   entryPoints: ['src/index.ts'],
-  outfile: 'lib/index.js',
+  outfile: LIB + '/index.js',
   bundle: true,
   format: 'esm',
   platform: 'node',
@@ -35,18 +112,14 @@ await build({
     'onnxruntime-node',
     'node:*',
   ],
-  banner: {
-    js:
-      "import { createRequire as __dshCreateRequire } from 'node:module';\n" +
-      'const require = __dshCreateRequire(import.meta.url);',
-  },
+  banner: { js: REQUIRE_BANNER },
   logLevel: 'info',
 })
 
 // Client: the loader requires this exact CJS closure shape.
-await build({
+await runBuild({
   entryPoints: ['src/client.tsx'],
-  outfile: 'lib/client.js',
+  outfile: LIB + '/client.js',
   bundle: true,
   format: 'cjs',
   platform: 'browser',
@@ -54,147 +127,54 @@ await build({
   external: PLATFORM_EXTERNALS,
   banner: {
     js:
-      `window.__ModuleLoader__.load({ id: ${JSON.stringify(PKG_ID)}, factory: (require) => {\n` +
+      'window.__ModuleLoader__.load({ id: ' + JSON.stringify(PKG_ID) + ', factory: (require) => {\n' +
       'var module = { exports: {} }; var exports = module.exports;',
   },
-  footer: {
-    js: 'return module.exports; } });',
-  },
+  footer: { js: 'return module.exports; } });' },
   logLevel: 'info',
 })
 
-// Test surface for plain-node tests.
-await build({
-  entryPoints: ['src/segmenter.ts'],
-  outfile: 'lib/segmenter.js',
+// All dependency-free test surfaces in one call.
+await runBuild({
+  entryPoints: TEST_SURFACES.map((name) => 'src/' + name + '.ts'),
+  outdir: LIB,
   bundle: false,
   format: 'esm',
   platform: 'node',
   logLevel: 'silent',
 })
 
-await build({
-  entryPoints: ['src/tts-queue.ts'],
-  outfile: 'lib/tts-queue.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
+for (const surface of SPECIAL_SURFACES) {
+  await runBuild({
+    entryPoints: ['src/' + surface.entry + '.ts'],
+    outfile: LIB + '/' + surface.entry + '.js',
+    format: 'esm',
+    platform: 'node',
+    ...surface.options,
+  })
+}
 
-await build({
-  entryPoints: ['src/voice-protocol.ts'],
-  outfile: 'lib/voice-protocol.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
+const expected = [
+  'index.js',
+  'client.js',
+  ...TEST_SURFACES.map((name) => name + '.js'),
+  ...SPECIAL_SURFACES.map((surface) => surface.entry + '.js'),
+]
+const missing = expected.filter((name) => !existsSync(LIB + '/' + name))
+const empty = expected.filter((name) => {
+  try { return statSync(LIB + '/' + name).size === 0 } catch { return false }
 })
+if (missing.length > 0) throw new Error('missing build artifacts: ' + missing.join(', '))
+if (empty.length > 0) throw new Error('empty build artifacts: ' + empty.join(', '))
 
-await build({
-  entryPoints: ['src/scheduler.ts'],
-  outfile: 'lib/scheduler.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
+const client = readFileSync(LIB + '/client.js', 'utf8')
+if (!client.includes('__ModuleLoader__.load')) {
+  throw new Error('client bundle is missing the module-loader closure')
+}
+const host = readFileSync(LIB + '/index.js', 'utf8')
+if (!host.includes('export')) throw new Error('host bundle is not an ESM module')
 
-await build({
-  entryPoints: ['src/organizer.ts'],
-  outfile: 'lib/organizer.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-await build({
-  entryPoints: ['src/queue-control.ts'],
-  outfile: 'lib/queue-control.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-await build({
-  entryPoints: ['src/speaker-policy.ts'],
-  outfile: 'lib/speaker-policy.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-await build({
-  entryPoints: ['src/speech-filter.ts'],
-  outfile: 'lib/speech-filter.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-await build({
-  entryPoints: ['src/wav.ts'],
-  outfile: 'lib/wav.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-await build({
-  entryPoints: ['src/voiceprint.ts'],
-  outfile: 'lib/voiceprint.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-await build({
-  entryPoints: ['src/separation-align.ts'],
-  outfile: 'lib/separation-align.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-await build({
-  entryPoints: ['src/separation.ts'],
-  outfile: 'lib/separation.js',
-  bundle: false,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-await build({
-  entryPoints: ['src/continuous-separation.ts'],
-  outfile: 'lib/continuous-separation.js',
-  bundle: true,
-  format: 'esm',
-  platform: 'node',
-  logLevel: 'silent',
-})
-
-// The worker is bundled: it is forked as a plain .js file and must not import .ts.
-await build({
-  entryPoints: ['src/separation-worker.ts'],
-  outfile: 'lib/separation-worker.js',
-  bundle: true,
-  format: 'esm',
-  platform: 'node',
-  external: ['onnxruntime-node', 'node:*'],
-  banner: {
-    js:
-      "import { createRequire as __dshCreateRequire } from 'node:module';\n" +
-      'const require = __dshCreateRequire(import.meta.url);',
-  },
-  logLevel: 'silent',
-})
-
-console.log('[dsh-voice-dialog] build done')
+console.log(
+  '[dsh-voice-dialog] build done: ' + expected.length + ' artifacts, '
+  + TEST_SURFACES.length + ' test surfaces',
+)

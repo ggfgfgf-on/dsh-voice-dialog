@@ -16,9 +16,18 @@ import { MsEdgeTTS, OUTPUT_FORMAT, type ProsodyOptions } from 'msedge-tts'
 
 export interface VoiceFrame {
   sessionId: string
+  /** Host-elected playback client; absent when no client claimed the session. */
+  owner?: string
+  /** Monotonic within the session; never reused, never reordered. */
   seq: number
+  /** Reply round, incremented once per assistant answer. */
+  epoch: number
   /** Groups the sentences of one assistant reply for repeat playback. */
   replyId?: string
+  /** Same-sentence read-aloud blocks share this id. */
+  sentenceId?: number
+  /** Zero-based position of this block inside its sentence. */
+  chunkIndex?: number
   /** Markdown-stripped sentence text (shown as live caption). */
   text: string
   /** Base64 MP3 bytes (24kHz mono); empty when `error` is set. */
@@ -119,7 +128,23 @@ export function createEdgeTts(): MsEdgeTTS {
 interface QueuedSentence {
   text: string
   epoch: number
+  /** Reply round; 0 when the caller does not track rounds. */
+  round: number
   replyId?: string
+  sentenceId?: number
+  chunkIndex?: number
+}
+
+/**
+ * A block cut at a length threshold may not end in punctuation. Give TTS a
+ * tiny trailing pause so blocks that were reordered together do not run into
+ * each other; terminal punctuation is never replaced or removed.
+ */
+export function withSpeechPause(text: string): string {
+  const clean = text.trim()
+  if (!clean) return clean
+  if (/[，、；：,;:。！？!?…\s]$/u.test(clean)) return clean
+  return clean + '，'
 }
 
 interface SessionQueue {
@@ -227,14 +252,28 @@ export class TtsQueue {
     }
   }
 
-  /** Enqueue one sentence for a session; starts the pump if idle. */
-  enqueue(sessionId: string, text: string, replyId?: string): void {
+  /** Enqueue one read-aloud block; starts the pump if idle. */
+  enqueue(
+    sessionId: string,
+    text: string,
+    replyId?: string,
+    round = 0,
+    block: { sentenceId?: number; chunkIndex?: number } = {},
+  ): void {
     let q = this.queues.get(sessionId)
     if (!q) {
       q = { pending: [], busy: false, seq: 0, epoch: 0, failures: 0, retry: null }
       this.queues.set(sessionId, q)
     }
-    q.pending.push({ text, epoch: q.epoch, replyId })
+    const sentenceId = typeof block.sentenceId === 'number' && Number.isFinite(block.sentenceId)
+      ? Math.max(0, Math.trunc(block.sentenceId)) : undefined
+    const chunkIndex = typeof block.chunkIndex === 'number' && Number.isFinite(block.chunkIndex)
+      ? Math.max(0, Math.trunc(block.chunkIndex)) : undefined
+    q.pending.push({
+      text, epoch: q.epoch, round: Math.max(0, Math.trunc(round)), replyId,
+      ...(sentenceId === undefined ? {} : { sentenceId }),
+      ...(chunkIndex === undefined ? {} : { chunkIndex }),
+    })
     void this.pump(sessionId, q)
   }
 
@@ -277,7 +316,9 @@ export class TtsQueue {
       console.warn(
         `[dsh-voice-dialog] TTS still unavailable, dropping ${q.pending.length} pending sentence(s)`,
       )
-      for (const item of q.pending) this.emitFailure(sessionId, q, item.text, item.replyId, 'TTS unavailable')
+      for (const item of q.pending) {
+        this.emitFailure(sessionId, q, item.text, item.replyId, 'TTS unavailable', item.round, item)
+      }
       q.pending.length = 0
       // A later sentence gets a fresh retry budget instead of being dropped
       // on its first failure because the counter was never reset.
@@ -311,7 +352,7 @@ export class TtsQueue {
           try {
             // A reset cleared the handshake, so later attempts dial again.
             if (attempt > 1) await this.ensureReady()
-            const { audioStream } = await this.tts.toStream(item.text, this.prosody)
+            const { audioStream } = await this.tts.toStream(withSpeechPause(item.text), this.prosody)
             const chunks: Buffer[] = []
             for await (const chunk of audioStream) {
               chunks.push(chunk as Buffer)
@@ -339,7 +380,10 @@ export class TtsQueue {
           const frame: VoiceFrame = {
             sessionId,
             seq: q.seq++,
+            epoch: item.round,
             replyId: item.replyId,
+            ...(item.sentenceId === undefined ? {} : { sentenceId: item.sentenceId }),
+            ...(item.chunkIndex === undefined ? {} : { chunkIndex: item.chunkIndex }),
             text: item.text,
             audio: buf.toString('base64'),
           }
@@ -356,7 +400,7 @@ export class TtsQueue {
           const message = e instanceof Error ? e.message : String(e)
           // eslint-disable-next-line no-console
           console.warn('[dsh-voice-dialog] synthesis failed: ' + message)
-          if (item.epoch === q.epoch) this.emitFailure(sessionId, q, item.text, item.replyId, message)
+          if (item.epoch === q.epoch) this.emitFailure(sessionId, q, item.text, item.replyId, message, item.round, item)
         }
       }
     } catch (e) {
@@ -373,8 +417,17 @@ export class TtsQueue {
     }
   }
 
-  private emitFailure(sessionId: string, q: SessionQueue, text: string, replyId: string | undefined, error: string): void {
-    this.emit({ sessionId, seq: q.seq++, replyId, text, audio: '', error })
+  private emitFailure(
+    sessionId: string, q: SessionQueue, text: string,
+    replyId: string | undefined, error: string, round = 0,
+    block: { sentenceId?: number; chunkIndex?: number } = {},
+  ): void {
+    this.emit({
+      sessionId, seq: q.seq++, epoch: Math.max(0, Math.trunc(round)), replyId,
+      ...(block.sentenceId === undefined ? {} : { sentenceId: block.sentenceId }),
+      ...(block.chunkIndex === undefined ? {} : { chunkIndex: block.chunkIndex }),
+      text, audio: '', error,
+    })
   }
 
   private emit(frame: VoiceFrame): void {

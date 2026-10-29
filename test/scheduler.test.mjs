@@ -167,6 +167,23 @@ test('a failed transcript is reported without breaking the queue', async () => {
   assert.deepEqual(errors, ['识别失败'])
 })
 
+test('dropping a held head cannot wedge the queue when its hold never settles', async () => {
+  const never = new Promise(() => undefined)
+  const deliveries = []
+  const scheduler = new SpeechScheduler({
+    deliver: async (text, mode) => { deliveries.push({ text, mode }) },
+    ownerMode: () => 'queue',
+    guestMode: () => 'queue',
+  })
+  const dropped = scheduler.enqueue('owner', '我', Promise.resolve('丢掉'), { hold: never })
+  scheduler.enqueue('owner', '我', Promise.resolve('保留'))
+  await tick(10)
+  dropped.drop()
+  await tick(40)
+  assert.deepEqual(deliveries, [{ text: '保留', mode: 'queue' }])
+  assert.deepEqual(scheduler.status(), { active: 0, queued: 0 })
+})
+
 test('dispose still delivers captured lines', async () => {
   const deliveries = []
   const scheduler = new SpeechScheduler({

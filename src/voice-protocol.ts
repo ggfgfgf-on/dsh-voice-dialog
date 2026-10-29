@@ -6,6 +6,9 @@ export type VoiceCommand =
   | { action: 'rate'; rate?: number; delta?: number }
   | { action: 'repeat' }
   | { action: 'stop' }
+  | { action: 'hold' }
+  | { action: 'resume' }
+  | { action: 'skip'; count: number }
 
 const OPEN = /\[\[\s*voice\s*[:：]/i
 
@@ -15,6 +18,19 @@ export function parseVoiceCommand(raw: string): VoiceCommand | null {
   if (text.length === 0) return null
   const lower = text.toLowerCase()
   if (lower === 'repeat' || lower === 'stop') return { action: lower }
+  // The model holds the floor while the owner is still talking, then resumes.
+  if (lower === 'hold' || lower === 'wait' || lower === 'pause' || lower === 'quiet') {
+    return { action: 'hold' }
+  }
+  if (lower === 'resume' || lower === 'continue' || lower === 'go') return { action: 'resume' }
+  const skip = /^skip\b([\s\S]*)$/i.exec(text)
+  if (skip) {
+    const raw = skip[1].trim().replace(/^[=:]\s*/, '')
+    if (raw.length === 0) return { action: 'skip', count: 1 }
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return { action: 'skip', count: 1 }
+    return { action: 'skip', count: Math.max(1, Math.min(20, Math.floor(value))) }
+  }
   const volume = /^volume\b([\s\S]*)$/i.exec(text)
   if (volume) {
     const argument = volume[1].trim().replace(/^[=:]\s*/, '')

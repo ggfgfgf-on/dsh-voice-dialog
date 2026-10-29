@@ -40,3 +40,23 @@ test('ordinary chain-of-thought text is not spoken', () => {
   assert.deepEqual(parser.feed('继续推理'), [])
   parser.flush()
 })
+test('parses hold, resume and skip directives', () => {
+  assert.deepEqual(parseVoiceCommand('hold'), { action: 'hold' })
+  assert.deepEqual(parseVoiceCommand('Hold'), { action: 'hold' })
+  assert.deepEqual(parseVoiceCommand('pause'), { action: 'hold' })
+  assert.deepEqual(parseVoiceCommand('resume'), { action: 'resume' })
+  assert.deepEqual(parseVoiceCommand('continue'), { action: 'resume' })
+  assert.deepEqual(parseVoiceCommand('skip'), { action: 'skip', count: 1 })
+  assert.deepEqual(parseVoiceCommand('skip 3'), { action: 'skip', count: 3 })
+  assert.deepEqual(parseVoiceCommand('skip = 99'), { action: 'skip', count: 20 })
+})
+
+test('hold/resume come out of the reasoning stream in order', () => {
+  const protocol = new VoiceProtocol()
+  const first = protocol.feed('想一下，[[voice: hold]] 主人还在说')
+  assert.deepEqual(first, [{ action: 'hold' }])
+  const second = protocol.feed('…说完了，[[voice: re')
+  assert.deepEqual(second, [])
+  const third = protocol.feed('sume]] 接着说')
+  assert.deepEqual(third, [{ action: 'resume' }])
+})

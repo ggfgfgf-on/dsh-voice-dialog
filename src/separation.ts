@@ -23,6 +23,9 @@ export const SEPARATION_MODEL_FILE = 'mossformer2_ss_16k.onnx'
 export const SEPARATION_MODEL_BYTES = 245_120_037
 const MODEL_URL = 'https://huggingface.co/mhavo/mossformer2-ss-16k-onnx/resolve/main/' + SEPARATION_MODEL_FILE
 const SAMPLE_RATE = 16_000
+/** Try the Windows GPU first; the worker always appends CPU as a safety net. */
+const DEFAULT_EXECUTION_PROVIDERS = ['dml']
+const DEFAULT_DML_DEVICE_ID = 0
 /** A second stream below this share of the louder one is leakage, not a person. */
 const SOURCE_FLOOR = 0.1
 
@@ -33,15 +36,36 @@ export interface SeparationStatus {
   modelPath: string
   modelBytes: number
   backend?: string
+  executionProviders: string[]
   error?: string
 }
 
 export interface RawSeparation {
   sources: Array<{ samples: Float32Array; rms: number; onsetMs: number }>
+  /** Time inside the worker call (model window loop). */
   elapsedMs: number
+  /** Time spent behind another request on the single-worker chain. */
+  queueMs?: number
+  /** Request start -> result, including both queueMs and elapsedMs. */
+  wallMs?: number
 }
 
 type RunWindow = (input: Float32Array) => Promise<[Float32Array, Float32Array]>
+
+function normalizeExecutionProviders(values: readonly string[] | undefined): string[] {
+  const source = values ?? process.env.DSH_SEPARATION_EXECUTION_PROVIDERS?.split(',')
+  const unique = [...new Set(
+    (source ?? DEFAULT_EXECUTION_PROVIDERS)
+      .map((value) => String(value).trim().toLowerCase())
+      .filter(Boolean),
+  )]
+  return unique.length > 0 ? unique : [...DEFAULT_EXECUTION_PROVIDERS]
+}
+
+function normalizeDmlDeviceId(value: number | undefined): number {
+  const candidate = value ?? Number(process.env.DSH_SEPARATION_DML_DEVICE_ID ?? DEFAULT_DML_DEVICE_ID)
+  return Number.isInteger(candidate) && candidate >= 0 ? candidate : DEFAULT_DML_DEVICE_ID
+}
 
 function proxyUrl(): string | undefined {
   const raw = process.env.DSH_VOICE_MODEL_PROXY ?? process.env.HTTPS_PROXY ?? process.env.https_proxy
@@ -198,13 +222,36 @@ export class SeparationService {
     reject: (error: Error) => void
   }>()
   private readonly injectedRun: RunWindow | undefined
+  private readonly executionProviders: string[]
+  private readonly dmlDeviceId: number
 
-  constructor(options: { dataDir?: string; modelPath?: string; run?: RunWindow } = {}) {
+  constructor(options: {
+    dataDir?: string
+    modelPath?: string
+    run?: RunWindow
+    executionProviders?: readonly string[]
+    dmlDeviceId?: number
+  } = {}) {
     this.dataDir = options.dataDir ?? join(homedir(), '.dsh', 'voice-dialog')
     this.modelPath = options.modelPath
       ?? process.env.DSH_SEPARATION_MODEL
       ?? join(this.dataDir, 'models', SEPARATION_MODEL_FILE)
     this.injectedRun = options.run
+    this.executionProviders = normalizeExecutionProviders(options.executionProviders)
+    this.dmlDeviceId = normalizeDmlDeviceId(options.dmlDeviceId)
+  }
+
+  /** Log both the selected provider and the provider chain requested by the user. */
+  private setBackend(value: unknown): void {
+    const backend = typeof value === 'string' && value.length > 0 ? value : undefined
+    if (!backend || backend === this.backend) return
+    this.backend = backend
+    const fallback = backend === 'cpu' && !this.executionProviders.includes('cpu')
+    const line = '[dsh-voice-dialog] separation provider=' + backend
+      + ' requested=' + this.executionProviders.join(',')
+      + (fallback ? ' (CPU fallback)' : '')
+    if (fallback) console.warn(line)
+    else console.info(line)
   }
 
   status(): SeparationStatus {
@@ -220,6 +267,7 @@ export class SeparationService {
       ready,
       modelPath: this.modelPath,
       modelBytes,
+      executionProviders: this.executionProviders,
       ...(this.backend ? { backend: this.backend } : {}),
       ...(ready ? {} : { error: addonAvailable ? '分离模型未安装，请在设置页下载' : '缺少本地分离组件 onnxruntime-node' }),
     }
@@ -293,9 +341,14 @@ export class SeparationService {
       worker.on('message', (message: any) => {
         if (!message || typeof message !== 'object') return
         if (message.type === 'ready') {
-          this.backend = typeof message.backend === 'string' ? message.backend : undefined
+          this.setBackend(message.backend)
           if (timer) clearTimeout(timer)
           if (!settled) { settled = true; resolve() }
+          return
+        }
+        if (message.type === 'backend') {
+          // A GPU session can initialize successfully and still fail at run time.
+          this.setBackend(message.backend)
           return
         }
         if (message.type === 'result') {
@@ -340,7 +393,12 @@ export class SeparationService {
         fail(new Error('分离进程启动超时'))
       }, 30_000)
       try {
-        worker.send({ type: 'init', modelPath: this.modelPath })
+        worker.send({
+          type: 'init',
+          modelPath: this.modelPath,
+          executionProviders: this.executionProviders,
+          dmlDeviceId: this.dmlDeviceId,
+        })
       } catch (error) {
         fail(error instanceof Error ? error : new Error(String(error)))
       }
@@ -373,8 +431,17 @@ export class SeparationService {
 
   async separate(samples: Float32Array): Promise<RawSeparation> {
     if (samples.length === 0) throw new Error('没有可分离的语音')
-    if (this.injectedRun) return separateWithRunner(samples, this.injectedRun)
-    const run = this.chain.then(() => this.request(samples))
+    const requestedAt = Date.now()
+    if (this.injectedRun) {
+      const result = await separateWithRunner(samples, this.injectedRun)
+      return { ...result, queueMs: 0, wallMs: Date.now() - requestedAt }
+    }
+    let queueMs = 0
+    const run = this.chain.then(async () => {
+      queueMs = Date.now() - requestedAt
+      const result = await this.request(samples)
+      return { ...result, queueMs, wallMs: Date.now() - requestedAt }
+    })
     this.chain = run.then(() => undefined, () => undefined)
     return run
   }

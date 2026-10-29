@@ -1,5 +1,11 @@
 /** Strict FIFO delivery for concurrent multi-speaker transcripts. */
 import { parseQueueControl, type QueueControl } from './queue-control.js'
+import type { QueuePlanItem } from './organizer.js'
+
+export interface QueuePlanOutcome {
+  applied: QueuePlanItem[]
+  ignored: Array<{ id: number; reason: string }>
+}
 
 export type SpeakerLane = 'owner' | 'guest'
 export type GuestMode = 'queue' | 'steer' | 'ignore'
@@ -29,12 +35,26 @@ export interface SpeechSchedulerOptions {
   onError?: (error: unknown) => void
 }
 
+export interface QueueSnapshotEntry {
+  seq: number
+  /** Arrival id used by the planner to address this entry. */
+  id: number
+  lane: SpeakerLane
+  /** Recognized text, empty while transcription is still running. */
+  text: string
+  ready: boolean
+}
+
 export interface EnqueueOptions {
   /**
    * Keeps this entry at the head of the FIFO until the parallel organizer has
    * decided. Later entries still cannot overtake it.
    */
   hold?: Promise<void>
+  /** Lower is delivered earlier. Omitted entries fall back to arrival order. */
+  priority?: number
+  /** Stable arrival token captured before an asynchronous organizer decision. */
+  order?: number
 }
 
 /** A stable handle for a later organizer decision. */
@@ -44,6 +64,11 @@ export interface SchedulerEntry {
   setMode(mode: PromptMode): void
   /** Drop only this entry; earlier/later entries keep their order. */
   drop(): void
+  /**
+   * True once the entry left the queue and was handed to the model. A late
+   * organizer answer must not drop it after this point.
+   */
+  started(): boolean
 }
 
 interface Entry {
@@ -55,11 +80,20 @@ interface Entry {
   dropped: boolean
   delivered: boolean
   modeOverride?: PromptMode
+  priority?: number
+  order: number
   hold?: Promise<void>
   holdSettled: boolean
+  /** Resolves the local hold race when this entry is dropped or interrupted. */
+  wakeHold?: () => void
 }
 
-const NOOP_ENTRY: SchedulerEntry = { seq: -1, setMode: () => undefined, drop: () => undefined }
+const NOOP_ENTRY: SchedulerEntry = {
+  seq: -1,
+  setMode: () => undefined,
+  drop: () => undefined,
+  started: () => true,
+}
 
 /**
  * Every captured utterance gets a sequence number when it is enqueued, and the
@@ -70,6 +104,7 @@ const NOOP_ENTRY: SchedulerEntry = { seq: -1, setMode: () => undefined, drop: ()
 export class SpeechScheduler {
   private entries: Entry[] = []
   private nextSeq = 0
+  private nextOrder = 0
   private active = 0
   private closed = false
   private draining = false
@@ -87,6 +122,15 @@ export class SpeechScheduler {
   ): SchedulerEntry {
     if (this.closed) return NOOP_ENTRY
     if (lane === 'guest' && label) this.lastGuestLabel = label
+    const fallbackOrder = this.nextOrder++
+    const priority = typeof enqueueOptions.priority === 'number'
+      && Number.isFinite(enqueueOptions.priority) ? Math.trunc(enqueueOptions.priority) : undefined
+    let wakeHold: (() => void) | undefined
+    let hold = enqueueOptions.hold
+    if (hold !== undefined) {
+      const cancelled = new Promise<void>((resolve) => { wakeHold = resolve })
+      hold = Promise.race([hold, cancelled])
+    }
     const entry: Entry = {
       seq: this.nextSeq++,
       lane,
@@ -95,8 +139,12 @@ export class SpeechScheduler {
       text: null,
       dropped: false,
       delivered: false,
-      hold: enqueueOptions.hold,
-      holdSettled: enqueueOptions.hold === undefined,
+      priority,
+      order: typeof enqueueOptions.order === 'number' && Number.isFinite(enqueueOptions.order)
+        ? enqueueOptions.order : fallbackOrder,
+      hold,
+      holdSettled: hold === undefined,
+      wakeHold,
     }
     this.entries.push(entry)
     this.active += 1
@@ -134,6 +182,7 @@ export class SpeechScheduler {
       seq: entry.seq,
       setMode: (mode) => { this.setMode(entry, mode) },
       drop: () => { this.drop(entry) },
+      started: () => entry.delivered,
     }
   }
 
@@ -152,6 +201,59 @@ export class SpeechScheduler {
     return { active: this.active, queued: this.entries.length }
   }
 
+  /**
+   * Read-only FIFO view for the organizer: what is waiting, in which lane, and
+   * in whose words. Never mutates or wakes the pump.
+   */
+  snapshot(): QueueSnapshotEntry[] {
+    return this.entries.map((entry) => ({
+      seq: entry.seq,
+      id: entry.order,
+      lane: entry.lane,
+      text: entry.text ?? '',
+      ready: entry.ready,
+    }))
+  }
+
+  /**
+   * Apply a planner's queue adjudication. Only entries still waiting are
+   * addressable: a started utterance can no longer be dropped here, it can only
+   * be faded out by an interrupt. Unknown/duplicate ids are ignored, never
+   * guessed, so a stale plan can only ever be a no-op.
+   */
+  applyQueuePlan(plan: readonly QueuePlanItem[]): QueuePlanOutcome {
+    const applied: QueuePlanItem[] = []
+    const ignored: Array<{ id: number; reason: string }> = []
+    const seen = new Set<number>()
+    for (const item of plan.slice(0, 16)) {
+      const id = Math.trunc(Number(item.id))
+      if (!Number.isInteger(id) || id < 0) { ignored.push({ id, reason: 'invalid-id' }); continue }
+      if (seen.has(id)) { ignored.push({ id, reason: 'duplicate' }); continue }
+      seen.add(id)
+      const entry = this.entries.find((candidate) => candidate.order === id)
+      if (!entry) { ignored.push({ id, reason: 'unknown-id' }); continue }
+      if (entry.delivered) { ignored.push({ id, reason: 'started' }); continue }
+      if (item.action === 'keep') { applied.push({ id, action: 'keep' }); continue }
+      if (item.action === 'drop') {
+        this.drop(entry)
+        applied.push({ id, action: 'drop' })
+        continue
+      }
+      if (item.action === 'raise') {
+        const priority = Number(item.priority)
+        if (!Number.isFinite(priority)) { ignored.push({ id, reason: 'invalid-priority' }); continue }
+        entry.priority = Math.max(-1, Math.min(1_000_000, Math.trunc(priority)))
+        applied.push({ id, action: 'raise', priority: entry.priority })
+        continue
+      }
+      ignored.push({ id, reason: 'invalid-action' })
+    }
+    this.orderEntries()
+    this.emit()
+    this.drain()
+    return { applied, ignored }
+  }
+
   private setMode(entry: Entry, mode: PromptMode): void {
     if (this.closed || entry.dropped || entry.delivered) return
     entry.modeOverride = mode
@@ -167,7 +269,16 @@ export class SpeechScheduler {
   }
 
   private remove(entry: Entry): void {
+    this.settleHold(entry)
     this.entries = this.entries.filter((item) => item !== entry)
+  }
+
+  /** Release a pump awaiting this entry's external hold, exactly once. */
+  private settleHold(entry: Entry): void {
+    entry.holdSettled = true
+    const wake = entry.wakeHold
+    entry.wakeHold = undefined
+    wake?.()
   }
 
   private applyControl(control: QueueControl, entry: Entry): void {
@@ -194,6 +305,9 @@ export class SpeechScheduler {
     const canonical = target === '*' ? '*' : (this.options.resolveSpeaker?.(target) ?? target)
     if (canonical === '我') return
 
+    for (const item of this.entries) {
+      if (item.lane === 'guest' && (canonical === '*' || item.label === canonical)) this.settleHold(item)
+    }
     this.entries = this.entries.filter((item) => {
       if (item.lane !== 'guest') return true
       return !(canonical === '*' || item.label === canonical)
@@ -202,6 +316,7 @@ export class SpeechScheduler {
   }
 
   private dropAll(): void {
+    for (const entry of this.entries) this.settleHold(entry)
     this.entries = []
   }
 
@@ -214,8 +329,20 @@ export class SpeechScheduler {
     })
   }
 
+  /** Stable priority order; equal priorities keep their arrival token. */
+  private orderEntries(): void {
+    this.entries.sort((left, right) => {
+      const leftPriority = left.priority ?? Number.MAX_SAFE_INTEGER
+      const rightPriority = right.priority ?? Number.MAX_SAFE_INTEGER
+      if (leftPriority !== rightPriority) return leftPriority - rightPriority
+      if (left.order !== right.order) return left.order - right.order
+      return left.seq - right.seq
+    })
+  }
+
   private async pump(): Promise<void> {
     while (this.entries.length > 0) {
+      this.orderEntries()
       const entry = this.entries[0]!
       if (!entry.ready) return
       if (entry.hold && !entry.holdSettled) {
@@ -226,6 +353,9 @@ export class SpeechScheduler {
       }
       this.entries.shift()
       entry.delivered = true
+      // The entry just left the queue: without this the status line keeps
+      // showing the pre-shift count for the whole time it is being spoken.
+      this.emit()
       if (entry.dropped || !entry.text) {
         this.emit()
         continue

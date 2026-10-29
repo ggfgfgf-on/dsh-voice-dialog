@@ -69,6 +69,29 @@ test('rate is forwarded to each synthesis call', async () => {
   await queue.close()
 })
 
+test('block metadata survives the frame and a length-cut block gets a pause', async () => {
+  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural' })
+  let synthesized = ''
+  queue.tts = {
+    setMetadata: async () => undefined,
+    toStream: async (text) => {
+      synthesized = text
+      return { audioStream: (async function* () { yield Buffer.from([0xff, 0xfb, 0x90, 0x64]) })() }
+    },
+    close: async () => undefined,
+  }
+  const frames = []
+  queue.subscribe((frame) => frames.push(frame))
+  queue.enqueue('session-block', '没有标点的块', 'reply-block', 7, { sentenceId: 3, chunkIndex: 1 })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(synthesized, '没有标点的块，')
+  assert.equal(frames.length, 1)
+  assert.equal(frames[0].text, '没有标点的块')
+  assert.equal(frames[0].sentenceId, 3)
+  assert.equal(frames[0].chunkIndex, 1)
+  await queue.close()
+})
+
 test('a transient synthesis failure retries on a fresh attempt', async () => {
   const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural', synthAttempts: 2, retryDelayMs: 1 })
   let calls = 0

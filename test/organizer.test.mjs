@@ -23,10 +23,10 @@ const request = {
   queued: 1,
 }
 
-test('parses the three actions, fences, and rejects junk', () => {
+test('parses the documented actions, fences, and rejects junk', () => {
   const fence = String.fromCharCode(96).repeat(3)
   assert.equal(normalizeOrganizerAction('INTERRUPT'), 'interrupt')
-  assert.equal(normalizeOrganizerAction('drop'), null)
+  assert.equal(normalizeOrganizerAction('drop'), 'drop')
   assert.deepEqual(parseOrganizerResponse(fence + 'json\n{"action":"interrupt"}\n' + fence), {
     action: 'interrupt', reason: '',
   })
@@ -111,6 +111,26 @@ test('queue override leaves the existing policy alone', async () => {
   hold.resolve()
   await tick()
   assert.deepEqual(deliveries, [{ text: '普通一句', mode: 'queue' }])
+})
+
+test('a queue plan survives the organizer plan wrapper', async () => {
+  const organizer = new SpeechOrganizer(async () => ({
+    action: 'queue',
+    queuePlan: [
+      { id: 3, action: 'drop' },
+      { id: 4, action: 'raise', priority: 2 },
+      { id: 'junk', action: 'drop' },
+    ],
+    reason: '整理队列',
+  }), { timeoutMs: 200 })
+  const plan = await organizer.plan({ ...request, queued: 2, queue: [
+    { lane: 'owner', text: '旧的一句' },
+    { lane: 'guest', text: '客人的一句' },
+  ] })
+  assert.deepEqual(plan.queuePlan, [
+    { id: 3, action: 'drop' },
+    { id: 4, action: 'raise', priority: 2 },
+  ])
 })
 
 test('ignore drops only that entry', async () => {

@@ -11,6 +11,52 @@ export interface SpeakerControl {
 
 export const MAX_SPEAKER_NAME = 24
 
+/** Similarity below which the audio cannot plausibly be the enrolled owner. */
+export const OWNER_PLAUSIBLE_FLOOR = 0.35
+
+export type SpeakerDecision = 'owner' | 'named' | 'fallback'
+
+export interface SpeakerDecisionInput {
+  /** Whether an owner profile is enrolled at all. */
+  ownerEnrolled: boolean
+  /** Cosine similarity to the owner profile (0 when absent). */
+  ownerSimilarity: number
+  /** Displayed threshold. Only a fallback for a named profile's own threshold. */
+  threshold?: number
+  /** Best named profile and the threshold it must clear on its own. */
+  namedSimilarity?: number
+  namedThreshold?: number
+  /** A named profile must beat the owner by at least this much. */
+  marginToOwner: number
+  /** Optional override for the owner plausibility floor. */
+  ownerFloor?: number
+}
+
+/**
+ * Owner-first voiceprint vote. A named profile can never win on an absolute
+ * threshold alone: it must both clear its own threshold and beat the owner by
+ * the configured margin. If no named profile is decisively better, a plausible
+ * owner match wins even when it is below the displayed threshold.
+ */
+export function decideSpeaker(input: SpeakerDecisionInput): SpeakerDecision {
+  const ownerSimilarity = Number.isFinite(input.ownerSimilarity) ? input.ownerSimilarity : 0
+  const margin = Number.isFinite(input.marginToOwner) ? Math.max(0, input.marginToOwner) : 0
+  const ownerFloor = typeof input.ownerFloor === 'number' && Number.isFinite(input.ownerFloor)
+    ? input.ownerFloor
+    : OWNER_PLAUSIBLE_FLOOR
+  const namedSimilarity = input.namedSimilarity
+  const namedThreshold = typeof input.namedThreshold === 'number' && Number.isFinite(input.namedThreshold)
+    ? input.namedThreshold
+    : input.threshold
+  const namedDecisive = typeof namedSimilarity === 'number' && Number.isFinite(namedSimilarity)
+    && typeof namedThreshold === 'number' && Number.isFinite(namedThreshold)
+    && namedSimilarity >= namedThreshold
+    && namedSimilarity >= ownerSimilarity + margin
+  if (namedDecisive) return 'named'
+  if (input.ownerEnrolled && ownerSimilarity >= ownerFloor) return 'owner'
+  return 'fallback'
+}
+
 function cleanName(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const name = value.trim()

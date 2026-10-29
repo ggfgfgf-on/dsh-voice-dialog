@@ -1,12 +1,14 @@
 /** Local speaker verification and online speaker labeling (CAM++ via sherpa-onnx). */
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { request as httpsRequest } from 'node:https'
 import { pipeline } from 'node:stream/promises'
 import * as httpsProxyAgent from 'https-proxy-agent'
+import { decideSpeakerGate, selectSpeechWindows, type OverlapDecision } from './separation-gate.js'
+import { decideSpeaker, OWNER_PLAUSIBLE_FLOOR } from './speaker-policy.js'
 
 const require = createRequire(import.meta.url)
 
@@ -20,17 +22,22 @@ const SAMPLE_RATE = 16000
 const MIN_ENROLL_SAMPLES = SAMPLE_RATE
 /** Segments shorter than this cannot produce a stable speaker embedding. */
 const MIN_IDENTIFY_SAMPLES = Math.floor(SAMPLE_RATE * 0.35)
-const DEFAULT_THRESHOLD = 0.52
-const CLUSTER_THRESHOLD = 0.5
+const DEFAULT_THRESHOLD = 0.5
+const CLUSTER_THRESHOLD = 0.55
 const MAX_CLUSTERS = 4
 /** Conservative EWMA weights: one unusual segment cannot dominate the owner template. */
 const OWNER_ADAPT_WEIGHT = 0.1
 const OWNER_SOFT_ADAPT_WEIGHT = 0.03
-/** Soft owner floors, with a small relaxation after a preceding owner turn. */
-const OWNER_SOFT_FLOOR = 0.4
-const OWNER_SOFT_FLOOR_AFTER_OWNER = 0.35
-const OWNER_GUEST_MARGIN = 0.06
-const OWNER_HISTORY_FLOOR = 0.45
+/** A guest must beat the owner by this much before the owner loses the turn. */
+const OWNER_GUEST_MARGIN = 0.12
+/** When the owner is this plausible, a guest needs a decisive lead to win: one
+ *  early mislabel must never grow a cluster that keeps stealing the owner. */
+const OWNER_PRIORITY_FLOOR = 0.5
+const OWNER_STRONG_MARGIN = 0.15
+/** Extra margin once the owner is already a strong match; keeps the ratio when the base moves. */
+const OWNER_STRONG_EXTRA = OWNER_STRONG_MARGIN - OWNER_GUEST_MARGIN
+const OWNER_MARGIN_MIN = 0.04
+const OWNER_MARGIN_MAX = 0.3
 const MAX_SESSION_LABELS = 128
 const NAMED_THRESHOLD_FLOOR = 0.55
 const MAX_NAMED_SPEAKERS = 12
@@ -60,6 +67,12 @@ export interface IdentifyResult {
   owner: boolean
   label: string
   similarity: number
+}
+
+export interface OverlapResult extends OverlapDecision {
+  ready: boolean
+  windows: Array<{ startMs: number; endMs: number }>
+  activeMs: number
 }
 
 interface StoredSpeaker {
@@ -105,6 +118,24 @@ function normalize(vector: Float32Array): Float32Array {
   const out = new Float32Array(vector.length)
   for (let i = 0; i < vector.length; i++) out[i] = vector[i] / norm
   return out
+}
+
+/** Clamp a user-supplied margin into the range the settings slider offers. */
+export function clampMargin(value: unknown): number {
+  const number = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(number)) return OWNER_GUEST_MARGIN
+  return Math.min(OWNER_MARGIN_MAX, Math.max(OWNER_MARGIN_MIN, Math.round(number * 100) / 100))
+}
+
+/** Every identification decision lands here, so a mislabel can be explained instead of guessed. */
+const DECISION_LOG = join(tmpdir(), 'dsh-voice-voiceprint.jsonl')
+const DECISION_LOG_LIMIT = 8 * 1024 * 1024
+
+function noteDecision(entry: Record<string, unknown>): void {
+  try {
+    try { if (statSync(DECISION_LOG).size > DECISION_LOG_LIMIT) return } catch { /* first line */ }
+    appendFileSync(DECISION_LOG, JSON.stringify(entry) + '\n', 'utf8')
+  } catch { /* diagnostics must never break speech */ }
 }
 
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
@@ -211,6 +242,9 @@ export class VoiceprintService {
   private readonly lastSpeakerLabels = new Map<string, string>()
   private chain: Promise<unknown> = Promise.resolve()
   private readonly injectedExtractor: Extractor | undefined
+
+  /** Scores behind the most recent decision, logged by identify(). */
+  private lastDecision?: Record<string, unknown>
 
   constructor(options: { dataDir?: string; modelPath?: string; extractor?: Extractor } = {}) {
     this.dataDir = options.dataDir ?? join(homedir(), '.dsh', 'voice-dialog')
@@ -331,6 +365,49 @@ export class VoiceprintService {
   /** Load the native model before the first utterance, without blocking startup. */
   warm(): void {
     if (this.status().ready) this.ensureExtractor()
+  }
+
+  /**
+   * Conservative single-vs-overlap probe for the separation fast path.
+   *
+   * It only compares two chunks from the same utterance; it never updates the
+   * owner template or creates guest clusters. A caller must treat anything
+   * other than `singleSpeaker === true` as "run separation".
+   */
+  async overlap(samples: Float32Array): Promise<OverlapResult> {
+    const selection = selectSpeechWindows(samples)
+    const windows = selection.windows.map((window) => ({
+      startMs: Math.round(window.startSample * 1000 / SAMPLE_RATE),
+      endMs: Math.round(window.endSample * 1000 / SAMPLE_RATE),
+    }))
+    if (!this.status().ready) {
+      return {
+        ready: false, windows, activeMs: Math.round(selection.activeSamples * 1000 / SAMPLE_RATE),
+        suspected: true, singleSpeaker: false, confident: false,
+        reason: 'voiceprint-not-ready', threshold: 0.62,
+      }
+    }
+    if (selection.windows.length < 2) {
+      return {
+        ready: true, windows, activeMs: Math.round(selection.activeSamples * 1000 / SAMPLE_RATE),
+        suspected: true, singleSpeaker: false, confident: false,
+        reason: 'insufficient-audio', threshold: 0.62,
+      }
+    }
+    const embeddings: Float32Array[] = []
+    for (const window of selection.windows) embeddings.push(await this.compute(window.samples))
+    const selfSimilarities = [cosineSimilarity(embeddings[0]!, embeddings[1]!)]
+    const owner = this.ownerEmbedding()
+    const ownerSimilarity = owner === null
+      ? undefined
+      : (cosineSimilarity(embeddings[0]!, owner) + cosineSimilarity(embeddings[1]!, owner)) / 2
+    const decision = decideSpeakerGate({ selfSimilarities, ...(ownerSimilarity === undefined ? {} : { ownerSimilarity }) })
+    return {
+      ready: true,
+      windows,
+      activeMs: Math.round(selection.activeSamples * 1000 / SAMPLE_RATE),
+      ...decision,
+    }
   }
 
   async prepare(): Promise<VoiceprintStatus> {
@@ -525,51 +602,122 @@ export class VoiceprintService {
     }
   }
 
+  /** Public entry: decide who spoke, then log what the decision was based on. */
   async identify(
     samples: Float32Array,
-    options: { sessionId?: string; threshold?: number; adapt?: boolean; excludeLabels?: string[] } = {},
+    options: {
+      sessionId?: string
+      threshold?: number
+      adapt?: boolean
+      excludeLabels?: string[]
+      margin?: number
+    } = {},
+  ): Promise<IdentifyResult> {
+    this.lastDecision = undefined
+    const identity = await this.identifyDecision(samples, options)
+    noteDecision({
+      at: new Date().toISOString(),
+      sessionId: (options.sessionId ?? '').trim() || 'default',
+      samples: samples.length,
+      label: identity.label,
+      owner: identity.owner,
+      similarity: Number(identity.similarity.toFixed(4)),
+      ...this.lastDecision,
+    })
+    return identity
+  }
+
+  async identifyDecision(
+    samples: Float32Array,
+    options: {
+    sessionId?: string
+    threshold?: number
+    adapt?: boolean
+    excludeLabels?: string[]
+    /** How much more similar a guest must be before it steals the owner's label. */
+    margin?: number
+  } = {},
   ): Promise<IdentifyResult> {
     if (samples.length < MIN_IDENTIFY_SAMPLES) throw new Error('这段话太短，无法判断声纹')
     const embedding = await this.compute(samples)
     const owner = this.ownerEmbedding()
     const threshold = Math.min(0.85, Math.max(0.3, options.threshold ?? DEFAULT_THRESHOLD))
     const sessionId = (options.sessionId ?? '').trim() || 'default'
-    const previousLabel = this.lastSpeakerLabels.get(sessionId)
+
+    // Without an owner template nothing may be learned from this utterance: the
+    // first speaker could be a guest and would then own the profile forever.
+    // Explicit enrollment is the only way in, so this stays memory-only (no
+    // store write, no template, no cluster) and every unnamed voice is treated
+    // as the owner with degraded certainty — never as 说话人N.
+    if (owner === null) {
+      const namedSpeakers = this.loadSpeakers()
+      const named = this.bestNamed(namedSpeakers, embedding)
+      const namedThreshold = Math.max(NAMED_THRESHOLD_FLOOR, threshold)
+      const decision = decideSpeaker({
+        ownerEnrolled: false,
+        ownerSimilarity: 0,
+        threshold,
+        namedSimilarity: named.speaker === undefined ? undefined : named.similarity,
+        namedThreshold,
+        marginToOwner: 0,
+      })
+      this.lastDecision = {
+        decision: decision === 'named' ? 'named' : 'owner',
+        ownerSimilarity: 0,
+        threshold,
+        marginToOwner: 0,
+        namedName: named.speaker?.name,
+        namedSimilarity: named.speaker === undefined ? undefined : named.similarity,
+        seeded: false,
+        degraded: true,
+      }
+      if (decision === 'named' && named.speaker) {
+        this.rememberLabel(sessionId, named.speaker.name)
+        return { enrolled: false, owner: false, label: named.speaker.name, similarity: named.similarity }
+      }
+      this.rememberLabel(sessionId, '我')
+      return { enrolled: false, owner: true, label: '我', similarity: 0 }
+    }
+
     const exclude = new Set((options.excludeLabels ?? []).filter((label) => typeof label === 'string'))
     const guest = this.bestGuest(sessionId, embedding, exclude)
     const namedSpeakers = this.loadSpeakers()
     const named = this.bestNamed(namedSpeakers, embedding)
     const namedThreshold = Math.max(NAMED_THRESHOLD_FLOOR, threshold)
-    const namedIsClearlyStronger = owner !== null && named.speaker !== undefined
-      && named.similarity >= namedThreshold
-      && named.similarity > cosineSimilarity(embedding, owner) + OWNER_GUEST_MARGIN
-
-    if (owner) {
-      const similarity = cosineSimilarity(embedding, owner)
-      if (similarity >= threshold && !namedIsClearlyStronger) {
-        if (options.adapt !== false) this.adaptOwner(embedding, OWNER_ADAPT_WEIGHT)
-        this.rememberLabel(sessionId, '我')
-        return { enrolled: true, owner: true, label: '我', similarity }
-      }
-
-      // A lower match can still be the owner when no guest cluster is clearly
-      // closer. A preceding owner turn lowers the floor slightly because
-      // dialogue continuity is useful evidence for short utterances.
-      const softFloor = previousLabel === '我'
-        ? OWNER_SOFT_FLOOR_AFTER_OWNER
-        : OWNER_SOFT_FLOOR
-      const guestIsClearlyStronger = (guest.cluster !== undefined
-        && guest.similarity > similarity + OWNER_GUEST_MARGIN) || namedIsClearlyStronger
-      const priorOwnerException = previousLabel === '我' && similarity >= OWNER_HISTORY_FLOOR
-        && !namedIsClearlyStronger
-      if (similarity >= softFloor && (!guestIsClearlyStronger || priorOwnerException)) {
-        if (options.adapt !== false) this.adaptOwner(embedding, OWNER_SOFT_ADAPT_WEIGHT)
-        this.rememberLabel(sessionId, '我')
-        return { enrolled: true, owner: true, label: '我', similarity }
-      }
+    const ownerSimilarity = owner === null ? 0 : cosineSimilarity(embedding, owner)
+    // The owner is the default speaker of this microphone. A named guest takes
+    // the turn only with a decisive lead, and a larger one while the owner match
+    // is already plausible.
+    const marginToOwner = clampMargin(options.margin) + (ownerSimilarity >= OWNER_PRIORITY_FLOOR ? OWNER_STRONG_EXTRA : 0)
+    const decision = decideSpeaker({
+      ownerEnrolled: owner !== null,
+      ownerSimilarity,
+      threshold,
+      namedSimilarity: named.speaker === undefined ? undefined : named.similarity,
+      namedThreshold,
+      marginToOwner,
+      ownerFloor: OWNER_PLAUSIBLE_FLOOR,
+    })
+    this.lastDecision = {
+      decision,
+      ownerSimilarity,
+      threshold,
+      marginToOwner,
+      namedName: named.speaker?.name,
+      namedSimilarity: named.speaker === undefined ? undefined : named.similarity,
+      clusterLabel: guest.cluster?.label,
+      clusterSimilarity: guest.similarity,
     }
 
-    if (named.speaker && named.similarity >= namedThreshold) {
+    if (decision === 'owner') {
+      if (options.adapt !== false) {
+        this.adaptOwner(embedding, ownerSimilarity >= threshold ? OWNER_ADAPT_WEIGHT : OWNER_SOFT_ADAPT_WEIGHT)
+      }
+      this.rememberLabel(sessionId, '我')
+      return { enrolled: true, owner: true, label: '我', similarity: ownerSimilarity }
+    }
+
+    if (decision === 'named' && named.speaker) {
       this.rememberLabel(sessionId, named.speaker.name)
       return { enrolled: true, owner: false, label: named.speaker.name, similarity: named.similarity }
     }

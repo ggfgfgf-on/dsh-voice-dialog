@@ -2,27 +2,90 @@
 import * as React from 'react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
-  Button, IconCloseOutlineRegular, IconMicrophoneOutlineRegular, IconStopFillRegular, Tooltip,
+  Button, IconCloseOutlineRegular, IconMicrophoneOutlineRegular, IconSettingsOutlineRegular,
+  IconStopFillRegular, Modal, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import speechRemote from './speech-remote.js'
-import { MicrophoneLoop, recordVoiceSample } from './mic.ts'
+import { MicrophoneLoop, recordVoiceSample, type MicPlaybackSnapshot } from './mic.ts'
 import { ContinuousSeparation, dedupeTranscript, type ContinuousSegment } from './continuous-separation.ts'
-import { getPreferences, setPreferences, subscribePreferences, type VoiceDialogPreferences } from './preferences.ts'
+import {
+  getPreferences, setPreferences, subscribePreferences,
+  SPEAKER_THRESHOLD_MAX, SPEAKER_THRESHOLD_MIN, type VoiceDialogPreferences,
+} from './preferences.ts'
+import { VolumeRig } from './volume-gain.ts'
+import { createVolumeReporter } from './volume-report.ts'
 import { SpeechScheduler, type GuestMode } from './scheduler.ts'
-import { SpeechOrganizer, type OrganizerRequest } from './organizer.ts'
+import {
+  applyReorganization, ORGANIZER_PENDING_ITEM_CHARS, ORGANIZER_PENDING_LIMIT,
+  ORGANIZER_PENDING_TOTAL_CHARS, shouldDeliverOrganizerAction, SpeechOrganizer,
+  type OrganizerRequest,
+} from './organizer.ts'
 import { parseQueueControl } from './queue-control.ts'
+import {
+  decideBargeIn, isSameSentence, orderBargeInFrames, splitAtSentenceBoundary,
+} from './barge-in.ts'
+import { decideInput, inputGateTraceFields, ruleInputDecision, type InputGateDecision } from './input-gate.ts'
+import { resumeDelayForUtterance, YIELD_RESUME_AFTER_SPEECH_MS } from './yield.ts'
+import { echoGate, noiseGate, type SpokenSample } from './gates.ts'
+import { FrameWindow, orderOf, playBlockReason, shouldPlayFrame } from './frame-order.ts'
+import { PlanLedger, shouldApplyPlan, shouldRunPlanner, SpeechPlanner, type PlannerRequest } from './planner.ts'
 import { SpeakerPolicyStore } from './speaker-policy.ts'
 import { audioBase64, decodeWaveBase64, encodeWave } from './wav.ts'
+import { encodeAudioFrames, postAudioFrames, type BinaryTransportState } from './audio-transport.ts'
+import {
+  buildUtteranceRecord, createUtteranceTrace, markUtteranceStage, noteUtteranceText,
+  type SeparationLatencyDetail, type TraceInput, type UtteranceTrace, type UtteranceTiming,
+} from './latency.ts'
+import {
+  canReuseSpeculativeAsr, firstDelivery, shouldCallGate,
+} from './routing.ts'
+
+/** Gain telemetry: batched samples to the host JSONL log; never audio or transcript. */
+const volumeReporter = createVolumeReporter({
+  post: (payload) => {
+    try {
+      void fetch(apiUrl('/volume-log'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        keepalive: true,
+      }).catch(() => undefined)
+    } catch { /* telemetry must never break playback */ }
+  },
+  batchMs: 300,
+})
 
 export const inject = ['remote']
 
+/** Edge TTS speech is mixed quiet; this brings it to normal media loudness. */
 const BOOTSTRAP_BASE = '/dsh-voice-dialog-api'
 const BUNDLE_ID = 'dsh-voice-dialog'
+/** Ducking, cut fades and volume live in volume-gain.ts: one writer, one target. */
+/** Tail-silence presets; any other value may be typed into the custom field. */
+const PAUSE_PRESETS: ReadonlyArray<readonly [number, string]> = [
+  [600, '0.6 秒（极快，容易截话）'],
+  [900, '0.9 秒（默认）'],
+  [1200, '1.2 秒（快）'],
+  [1600, '1.6 秒（稳）'],
+  [2000, '2.0 秒（少截话）'],
+  [2500, '2.5 秒（慢，适合思考）'],
+  [3000, '3.0 秒（很慢）'],
+  [4000, '4.0 秒（最长）'],
+]
 
 interface VoiceFrame {
   sessionId: string
+  /** Host-elected playback client; absent when no client claimed the session. */
+  owner?: string
+  /** Monotonic within the session; the client uses it to discard replays. */
   seq: number
+  /** Reply round, incremented once per assistant answer by the host. */
+  epoch: number
   replyId?: string
+  /** Same-sentence read-aloud blocks share this id. */
+  sentenceId?: number
+  /** Zero-based position inside the sentence. */
+  chunkIndex?: number
   text: string
   audio: string
   error?: string
@@ -92,7 +155,24 @@ interface SeparationResult {
   ok: boolean
   separated: boolean
   elapsedMs: number
+  queueMs?: number
+  workerMs?: number
+  wallMs?: number
   sources: SeparatedSource[]
+}
+
+interface OverlapProbe {
+  ok?: boolean
+  ready: boolean
+  singleSpeaker: boolean
+  suspected: boolean
+  confident: boolean
+  reason: string
+  windows: Array<{ startMs: number; endMs: number }>
+  activeMs: number
+  minSimilarity?: number
+  ownerSimilarity?: number
+  threshold: number
 }
 
 /** Edge TTS voices exposed by the settings page. */
@@ -127,7 +207,7 @@ function apiUrl(path: string): string {
  * subagent results are spoken only for sessions that report active.
  */
 function reportVoiceState(sessionId: string, active: boolean, unloading = false): void {
-  const body = JSON.stringify({ sessionId, active })
+  const body = JSON.stringify({ sessionId, active, clientId: CLIENT_ID })
   try {
     if (unloading && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
       navigator.sendBeacon(apiUrl('/voice-state'), new Blob([body], { type: 'application/json' }))
@@ -141,6 +221,29 @@ function reportVoiceState(sessionId: string, active: boolean, unloading = false)
     headers: { 'content-type': 'application/json' },
     body,
     keepalive: !active,
+  }).catch(() => undefined)
+}
+
+/**
+ * Tell the host when someone starts and stops talking, so the model can sense
+ * the floor instead of being told about it by a separate judge.
+ */
+function reportSpeech(sessionId: string, speech: 'start' | 'end' | 'speaker', speaker?: string): void {
+  void fetch(apiUrl('/voice-state'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId, clientId: CLIENT_ID, speech, speaker }),
+    keepalive: true,
+  }).catch(() => undefined)
+}
+
+/** Whether the assistant's own mouth is open right now. */
+function reportPlayback(sessionId: string, playing: boolean): void {
+  void fetch(apiUrl('/voice-state'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId, clientId: CLIENT_ID, playback: playing }),
+    keepalive: true,
   }).catch(() => undefined)
 }
 
@@ -162,6 +265,16 @@ function loadConfig(): Promise<HostConfig> {
       })
   }
   return configPromise
+}
+
+/** An empty failure must still read as a sentence, never as the word undefined. */
+function failureText(failure: unknown): string {
+  if (failure instanceof Error) {
+    const message = failure.message.trim()
+    if (message) return message
+  }
+  if (typeof failure === 'string' && failure.trim()) return failure.trim()
+  return '连接断了：刷新这个页面，声音和识别都会回来。'
 }
 
 async function errorFrom(response: Response, fallback: string): Promise<Error> {
@@ -198,6 +311,18 @@ async function warmSeparation(): Promise<void> {
   if (!response.ok) throw await errorFrom(response, '分离模型预热失败')
 }
 
+/** Fire-and-forget latency sample; a lost sample must never break speech. */
+async function postLatency(record: unknown): Promise<void> {
+  try {
+    await fetch(apiUrl('/latency'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(record),
+      keepalive: true,
+    })
+  } catch { /* logging is best-effort */ }
+}
+
 async function organizeSpeech(request: OrganizerRequest, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(apiUrl('/organize'), {
     method: 'POST',
@@ -209,9 +334,42 @@ async function organizeSpeech(request: OrganizerRequest, signal: AbortSignal): P
   return await response.json()
 }
 
+/** Slow planner layer: never awaited on the reply path. */
+async function planSpeech(request: PlannerRequest, signal: AbortSignal): Promise<unknown> {
+  const response = await fetch(apiUrl('/plan'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+    signal,
+  })
+  if (!response.ok) throw await errorFrom(response, '规划层失败')
+  return await response.json()
+}
+
+/**
+ * Raw PCM16 frames instead of base64 WAV inside JSON: one Int16 pass on this
+ * side, one pass back to Float32 on the host, and 25% less to upload.
+ * A host that predates the route (404/400) or a dropped connection flips the
+ * flag for the rest of the page load and every later call uses the JSON path.
+ */
+const binaryTransport: BinaryTransportState = { broken: false }
+
 async function separateSegment(
-  samples: Float32Array, sessionId: string, threshold: number, identify = true,
+  samples: Float32Array, sessionId: string, threshold: number, identify = true, margin = 0.12,
 ): Promise<SeparationResult> {
+  const binary = await postAudioFrames(
+    fetch as any,
+    apiUrl('/separation/separate-binary'),
+    samples,
+    {
+      'x-voice-session': sessionId,
+      'x-voice-threshold': String(threshold),
+      'x-voice-margin': String(margin),
+      'x-voice-identify': identify ? '1' : '0',
+    },
+    binaryTransport,
+  )
+  if (binary) return binary as SeparationResult
   const response = await fetch(apiUrl('/separation/separate'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -219,6 +377,7 @@ async function separateSegment(
       audioBase64: audioBase64(encodeWave(samples)),
       sessionId,
       threshold,
+      margin,
       identify,
     }),
   })
@@ -236,7 +395,7 @@ async function enrollVoiceprint(samples: Float32Array): Promise<void> {
 }
 
 async function identifySpeaker(
-  samples: Float32Array, sessionId: string, threshold: number,
+  samples: Float32Array, sessionId: string, threshold: number, margin = 0.12,
 ): Promise<SpeakerIdentity> {
   const response = await fetch(apiUrl('/voiceprint/identify'), {
     method: 'POST',
@@ -245,10 +404,21 @@ async function identifySpeaker(
       audioBase64: audioBase64(encodeWave(samples)),
       sessionId,
       threshold,
+      margin,
     }),
   })
   if (!response.ok) throw await errorFrom(response, '声纹识别失败')
   return await response.json() as SpeakerIdentity
+}
+
+async function probeSpeakerOverlap(samples: Float32Array): Promise<OverlapProbe> {
+  const response = await fetch(apiUrl('/voiceprint/overlap'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ audioBase64: audioBase64(encodeWave(samples)) }),
+  })
+  if (!response.ok) throw await errorFrom(response, '声纹重叠检测失败')
+  return await response.json() as OverlapProbe
 }
 
 async function forgetVoiceprint(): Promise<void> {
@@ -291,38 +461,90 @@ function base64ToAudioUrl(base64: string): string {
 }
 
 /**
- * Page-level player. A barge-in only ducks this gain: playback is never
- * cancelled by the user speaking, so the assistant can finish its thought
- * while the transcript is steered into the running model.
+ * Page-level player. A barge-in holds the sentence where it is: the microphone
+ * onset pauses the audio before any transcript exists, then the routing
+ * decision either resumes the same spot or abandons the sentence for the new
+ * answer. Nothing is ever re-read from the top after an interruption.
  */
 class TtsPlayer {
   private readonly audio = new Audio()
   private context: AudioContext | undefined
   private gain: GainNode | undefined
+  /** Fixed makeup gain: Edge TTS arrives noticeably quieter than other media. */
+  private boost: GainNode | undefined
+  /** Limiter after the boost, so a louder voice still cannot clip. */
+  private limiter: DynamicsCompressorNode | undefined
   private source: MediaElementAudioSourceNode | undefined
   private readonly queue: VoiceFrame[] = []
   private prefs: VoiceDialogPreferences = getPreferences()
   private url: string | undefined
   private playing = false
-  private ducked = false
   private blocked = false
   private active = false
   private muted = false
   private cutting = false
   private afterCut: VoiceFrame[] = []
   private cutReplyId: string | undefined
+  /** Owner barge-in is waiting for the current sentence to finish. */
+  private bargeInActive = false
+  private bargeInOldReplyId: string | undefined
+  private bargeInNewReplyId: string | undefined
+  /** Unread tail of the old answer, held for playback after the new answer. */
+  private deferred: VoiceFrame[] = []
+  private deferredTimer: ReturnType<typeof setTimeout> | null = null
   private cutToken = 0
+  /** Microphone onset holds the audible sentence; the decision releases it. */
+  private yielded = false
+  private yieldFrame: VoiceFrame | undefined
+  private yieldTimer: ReturnType<typeof setTimeout> | null = null
   private currentFrame: VoiceFrame | undefined
   private sessionId: string | undefined
-  private volumeOverride: number | undefined
+  /**
+   * The single writer of playback gain. Ducking, cut fades and volume commands
+   * all go through it, so no interruption can multiply the attenuation: the
+   * target is always recomputed as volume or volume*duckLevel.
+   */
+  private readonly gainRig = new VolumeRig({
+    context: () => this.context,
+    param: () => this.gain?.gain,
+    volume: () => this.prefs.volume,
+    duckLevel: () => this.prefs.duckLevel,
+    sink: (sample) => volumeReporter.report(sample),
+  })
+  /** Latency hook: called when a frame actually starts playing. */
+  onPlay: ((frame: VoiceFrame) => void) | undefined
+  /** Perception hook: the mouth opening and closing, as the host sees it. */
+  onPlayback: ((playing: boolean, sessionId: string | undefined) => void) | undefined
   private lastReplyId: string | undefined
+  /** Reply id of the most recently queued frame, to detect a superseded answer. */
+  private lastQueuedReplyId: string | undefined
   private lastTexts: string[] = []
   private lastFrames: VoiceFrame[] = []
+  /** Recently spoken sentences, for self-echo detection. */
+  private readonly spoken: SpokenSample[] = []
+  /** Start of the current TTS frame; every frame resets the echo guard. */
+  private playbackStartedAt = 0
+  /** Monotonic frame watermark; a stale frame can never resurrect here. */
+  private readonly frameWindow = new FrameWindow()
+  private frameStats = { received: 0, dropped: 0, played: 0 }
   private readonly unsubscribe = subscribePreferences((value) => {
     this.prefs = value
+    if (this.boost) this.boost.gain.value = value.speechBoost
     if (!value.autoRead) this.clear()
     else this.applyGain()
   })
+
+  /** Live state for the microphone's self-echo gate. */
+  playbackState(): MicPlaybackSnapshot {
+    if (!this.playing || !this.active) return { playing: false }
+    const target = this.gainRig.target()
+    return {
+      playing: true,
+      startedAt: this.playbackStartedAt,
+      // Output estimate before ad-hoc loudness; 2.5x is the preference maximum.
+      level: Math.min(1, Math.max(0, target * this.prefs.speechBoost / 2.5)),
+    }
+  }
 
   async enable(): Promise<void> {
     this.ensureContext()
@@ -335,9 +557,17 @@ class TtsPlayer {
 
   /** Read-aloud is only live while the microphone is listening. */
   beginSession(sessionId: string): void {
+    this.abandonYield()
+    // A different conversation starts a new frame sequence; the same session
+    // must keep its watermark, otherwise a stopped/cut reply could revive.
+    if (this.sessionId !== undefined && this.sessionId !== sessionId) this.frameWindow.reset()
     this.sessionId = sessionId
     this.active = true
     this.muted = false
+    this.resetBargeIn(true)
+    // A duck left over from a previous session must not follow the mic into
+    // the new one, otherwise the first reply opens already quiet.
+    this.gainRig.beginSession()
     void this.enable()
   }
 
@@ -347,11 +577,120 @@ class TtsPlayer {
   /** Stop accepting new sentences; already queued audio keeps playing. */
   endSession(): void {
     this.active = false
+    this.abandonYield()
+    this.resetBargeIn(true)
   }
 
   /** True while a reply is audible or waiting to be read. */
   busy(): boolean {
-    return this.active && (this.playing || this.queue.length > 0 || this.cutting)
+    return this.active && (this.playing || this.queue.length > 0 || this.cutting || this.deferred.length > 0)
+  }
+
+  /**
+   * What the assistant still owes the listener, in speaking order. Index 0 is
+   * the sentence playing right now; the organizer may drop or reorder the rest.
+   */
+  pendingFrames(
+    limit = ORGANIZER_PENDING_LIMIT,
+    itemChars = ORGANIZER_PENDING_ITEM_CHARS,
+    totalChars = ORGANIZER_PENDING_TOTAL_CHARS,
+  ): VoiceFrame[] {
+    const rows = [
+      ...(this.playing && this.currentFrame ? [this.currentFrame] : []),
+      // New-answer frames first, then the preserved tail: this is the actual
+      // order the player will use, not a cosmetic display order.
+      ...orderBargeInFrames<VoiceFrame>(this.queue, this.deferred),
+      ...this.afterCut,
+    ]
+    const frames: VoiceFrame[] = []
+    let chars = 0
+    for (const frame of rows) {
+      if (frames.length >= limit) break
+      if (!frame || typeof frame.text !== 'string') continue
+      const clean = Array.from(frame.text.replace(/\s+/gu, ' ').trim())
+      if (clean.length === 0) continue
+      const text = clean.slice(0, itemChars).join('')
+      const length = Array.from(text).length
+      if (chars + length > totalChars) break
+      chars += length
+      frames.push(frame)
+    }
+    return frames
+  }
+
+  /**
+   * Mark an owner barge-in. Playback keeps running through the current
+   * sentence; only later sentences are held. No audio is cut mid-sentence.
+   */
+  beginOwnerBargeIn(): boolean {
+    if (!this.active || this.muted || this.cutting) return false
+    if (!this.playing || !this.currentFrame) return false
+    if (this.bargeInActive) {
+      this.abandonYield()
+      return true
+    }
+    const current = this.currentFrame
+    this.bargeInActive = true
+    this.bargeInOldReplyId = current.replyId
+    this.bargeInNewReplyId = undefined
+    this.clearDeferredTimer()
+    // The owner took the floor: the sentence stops where the listener's voice
+    // caught it, and no part of the old answer follows the new one. Finishing
+    // that sentence first is what read as a mechanical hand-off.
+    this.abandonYield()
+    this.queue.length = 0
+    this.deferred.length = 0
+    this.dropCurrent()
+    return true
+  }
+
+  /**
+   * Apply an organizer rewrite to sentences that have not started yet. Only
+   * frames captured by pendingFrames and still queued/deferred are touched, so
+   * a stale answer can never resurrect, duplicate or silently lose a sentence.
+   */
+  restructure(
+    snapshot: readonly VoiceFrame[],
+    fields: { dropSentences?: number[]; reorder?: number[] },
+  ): { dropped: number; reordered: boolean } {
+    const untouched = { dropped: 0, reordered: false }
+    if (!this.active || this.muted || this.cutting || snapshot.length === 0) return untouched
+    const plan = applyReorganization(snapshot.length, fields, {
+      chunkGroups: snapshot.map((frame) => frame.sentenceId),
+    })
+    const current = this.playing ? this.currentFrame : undefined
+    const queued = [...this.queue, ...this.deferred]
+    const droppedFrames = plan.dropped
+      .map((index) => snapshot[index])
+      .filter((frame): frame is VoiceFrame => frame !== undefined && frame !== current && queued.includes(frame))
+    // The sentence already being spoken always finishes first, regardless of a
+    // late plan. Forcing that prefix is what guarantees no mid-sentence cut.
+    const boundary = this.bargeInActive
+      ? splitAtSentenceBoundary(current, queued).finish
+      : []
+    const boundarySet = new Set(boundary)
+    const desired: VoiceFrame[] = [...boundary]
+    for (const index of plan.order) {
+      const frame = snapshot[index]
+      if (!frame || frame === current || !queued.includes(frame) || desired.includes(frame)) continue
+      desired.push(frame)
+    }
+    for (const frame of queued) if (!desired.includes(frame)) desired.push(frame)
+    const dropped = droppedFrames.length
+    const reordered = desired.some((frame, index) => queued[index] !== frame)
+    if (dropped === 0 && !reordered) return untouched
+    if (this.bargeInActive) {
+      const oldReplyId = this.bargeInOldReplyId
+      const playable = desired.filter((frame) => boundarySet.has(frame) || frame.replyId !== oldReplyId)
+      const held = desired.filter((frame) => !playable.includes(frame))
+      this.queue.splice(0, this.queue.length, ...playable)
+      this.deferred.splice(0, this.deferred.length, ...held)
+    } else {
+      this.queue.splice(0, this.queue.length, ...desired)
+      this.deferred.length = 0
+    }
+    if (!this.playing && this.queue.length > 0 && !this.blocked) this.playNext()
+    return { dropped, reordered }
   }
 
   /**
@@ -365,17 +704,9 @@ class TtsPlayer {
     const token = ++this.cutToken
     this.cutting = true
     this.cutReplyId = this.currentFrame?.replyId
-    const context = this.context
-    const gain = this.gain
-    if (gain && context) {
-      try {
-        gain.gain.cancelScheduledValues(context.currentTime)
-        gain.gain.setValueAtTime(gain.gain.value, context.currentTime)
-        gain.gain.linearRampToValueAtTime(0, context.currentTime + 0.25)
-      } catch {
-        // A closed context must not block the cut.
-      }
-    }
+    // One writer fades the sentence out and schedules its own recovery, so a
+    // fade to zero can never outlive the interruption.
+    this.gainRig.cutFade()
     setTimeout(() => {
       if (token !== this.cutToken) return
       if (!this.active || !isCurrent(expectedVersion)) {
@@ -387,18 +718,18 @@ class TtsPlayer {
         return
       }
       this.queue.length = 0
+      this.resetBargeIn(true)
       this.audio.pause()
       this.audio.onended = null
       this.audio.onerror = null
       this.cleanupUrl()
       try { window.speechSynthesis?.cancel() } catch { /* unsupported */ }
       this.playing = false
-      this.ducked = false
+      this.restore()
       this.blocked = false
       this.cutting = false
       const pending = this.afterCut
       this.afterCut = []
-      this.applyGain()
       for (const frame of pending) this.enqueue(frame)
     }, 260)
     return true
@@ -409,10 +740,10 @@ class TtsPlayer {
     if (control.action === 'stop') { this.stopAll(); return }
     if (control.action === 'repeat') { this.repeatLast(); return }
     if (control.action === 'volume') {
-      const base = this.currentVolume()
-      const next = typeof control.level === 'number' ? control.level : base + (control.delta ?? 0)
-      this.volumeOverride = Math.max(0, Math.min(1, next))
-      this.applyGain()
+      // The rig stores one absolute level, so a command can never compound with
+      // a duck that happened to be active when it arrived.
+      if (typeof control.level === 'number') this.gainRig.setOverride(control.level)
+      else this.gainRig.adjust(control.delta ?? 0)
     }
     // Rate is applied by the host TTS queue for subsequent sentences; the
     // player only needs to ignore the broadcast.
@@ -427,18 +758,28 @@ class TtsPlayer {
       this.lastFrames = []
     }
     this.lastTexts.push(frame.text)
+    this.spoken.push({ text: frame.text, at: Date.now() })
+    if (this.spoken.length > 40) this.spoken.shift()
     if (frame.audio.length > 0 && !frame.error) this.lastFrames.push(frame)
     if (this.lastTexts.length > 80) this.lastTexts.shift()
     if (this.lastFrames.length > 80) this.lastFrames.shift()
   }
 
+  /** Sentences spoken within the echo window; used by the echo gate. */
+  recentSpoken(): readonly SpokenSample[] {
+    const cutoff = Date.now() - 10_000
+    return this.spoken.filter((sample) => sample.at >= cutoff)
+  }
+
   private currentVolume(): number {
-    return Math.max(0, Math.min(1, this.volumeOverride ?? this.prefs.volume))
+    return this.gainRig.volume()
   }
 
   private halt(): void {
+    this.abandonYield()
     this.queue.length = 0
     this.afterCut = []
+    this.resetBargeIn(true)
     this.cutting = false
     this.cutToken += 1
     this.cutReplyId = undefined
@@ -446,7 +787,8 @@ class TtsPlayer {
     this.cleanupUrl()
     try { window.speechSynthesis?.cancel() } catch { /* unsupported */ }
     this.playing = false
-    this.ducked = false
+    this.lastQueuedReplyId = undefined
+    this.restore()
     this.blocked = false
   }
 
@@ -470,22 +812,124 @@ class TtsPlayer {
   }
 
   duck(): void {
-    this.ducked = true
-    this.applyGain()
+    // Suppression after a cut, the duck watchdog and the single gain write all
+    // live in the rig, so speech can never stack attenuation.
+    this.gainRig.duck()
     // The system-voice fallback has no Web Audio gain; pause it softly instead.
     try { window.speechSynthesis?.pause() } catch { /* unsupported */ }
   }
 
   restore(): void {
-    this.ducked = false
-    this.applyGain()
+    this.gainRig.restore()
     try { window.speechSynthesis?.resume() } catch { /* unsupported */ }
+  }
+
+  /**
+   * Owner voice onset: hold the sentence in place. This runs on the microphone
+   * VAD, before any transcript exists - waiting for recognition is what let the
+   * assistant read over the first words of every new sentence.
+   */
+  yieldToOwner(): boolean {
+    if (!this.canHold()) return false
+    if (this.yielded) return true
+    if (this.audio.paused) return false
+    this.yielded = true
+    this.yieldFrame = this.currentFrame
+    this.clearYieldTimer()
+    this.audio.pause()
+    this.gainRig.duck()
+    try { window.speechSynthesis?.pause() } catch { /* unsupported */ }
+    return true
+  }
+
+  /** The utterance did not take the floor: carry on exactly where it stopped. */
+  resumeFromYield(): void {
+    if (!this.yielded) return
+    this.clearYieldTimer()
+    this.yielded = false
+    const frame = this.yieldFrame
+    this.yieldFrame = undefined
+    if (!frame || !this.active || this.muted || this.cutting || this.blocked || !this.playing) return
+    this.gainRig.restore()
+    try { window.speechSynthesis?.resume() } catch { /* unsupported */ }
+    const played = this.audio.play()
+    if (played && typeof played.catch === 'function') {
+      played.catch(() => {
+        this.yielded = false
+        this.playing = false
+        this.playNext()
+      })
+    }
+  }
+
+  /**
+   * The speaker stopped. Recognition still needs a moment, so hold the silence
+   * and only resume if no routing decision lands before the delay.
+   */
+  resumeAfterSpeech(delayMs = YIELD_RESUME_AFTER_SPEECH_MS): void {
+    if (!this.yielded) return
+    this.clearYieldTimer()
+    this.yieldTimer = setTimeout(() => {
+      this.yieldTimer = null
+      this.resumeFromYield()
+    }, Math.max(0, delayMs))
+  }
+
+  /** True while a sentence is held waiting for the routing decision. */
+  holdsYield(): boolean { return this.yielded }
+
+  /** Could a hold be honoured right now? Checked before one is scheduled. */
+  canHold(): boolean {
+    return this.active && !this.muted && !this.cutting && !this.blocked
+      && this.prefs.autoRead && this.playing && this.currentFrame !== undefined
+  }
+
+  private clearYieldTimer(): void {
+    if (this.yieldTimer !== null) {
+      clearTimeout(this.yieldTimer)
+      this.yieldTimer = null
+    }
+  }
+
+  /** Drop a held sentence for good: the owner is taking the floor. */
+  private abandonYield(): void {
+    this.clearYieldTimer()
+    this.yielded = false
+    this.yieldFrame = undefined
+  }
+
+  /** Hard stop of the audible sentence, without touching the queue logic. */
+  private dropCurrent(): void {
+    this.audio.pause()
+    this.audio.onended = null
+    this.audio.onerror = null
+    this.cleanupUrl()
+    this.playing = false
+    this.currentFrame = undefined
+    this.restore()
   }
 
   /** Read one sentence with the platform voice when Edge TTS is unavailable. */
   speakFallback(text: string, frame?: VoiceFrame): void {
     if (!this.active || this.muted || !this.prefs.autoRead || !text.trim() || typeof SpeechSynthesisUtterance === 'undefined') return
-    if (frame) this.note(frame)
+    if (frame) {
+      this.frameStats.received += 1
+      this.reportFrame('received', frame)
+      if (!shouldPlayFrame(this.eligibility(frame))) {
+        this.frameStats.dropped += 1
+        this.reportFrame('dropped', frame, this.blockReason(frame))
+        return
+      }
+      const order = orderOf(frame)
+      const verdict = this.frameWindow.classify(order)
+      if (verdict !== 'accept') {
+        this.frameStats.dropped += 1
+        this.reportFrame('dropped', frame, verdict)
+        return
+      }
+      this.frameWindow.accept(order)
+      this.note(frame)
+    }
     try {
       const utterance = new SpeechSynthesisUtterance(text)
       utterance.volume = this.currentVolume()
@@ -497,11 +941,60 @@ class TtsPlayer {
   }
 
   enqueue(frame: VoiceFrame): void {
-    if (!this.active || this.muted || !this.prefs.autoRead) return
-    // A second tab can share the same SSE broadcast; only the session whose
-    // microphone is open may speak.
-    if (this.sessionId !== undefined && frame.sessionId !== this.sessionId) return
+    this.frameStats.received += 1
+    this.reportFrame('received', frame)
+    if (!shouldPlayFrame(this.eligibility(frame))) {
+      this.reportFrame('dropped', frame, this.blockReason(frame))
+      this.frameStats.dropped += 1
+      return
+    }
+    // Ordering guard: a frame older than the newest one already consumed is a
+    // late delivery/replay, never something the listener still waits for.
+    const order = orderOf(frame)
+    const verdict = this.frameWindow.classify(order)
+    if (verdict !== 'accept') {
+      this.reportFrame('dropped', frame, verdict)
+      this.frameStats.dropped += 1
+      return
+    }
+    this.frameWindow.accept(order)
     this.note(frame)
+    if (this.bargeInActive) {
+      // Late blocks from the old answer are retained, never played ahead of
+      // the answer to the owner's new question. A late continuation of the
+      // sentence already being spoken still gets to finish that sentence.
+      if (frame.replyId === this.bargeInOldReplyId) {
+        if (this.currentFrame && isSameSentence(this.currentFrame, frame)) {
+          // A late continuation still belongs before the replacement answer,
+          // otherwise the current sentence would be split by the new reply.
+          const firstNew = this.queue.findIndex((item) => item.replyId !== this.bargeInOldReplyId)
+          if (firstNew < 0) this.queue.push(frame)
+          else this.queue.splice(firstNew, 0, frame)
+          if (!this.playing) this.playNext()
+        } else {
+          // Old answer, unrelated sentence: the owner already moved on.
+          this.reportFrame('dropped', frame, 'barge-in-superseded')
+          this.frameStats.dropped += 1
+        }
+        return
+      }
+      // First frame of the replacement answer: it plays after the current
+      // sentence's remaining blocks and before the deferred old tail.
+      this.bargeInNewReplyId = frame.replyId
+      this.lastQueuedReplyId = frame.replyId
+      this.clearDeferredTimer()
+      this.queue.push(frame)
+      if (!this.playing) this.playNext()
+      return
+    }
+    // A new answer supersedes whatever is still unspoken from the previous one.
+    // Without this the listener hears the old report continue inside the new
+    // reply, which is the "it repeats the last thing it said" complaint.
+    if (this.lastQueuedReplyId !== undefined && frame.replyId !== this.lastQueuedReplyId) {
+      this.queue.length = 0
+      this.cutReplyId = undefined
+    }
+    this.lastQueuedReplyId = frame.replyId
     if (this.cutReplyId !== undefined && frame.replyId !== this.cutReplyId) this.cutReplyId = undefined
     if (this.cutReplyId !== undefined && frame.replyId === this.cutReplyId) return
     if (this.cutting) { this.afterCut.push(frame); return }
@@ -509,9 +1002,61 @@ class TtsPlayer {
     if (!this.playing) this.playNext()
   }
 
+  /** Everything the playback decision needs, including the host's election. */
+  private eligibility(frame: VoiceFrame) {
+    return {
+      active: this.active,
+      muted: this.muted,
+      autoRead: this.prefs.autoRead,
+      tabSession: this.sessionId,
+      frameSession: frame.sessionId,
+      ...(frame.owner === undefined ? {} : { frameOwner: frame.owner }),
+      clientId: CLIENT_ID,
+    }
+  }
+
+  /** Which eligibility condition rejected a frame, for the telemetry log. */
+  private blockReason(frame: VoiceFrame): string {
+    return playBlockReason(this.eligibility(frame)) ?? 'ineligible'
+  }
+
+  /**
+   * Heal a stale stop: another mounted instance can end this session while the
+   * microphone here is still open, which leaves the tab silent forever. The
+   * page re-asserts the session it is actually listening on.
+   */
+  assertActive(sessionId: string): void {
+    if (this.active || this.sessionId !== sessionId) return
+    this.active = true
+    this.muted = false
+    void this.enable()
+  }
+
+  /** Counters for the settings panel and for verification runs. */
+  frameCounters(): { received: number; dropped: number; played: number } {
+    return { ...this.frameStats }
+  }
+
+  /** JSONL telemetry: received / dropped (with reason) / played per frame. */
+  private reportFrame(phase: 'received' | 'dropped' | 'played', frame: VoiceFrame, reason?: string): void {
+    try {
+      void postLatency({
+        kind: 'frame',
+        phase,
+        sessionId: frame.sessionId,
+        replyId: frame.replyId,
+        epoch: typeof frame.epoch === 'number' ? frame.epoch : -1,
+        seq: typeof frame.seq === 'number' ? frame.seq : -1,
+        ...(reason === undefined ? {} : { reason }),
+      })
+    } catch { /* telemetry must never break speech */ }
+  }
+
   private clear(): void {
+    this.abandonYield()
     this.queue.length = 0
     this.afterCut = []
+    this.resetBargeIn(true)
     this.cutting = false
     this.cutToken += 1
     this.cutReplyId = undefined
@@ -519,11 +1064,12 @@ class TtsPlayer {
     try { window.speechSynthesis?.cancel() } catch { /* unsupported */ }
     this.cleanupUrl()
     this.playing = false
-    this.ducked = false
+    this.restore()
     this.blocked = false
     this.lastTexts = []
     this.lastFrames = []
     this.lastReplyId = undefined
+    this.lastQueuedReplyId = undefined
   }
 
   private ensureContext(): void {
@@ -533,29 +1079,88 @@ class TtsPlayer {
     this.context = new Ctor()
     this.source = this.context.createMediaElementSource(this.audio)
     this.gain = this.context.createGain()
+    // The duck/cut logic owns this.gain (0..1). Loudness comes after it: a fixed
+    // makeup gain and a limiter, so speech reaches laptop speakers at a normal
+    // level while ducks and fades keep working exactly as before.
+    this.boost = this.context.createGain()
+    this.boost.gain.value = this.prefs.speechBoost
+    this.limiter = this.context.createDynamicsCompressor()
+    this.limiter.threshold.value = -12
+    this.limiter.knee.value = 6
+    this.limiter.ratio.value = 12
+    this.limiter.attack.value = 0.003
+    this.limiter.release.value = 0.25
     this.source.connect(this.gain)
-    this.gain.connect(this.context.destination)
+    this.gain.connect(this.boost)
+    this.boost.connect(this.limiter)
+    this.limiter.connect(this.context.destination)
     this.applyGain()
   }
 
+  /** Every gain change goes through the rig: cancel, pin, then one target. */
   private applyGain(): void {
-    if (!this.gain || !this.context) return
-    const target = this.currentVolume() * (this.ducked ? this.prefs.duckLevel : 1)
-    this.gain.gain.setTargetAtTime(target, this.context.currentTime, 0.08)
+    this.gainRig.apply('apply')
+  }
+
+  private clearDeferredTimer(): void {
+    if (this.deferredTimer !== null) {
+      clearTimeout(this.deferredTimer)
+      this.deferredTimer = null
+    }
+  }
+
+  private resetBargeIn(clearFrames: boolean): void {
+    this.clearDeferredTimer()
+    this.bargeInActive = false
+    this.bargeInOldReplyId = undefined
+    this.bargeInNewReplyId = undefined
+    if (clearFrames) this.deferred.length = 0
+  }
+
+  /**
+   * The replacement answer has drained. Wait a short quiet window so late
+   * TTS frames still join that answer, then resume the preserved old tail.
+   */
+  private scheduleDeferredResume(): void {
+    if (!this.bargeInActive || this.bargeInNewReplyId === undefined) return
+    // Nothing held back: the interruption dropped the old tail, so the flag
+    // must clear here or every later frame would be treated as a barge-in.
+    if (this.deferred.length === 0) { this.resetBargeIn(false); return }
+    this.clearDeferredTimer()
+    this.deferredTimer = setTimeout(() => {
+      this.deferredTimer = null
+      if (!this.active || this.muted || this.cutting || this.playing) return
+      if (this.queue.length > 0 || !this.bargeInActive || this.bargeInNewReplyId === undefined) return
+      const held = this.deferred.splice(0)
+      if (held.length === 0) return
+      this.bargeInActive = false
+      this.bargeInOldReplyId = undefined
+      this.bargeInNewReplyId = undefined
+      this.queue.push(...orderBargeInFrames<VoiceFrame>([], held))
+      this.playNext()
+    }, 800)
   }
 
   private playNext(): void {
     const frame = this.queue.shift()
     if (!frame) {
       this.playing = false
+      this.currentFrame = undefined
+      if (this.onPlayback) { try { this.onPlayback(false, this.sessionId) } catch { /* logging only */ } }
+      if (this.bargeInActive && this.queue.length === 0) this.scheduleDeferredResume()
       return
     }
     this.ensureContext()
+    this.playbackStartedAt = Date.now()
     this.cleanupUrl()
     this.currentFrame = frame
     this.url = base64ToAudioUrl(frame.audio)
     this.audio.src = this.url
     this.playing = true
+    if (this.onPlayback) { try { this.onPlayback(true, frame.sessionId || this.sessionId) } catch { /* logging only */ } }
+    this.frameStats.played += 1
+    this.reportFrame('played', frame)
+    if (this.onPlay) { try { this.onPlay(frame) } catch { /* logging only */ } }
     this.audio.onended = () => { this.cleanupUrl(); this.playNext() }
     this.audio.onerror = () => { this.cleanupUrl(); this.playNext() }
     void this.audio.play().catch(() => {
@@ -573,6 +1178,12 @@ class TtsPlayer {
 }
 
 const sharedPlayer = new TtsPlayer()
+/** This page's identity in the host's playback election. */
+const CLIENT_ID = Math.random().toString(36).slice(2) + Date.now().toString(36)
+/** Local VAD onset of the utterance being recorded, in ms; 0 when idle. */
+let speechOnsetAt = 0
+/** Pending hold: set once speech started, cancelled if it was only a blip. */
+let holdTimer: ReturnType<typeof setTimeout> | null = null
 
 /** Names and guest policies are model-issued and kept in memory per session. */
 const speakerPolicy = new SpeakerPolicyStore()
@@ -630,27 +1241,28 @@ function useAutoRead(sessionId: string): void {
   }, [sessionId])
 }
 
-function openSettings(ctx: any): void {
-  try { ctx.pluginNavigation.openBundle(BUNDLE_ID) } catch (error) {
-    console.warn('[dsh-voice-dialog] cannot open bundle settings', error)
+/** The speech Remote can be unavailable (slow mount, disabled bundle, phone). */
+function requireSpeech(ctx: any): any {
+  // Reading a service the ctx did not inject throws in DSH ("cannot get
+  // property ... without inject"); it does not return undefined. Catch it so the
+  // settings page shows a readable line instead of a raw runtime error.
+  let speech: any
+  try { speech = ctx?.remote?.speech } catch { speech = undefined }
+  if (!speech) {
+    throw new Error('语音服务还没就绪：确认插件已启用后刷新这个页面，再试一次。')
   }
+  return speech
 }
 
 export async function apply(ctx: any): Promise<() => Promise<void>> {
-  // Mount the speech Remote contribution here instead of relying on the
-  // built-in voice-input client plugin to mount it for us. The contribution
-  // must be mounted before a nested inject can wait for remote.speech.
-  const disposeRemote = await ctx.remote.$mount(speechRemote)
-  const ui = ctx.inject(['remote.speech', 'slots', 'sessions', 'pluginNavigation'], (scope: any) => {
-    scope.slots.inject('conversation.input.activity', () =>
-      scope.slots.register({
-        name: 'conversation.input.activity',
-        // Shadow the official one-shot mic at the same seat. Only one
-        // microphone remains: no toolbar button and no floating panel.
-        priority: -100,
-        inject: () => ({ ctx: scope }),
-      }, VoiceMic),
-    )
+  // The settings form is registered first, on its own injection: the Plugins
+  // page only renders a config section once `plugins.bundle.config` holds an
+  // entry for the bundle, so a slow or unavailable speech Remote must never
+  // keep the settings hidden. That ordering is what made a phone show an
+  // empty plugin page.
+  // 'remote' must be injected on this scope: the settings form reads
+  // ctx.remote (speech catalog) and an un-injected read throws.
+  const settingsUi = ctx.inject(['slots', 'remote.speech'], (scope: any) => {
     scope.slots.inject('plugins.bundle.config', () =>
       scope.slots.register({
         name: 'plugins.bundle.config',
@@ -659,8 +1271,35 @@ export async function apply(ctx: any): Promise<() => Promise<void>> {
       }, VoiceSettings),
     )
   })
-  try { await ui } catch (error) { await ui.dispose(); await disposeRemote(); throw error }
-  return async () => { await ui.dispose(); await disposeRemote() }
+  let disposeRemote: (() => Promise<void>) | undefined
+  let micUi: { dispose: () => Promise<void> } | undefined
+  try {
+    await settingsUi
+    // Mount the speech Remote contribution here instead of relying on the
+    // built-in voice-input client plugin to mount it for us. The contribution
+    // must be mounted before a nested inject can wait for remote.speech.
+    disposeRemote = await ctx.remote.$mount(speechRemote)
+    micUi = ctx.inject(['remote.speech', 'slots', 'sessions', 'pluginNavigation'], (scope: any) => {
+      scope.slots.inject('conversation.input.activity', () =>
+        scope.slots.register({
+          name: 'conversation.input.activity',
+          // Shadow the official one-shot mic at the same seat. Only one
+          // microphone remains: no toolbar button and no floating panel.
+          priority: -100,
+          inject: () => ({ ctx: scope }),
+        }, VoiceMic),
+      )
+    })
+    await micUi
+  } catch (error) {
+    // A failed microphone seat must not take the settings page down with it.
+    console.error('[dsh-voice-dialog] client mount failed', error)
+  }
+  return async () => {
+    if (micUi) { try { await micUi.dispose() } catch { /* already gone */ } }
+    try { await settingsUi.dispose() } catch { /* already gone */ }
+    if (disposeRemote) { try { await disposeRemote() } catch { /* already gone */ } }
+  }
 }
 
 /** Capture survives a transient composer remount; only a real navigation stops it. */
@@ -723,6 +1362,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const [queued, setQueued] = useState(0)
   const [error, setError] = useState('')
   const [speaker, setSpeaker] = useState('')
+  /** A failure must be readable without hovering: phones have no tooltips. */
+  const [banner, setBanner] = useState('')
   const micRef = useRef<MicrophoneLoop | null>(null)
   const schedulerRef = useRef<SpeechScheduler | null>(null)
   const classifyRef = useRef<Promise<void>>(Promise.resolve())
@@ -730,7 +1371,22 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const separationRetryAtRef = useRef(0)
   const separatorRef = useRef<ContinuousSeparation | null>(null)
   const organizerRef = useRef<SpeechOrganizer | null>(null)
+  const plannerRef = useRef<SpeechPlanner | null>(null)
+  const planLedgerRef = useRef(new PlanLedger())
+  const organizerOrderRef = useRef(0)
   const lastLaneTextRef = useRef<Map<string, string>>(new Map())
+  /** Last accepted owner transcript, for the input gate's duplicate rule. */
+  const lastOwnerInputRef = useRef('')
+  /** Mixed tail kept from the moment speech ended, for a single-speaker ASR. */
+  const mixedTailRef = useRef<{ samples: number; at: number; text: Promise<string>; timing: UtteranceTiming } | null>(null)
+  /** Wall clock of the last speech sample the mic heard; the honest latency base. */
+  const lastSpeechEndRef = useRef<number>(0)
+  /** VAD close (utterance end) of the latest utterance. */
+  const lastUtteranceEndRef = useRef<number>(0)
+  /** Cached speech selection: the catalog round trip does not belong on every lane. */
+  const speechSelectionRef = useRef<{ at: number; value: { providerId: string; language: string } } | null>(null)
+  /** Idempotency gate: one continuously separated segment reaches the model once. */
+  const deliveredIdsRef = useRef<Set<string>>(new Set())
   useAutoRead(sessionId)
   useLayoutEffect(() => {
     onActiveChange?.(active)
@@ -741,8 +1397,39 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     if (!active) return
     reportVoiceState(sessionId, true)
     const heartbeat = setInterval(() => { reportVoiceState(sessionId, true) }, 45_000)
-    return () => { clearInterval(heartbeat) }
+    // While this tab hears the microphone it must also be the tab that speaks.
+    const heal = setInterval(() => { sharedPlayer.assertActive(sessionId) }, 2_500)
+    sharedPlayer.assertActive(sessionId)
+    return () => { clearInterval(heartbeat); clearInterval(heal) }
   }, [active, sessionId])
+
+  useEffect(() => subscribePreferences((value) => {
+    micRef.current?.tune({
+      silenceMs: value.pauseMs,
+      threshold: value.micThreshold > 0 ? value.micThreshold : null,
+    })
+  }), [])
+
+  // Surface every failure as a visible banner; a phone cannot hover a tooltip.
+  useEffect(() => {
+    if (!error) return
+    setBanner(error)
+    const timer = setTimeout(() => setBanner(''), 10_000)
+    return () => { clearTimeout(timer) }
+  }, [error])
+
+  useEffect(() => {
+    sharedPlayer.onPlay = (frame) => {
+      void postLatency({
+        kind: 'play_start', sessionId: frame.sessionId, replyId: frame.replyId,
+        at: new Date().toISOString(),
+      })
+    }
+    sharedPlayer.onPlayback = (playing, sessionId) => {
+      if (sessionId) reportPlayback(sessionId, playing)
+    }
+    return () => { sharedPlayer.onPlay = undefined; sharedPlayer.onPlayback = undefined }
+  }, [])
 
   useEffect(() => {
     const onPageHide = (): void => { reportVoiceState(sessionId, false, true) }
@@ -750,12 +1437,25 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     return () => { window.removeEventListener('pagehide', onPageHide) }
   }, [sessionId])
 
+  /** Backpressure counters: proves that a slow model never builds a backlog. */
+  const reportSeparationPressure = (separator: ContinuousSeparation): void => {
+    try {
+      void postLatency({
+        kind: 'separation-pressure',
+        sessionId,
+        at: new Date().toISOString(),
+        ...separator.pressureReport(),
+      })
+    } catch { /* counters are diagnostics only */ }
+  }
+
   const flushSeparator = async (): Promise<void> => {
     const separator = separatorRef.current
     separatorRef.current = null
     if (!separator) return
     try {
       await separator.flush()
+      reportSeparationPressure(separator)
       // Let the voiceprint/ASR chain enqueue the final lanes before dispose().
       await classifyRef.current
     } catch (failure) {
@@ -838,82 +1538,308 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     }
   }, [sessionId])
 
-  const transcribeAudio = async (audioBase64Value: string): Promise<string> => {
+  /**
+   * Resolve the recognizer selection once instead of once per lane: the catalog
+   * round trip used to sit in front of every single transcription.
+   */
+  const speechSelection = async (): Promise<{ providerId: string; language: string }> => {
+    const cached = speechSelectionRef.current
+    if (cached && Date.now() - cached.at < 15_000) return cached.value
     const catalog = await ctx.remote.speech.catalog()
     if (!catalog.ok) throw new Error(catalog.error?.message ?? '语音识别服务不可用')
     const provider = catalog.value.providers.find((item: any) => item.id === catalog.value.selection.providerId)
     if (!provider || !['ready', 'standby', 'waking'].includes(provider.preparation.phase)) {
+      speechSelectionRef.current = null
       throw new Error('语音模型未就绪，请在插件设置中准备')
     }
+    speechSelectionRef.current = { at: Date.now(), value: catalog.value.selection }
+    return catalog.value.selection
+  }
+
+  interface TimedTranscript {
+    text: string
+    /** Wall clock when the call acquired its slot. */
+    startedAt: number
+    /** Wall clock when the transcript arrived. */
+    doneAt: number
+    /** Model-only time reported by the provider, when it reports one. */
+    inferMs?: number
+  }
+
+  const transcribeTimed = async (audioBase64Value: string): Promise<TimedTranscript> => {
+    const startedAt = Date.now()
+    const selection = await speechSelection()
     const result = await ctx.remote.speech.transcribe({
       audioBase64: audioBase64Value,
-      ...catalog.value.selection,
+      ...selection,
     }, new AbortController().signal)
-    if (!result.ok) throw new Error(result.error?.message ?? '识别失败')
-    return String(result.value?.text ?? '').trim()
+    if (!result.ok) {
+      speechSelectionRef.current = null
+      throw new Error(result.error?.message ?? '识别失败')
+    }
+    const doneAt = Date.now()
+    const value = result.value as { text?: unknown; inferenceSeconds?: unknown } | undefined
+    const inferMs = typeof value?.inferenceSeconds === 'number' && Number.isFinite(value.inferenceSeconds)
+      ? Math.round(value.inferenceSeconds * 1000)
+      : undefined
+    return {
+      text: String(value?.text ?? '').trim(),
+      startedAt, doneAt,
+      ...(inferMs === undefined ? {} : { inferMs }),
+    }
   }
+
+  const transcribeAudio = async (audioBase64Value: string): Promise<string> =>
+    (await transcribeTimed(audioBase64Value)).text
 
   const transcribeSamples = (samples: Float32Array): Promise<string> =>
     transcribeAudio(audioBase64(encodeWave(samples)))
 
+  /** One ASR call that records its own timings on the way through. */
+  /** One ASR call that records its own timings on the way through. */
+  const timedSamples = (
+    samples: Float32Array,
+    runLimited: <T>(task: () => Promise<T>) => Promise<T>,
+    timing: UtteranceTiming = {},
+  ): { text: Promise<string>; timing: UtteranceTiming } => {
+    const text = runLimited(async () => {
+      const call = await transcribeTimed(audioBase64(encodeWave(samples)))
+      timing.asrStartAt = call.startedAt
+      timing.asrDoneAt = call.doneAt
+      if (call.inferMs !== undefined) timing.asrInferMs = call.inferMs
+      return call.text
+    })
+    void text.catch(() => undefined)
+    return { text, timing }
+  }
+
   /**
-   * Queue immediately, but when an assistant reply is active let the parallel
-   * organizer decide whether this owner line should steer, queue, or vanish.
-   * The entry keeps its FIFO position; only its delivery mode can change.
+   * The organizer is the single routing gate: every transcript (owner and
+   * guest) is classified before it enters the scheduler. A model failure
+   * always falls back to queueing in arrival order; only an explicit drop /
+   * ignore result discards speech.
    */
   const enqueueWithOrganizer = (
     lane: 'owner' | 'guest',
     canonical: string,
     work: Promise<string | null>,
     scheduler: SpeechScheduler,
+    closedAt?: number,
+    separated = false,
+    timing: UtteranceTiming = {},
+    fastPath = false,
   ): void => {
     const prefs = getPreferences()
-    if (!prefs.organizerEnabled || lane !== 'owner') {
-      scheduler.enqueue(lane, canonical, work)
+    const arrivalOrder = organizerOrderRef.current++
+    const trace = createUtteranceTrace({
+      sessionId,
+      lane,
+      // The honest base is when the speaker stopped, not when the segment arrived.
+      startedAt: timing.speechEndAt ?? closedAt ?? Date.now(),
+    } as TraceInput)
+    markUtteranceStage(trace, 'utterance_end', () => closedAt ?? Date.now())
+    if (separated) {
+      // Real arrival of the separation result, not the moment the utterance closed.
+      markUtteranceStage(trace, 'separation_done', () => timing.separationDoneAt ?? closedAt ?? Date.now())
+    }
+    if (timing.asrStartAt !== undefined) trace.marks.asr_start = timing.asrStartAt
+    if (timing.asrDoneAt !== undefined) trace.marks.asr_done = timing.asrDoneAt
+    const finish = (
+      options: Parameters<typeof buildUtteranceRecord>[1],
+      gateDecision?: InputGateDecision,
+    ): void => {
+      if (!trace) return
+      const record = buildUtteranceRecord(trace, { fastPath, ...options, timing })
+      if (gateDecision) Object.assign(record, inputGateTraceFields(gateDecision))
+      void postLatency(record)
+    }
+    // A sentence held by the microphone onset is released unless this utterance
+    // takes the floor; the owner steer path abandons it instead of resuming.
+    const release = (): void => sharedPlayer.resumeFromYield()
+    if (!prefs.organizerEnabled && lane === 'guest') {
+      release()
+      scheduler.enqueue(lane, canonical, work, { order: arrivalOrder })
       return
     }
     let organizer = organizerRef.current
     if (!organizer) {
-      organizer = new SpeechOrganizer((request, signal) => organizeSpeech(request, signal), { timeoutMs: 1300 })
+      organizer = new SpeechOrganizer((request, signal) => organizeSpeech(request, signal), { timeoutMs: 1400 })
       organizerRef.current = organizer
     }
-    let release!: () => void
-    const hold = new Promise<void>((resolve) => { release = resolve })
-    let settled = false
-    let safety: ReturnType<typeof setTimeout> | null = null
-    const finish = (): void => {
-      if (settled) return
-      settled = true
-      if (safety !== null) clearTimeout(safety)
-      release()
-    }
-    const entry = scheduler.enqueue(lane, canonical, work, { hold })
-    // A hung ASR call must not wedge the FIFO head forever.
-    safety = setTimeout(finish, 5000)
-    void work.then(async (text) => {
-      if (!text) return
-      // An explicit "打断" / stop wins over any model decision.
-      if (organizerRef.current !== organizer) return
-      if (parseQueueControl(text)) return
-      if (!sharedPlayer.busy() && scheduler.status().queued <= 1) return
-      const spoken = text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, '')
-      const plan = await organizer!.plan({
-        sessionId,
-        text: spoken,
-        lane,
-        playing: sharedPlayer.busy(),
-        queued: Math.max(0, scheduler.status().queued - 1),
+    const enqueue = (text: string, priority?: number) => {
+      const entry = scheduler.enqueue(lane, canonical, Promise.resolve(text), {
+        order: arrivalOrder,
+        priority,
       })
-      if (settled || !plan || !organizer!.isCurrent(plan)) return
-      if (plan.action === 'interrupt') {
-        entry.setMode('steer')
-        sharedPlayer.cut(plan.version, (version) => organizer!.isCurrent(plan))
-      } else if (plan.action === 'ignore') {
-        entry.drop()
+      entry.setMode(priority === -1 ? 'steer' : 'queue')
+      return entry
+    }
+    void work.then(async (text) => {
+      if (!text) { release(); return }
+      // Explicit "打断" / stop commands are hard commands, not model input.
+      if (parseQueueControl(text)) {
+        // Hard commands jump model-assigned priorities but still keep arrival order.
+        scheduler.enqueue(lane, canonical, Promise.resolve(text), { order: arrivalOrder, priority: -1 })
+        release()
+        markUtteranceStage(trace, 'enqueue')
+        finish({ organizerAction: 'hard-command' })
+        return
       }
+      const spoken = text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, '')
+      // Cheap gates before the 860 ms organizer request: guest noise and the
+      // microphone hearing its own playback. Both are conservative and leave
+      // anything a person would consider a sentence alone.
+      const noise = noiseGate(lane, spoken)
+      if (noise.drop) {
+        noteUtteranceText(trace, spoken)
+        release()
+        markUtteranceStage(trace, 'enqueue')
+        finish({ organizerAction: 'noise-gate:' + (noise.reason ?? 'noise') })
+        return
+      }
+      const echo = echoGate(spoken, sharedPlayer.recentSpoken())
+      if (echo.drop) {
+        noteUtteranceText(trace, spoken)
+        release()
+        markUtteranceStage(trace, 'enqueue')
+        finish({ organizerAction: 'echo-gate:' + (echo.reason ?? 'echo') })
+        return
+      }
+      const status = scheduler.status()
+      const imperative = /打断|停下|停一下|别说|闭嘴|不用念|先停|换一个|换个话题/u.test(spoken)
+      const schedulePlan = (allowInterrupt: boolean): void => {
+        const pending = sharedPlayer.pendingFrames()
+        // Fewer than two unread blocks means there is no order to change: the
+        // call could only rearrange what has already been spoken.
+        if (!shouldRunPlanner({ pendingBlocks: pending.length, queued: scheduler.status().queued })) return
+        let planner = plannerRef.current
+        if (!planner) {
+          planner = new SpeechPlanner((request, signal) => planSpeech(request, signal), { timeoutMs: 900 })
+          plannerRef.current = planner
+        }
+        const turnId = sessionId + ':' + arrivalOrder
+        const queued = scheduler.snapshot().flatMap((item) => item.text
+          ? [{ id: item.id, lane: item.lane, text: item.text }] : [])
+        void planner.plan({
+          sessionId, turnId, text: spoken, lane,
+          playing: sharedPlayer.busy(), queued: queued.length, queue: queued,
+          assistantPending: pending.map((frame) => ({
+            text: frame.text,
+            ...(typeof frame.sentenceId === 'number' ? { sentenceId: frame.sentenceId } : {}),
+            ...(typeof frame.chunkIndex === 'number' ? { chunkIndex: frame.chunkIndex } : {}),
+          })),
+        }).then((plan) => {
+          if (!plan) return
+          const ids = scheduler.snapshot().map((item) => item.id)
+          // A plan for a turn that already ended (queue empty, nothing playing)
+          // is discarded whole: it may only correct, never revive.
+          if (!shouldApplyPlan(plan, { playing: sharedPlayer.busy(), queued: ids.length, ids })) return
+          if (!planLedgerRef.current.tryClaim(plan)) return
+          if (plan.queuePlan && plan.queuePlan.length > 0) scheduler.applyQueuePlan(plan.queuePlan)
+          if (plan.dropSentences !== undefined || plan.reorder !== undefined) {
+            try { sharedPlayer.restructure(pending, plan) } catch { /* keep original order */ }
+          }
+          // Perception first: owner speech is reported to the host/model and
+          // never cut here. Only an explicitly steered guest still cuts.
+          if (plan.interrupt && allowInterrupt && lane !== 'owner') {
+            sharedPlayer.cut(0, () => true)
+          }
+        }).catch(() => undefined)
+      }
+      noteUtteranceText(trace, spoken)
+      if (lane === 'owner') {
+        // The owner's line is never held back by a judgment round trip. Rules
+        // that are certain (noise, an exact repeat, a spoken "stop") answer
+        // synchronously; everything else enters the FIFO at once. The meaning
+        // layer then decides — with what is being read right now, what the
+        // assistant still owes, and what is already waiting — whether this line
+        // should take the floor. Its verdict only ever corrects an entry that
+        // has not started, so a slow or failed judgment costs nothing.
+        const previousOwnerLine = lastOwnerInputRef.current
+        const gateInput = {
+          text: spoken,
+          lane,
+          playing: sharedPlayer.busy(),
+          queued: status.queued,
+          ...(previousOwnerLine ? { previousText: previousOwnerLine } : {}),
+        }
+        const ruled = ruleInputDecision(gateInput)
+        if (ruled?.verdict === 'drop') {
+          release()
+          markUtteranceStage(trace, 'enqueue')
+          finish({ organizerAction: 'input-gate:drop:' + ruled.reason }, ruled)
+          return
+        }
+        lastOwnerInputRef.current = spoken
+        let entry: ReturnType<typeof enqueue>
+        if (ruled?.verdict === 'steer') {
+          // A spoken stop still steers delivery, but the page does not cut:
+          // the host/model sees the line and decides how to stop the mouth.
+          organizerRef.current?.cancel()
+          release()
+          entry = enqueue(text, -1)
+          entry.setMode('steer')
+          markUtteranceStage(trace, 'enqueue')
+          finish({ organizerAction: 'input-gate:steer:' + ruled.source }, ruled)
+          schedulePlan(true)
+          return
+        }
+        release()
+        // No meaning judge on the owner lane. What the owner says is the
+        // floor: the model reads the line in its own turn and answers, so a
+        // second model scoring it can only add latency and get it wrong.
+        // Only the deterministic rules above may reject a line outright.
+        const bargeIn = decideBargeIn({ lane: 'owner', playing: sharedPlayer.busy() })
+        // Report-only: queue the owner's words; keep the current audio playing.
+        entry = enqueue(text)
+        entry.setMode('queue')
+        markUtteranceStage(trace, 'enqueue')
+        finish({ organizerAction: 'owner-floor:' + bargeIn.action })
+        return
+      }
+
+      // Guests keep the existing organizer strategy, but queueing is the
+      // default and a guest verdict can never cut the owner's playback unless
+      // that speaker was explicitly switched to steer.
+      const guestMode = effectiveGuestMode(sessionId, canonical)
+      // A guest speaking pauses the owner's answer for a moment; it resumes as
+      // soon as the guest is routed, because guest speech only queues.
+      release()
+      const entry = enqueue(text, guestMode === 'steer' ? -1 : undefined)
+      entry.setMode(guestMode === 'steer' ? 'steer' : 'queue')
+      if (shouldCallGate({ playing: sharedPlayer.busy(), queued: status.queued }, imperative)) {
+        let current = organizerRef.current
+        if (!current) {
+          current = new SpeechOrganizer((request, signal) => organizeSpeech(request, signal), { timeoutMs: 1400 })
+          organizerRef.current = current
+        }
+        const selected = current
+        void selected.plan({
+          sessionId,
+          text: spoken,
+          lane,
+          playing: true,
+          queued: status.queued,
+          ownerWeight: 0.3,
+        }).then((plan) => {
+          if (!plan || !selected.isCurrent(plan)) return
+          if (!entry.started() && (plan.action === 'drop' || plan.action === 'ignore')) {
+            entry.drop()
+            return
+          }
+          if (guestMode === 'steer' && plan.action === 'interrupt') {
+            sharedPlayer.cut(0, () => true)
+            entry.setMode('steer')
+          }
+        }).catch(() => undefined)
+      }
+      markUtteranceStage(trace, 'enqueue')
+      finish({ organizerAction: guestMode === 'steer' ? 'guest-steer-fastpath' : 'guest-queue-fastpath' })
+      schedulePlan(guestMode === 'steer')
     }).catch((failure: unknown) => {
-      console.warn('[dsh-voice-dialog] organizer skipped', failure)
-    }).finally(finish)
+      release()
+      console.warn('[dsh-voice-dialog] organizer routing failed', failure)
+    })
   }
 
   /** Turn the two separated streams into two independently labelled lanes. */
@@ -921,6 +1847,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     result: SeparationResult,
     scheduler: SpeechScheduler,
     runLimited: <T>(task: () => Promise<T>) => Promise<T>,
+    separation?: SeparationLatencyDetail,
   ): void => {
     const prefs = getPreferences()
     const tasks: Array<{
@@ -928,6 +1855,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       canonical: string
       onsetMs: number
       work: Promise<string | null>
+      timing: UtteranceTiming
     }> = []
     result.sources.forEach((source, index) => {
       const identity = source.identity
@@ -944,16 +1872,30 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       }
       if (lane === 'guest') setSpeaker(display || '其他人')
       const prefix = prefs.speakerPrefix && display ? '[声纹：' + display + '] ' : ''
+      const timing: UtteranceTiming = {}
       const work = runLimited(async () => {
-        const text = await transcribeAudio(source.audioBase64)
-        return text ? prefix + text : null
+        const call = await transcribeTimed(source.audioBase64)
+        timing.asrStartAt = call.startedAt
+        timing.asrDoneAt = call.doneAt
+        if (call.inferMs !== undefined) timing.asrInferMs = call.inferMs
+        return call.text ? prefix + call.text : null
       })
-      tasks.push({ lane, canonical, onsetMs: source.onsetMs, work })
+      tasks.push({ lane, canonical, onsetMs: source.onsetMs, work, timing })
     })
     // Keep the earlier speaker first; if they started together, the owner goes first.
     tasks.sort((a, b) => a.onsetMs - b.onsetMs
       || (a.lane === b.lane ? 0 : a.lane === 'owner' ? -1 : 1))
-    for (const task of tasks) enqueueWithOrganizer(task.lane, task.canonical, task.work, scheduler)
+    const arrivedAt = Date.now()
+    const utteranceEnd = lastUtteranceEndRef.current || arrivedAt
+    for (const task of tasks) {
+      const timing: UtteranceTiming = {
+        separationDoneAt: arrivedAt,
+        ...(separation === undefined ? {} : { separation }),
+        ...task.timing,
+      }
+      if (lastSpeechEndRef.current > 0) timing.speechEndAt = lastSpeechEndRef.current
+      enqueueWithOrganizer(task.lane, task.canonical, task.work, scheduler, utteranceEnd, true, timing)
+    }
   }
 
   /** Identify a continuously separated lane, then queue its new text. */
@@ -962,11 +1904,50 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     scheduler: SpeechScheduler,
     runLimited: <T>(task: () => Promise<T>) => Promise<T>,
   ): void => {
+    // One utterance id, one delivery. Separation and the speculative path may
+    // both complete for the same audio, so the second completion is a no-op.
+    if (segment.utteranceId !== undefined
+      && !firstDelivery(deliveredIdsRef.current, segment.utteranceId)) return
+    const arrivedAt = Date.now()
+    const utteranceEnd = lastUtteranceEndRef.current || arrivedAt
+    const diagnostics = segment.separation
+    const timing: UtteranceTiming = {
+      separationDoneAt: arrivedAt,
+      separation: {
+        mode: 'continuous',
+        ...(diagnostics?.prewarm === undefined ? {} : { prewarm: diagnostics.prewarm }),
+        ...(diagnostics?.queueMs === undefined ? {} : { queueMs: diagnostics.queueMs }),
+        ...(diagnostics?.modelMs === undefined ? {} : { modelMs: diagnostics.modelMs }),
+        ...(diagnostics?.wallMs === undefined ? {} : { wallMs: diagnostics.wallMs }),
+        ...(diagnostics?.prewarmWaitMs === undefined ? {} : { prewarmWaitMs: diagnostics.prewarmWaitMs }),
+        ...(diagnostics?.windowMs === undefined ? {} : { windowMs: diagnostics.windowMs }),
+        ...(diagnostics?.modelCalls === undefined ? {} : { modelCalls: diagnostics.modelCalls }),
+        gateReason: diagnostics?.mixed ? 'mixed-fallback' : 'separation',
+      },
+    }
+    if (lastSpeechEndRef.current > 0) timing.speechEndAt = lastSpeechEndRef.current
+    // Single speaker: the mixed tail covers the same audio, so its transcript
+    // replaces the separated lane's recognition and one ASR call is saved.
+    const mixed = mixedTailRef.current
+    const useMixed = segment.siblingActive === false && mixed !== null
+      && arrivedAt - mixed.at < 8000
+      && canReuseSpeculativeAsr(segment.samples.length, mixed.samples)
+    let transcription: Promise<string>
+    if (useMixed && mixed) {
+      mixedTailRef.current = null
+      Object.assign(timing, mixed.timing)
+      transcription = mixed.text
+    } else {
+      // Recognition starts the moment the segment closes; its timings land on
+      // the same object the trace reads a moment later.
+      transcription = timedSamples(segment.samples, runLimited, timing).text
+    }
+    void transcription.catch(() => undefined)
     classifyRef.current = classifyRef.current.then(async () => {
       const prefs = getPreferences()
       let identity: SpeakerIdentity | null = null
       try {
-        identity = await identifySpeaker(segment.samples, sessionId, prefs.speakerThreshold)
+        identity = await identifySpeaker(segment.samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin)
       } catch {
         // A short or noisy lane can still be transcribed without a voiceprint.
       }
@@ -987,15 +1968,124 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       if (lane === 'guest') setSpeaker(display || '其他人')
       const key = lane + ':' + canonical
       const work = runLimited(async () => {
-        const text = await transcribeSamples(segment.samples)
+        const text = await transcription
         const fresh = dedupeTranscript(lastLaneTextRef.current.get(key) ?? '', text)
         lastLaneTextRef.current.set(key, text)
         if (!fresh) return null
         return prefs.speakerPrefix && display ? '[声纹：' + display + '] ' + fresh : fresh
       })
-      enqueueWithOrganizer(lane, canonical, work, scheduler)
+      enqueueWithOrganizer(lane, canonical, work, scheduler, utteranceEnd, true, timing)
     }).catch((failure: unknown) => {
       console.warn('[dsh-voice-dialog] continuous speaker routing failed', failure)
+    })
+  }
+
+  /** Route one already-recognized mixed utterance after the speaker gate. */
+  const enqueueFastSingle = (
+    identity: SpeakerIdentity | null,
+    transcription: Promise<string>,
+    timing: UtteranceTiming,
+    scheduler: SpeechScheduler,
+    utteranceEnd: number,
+    fastPath: boolean,
+    prefs: VoiceDialogPreferences,
+  ): void => {
+    if (prefs.speakerGate && identity?.owner !== true) {
+      setSpeaker('已忽略其他人的声音')
+      return
+    }
+    const lane: 'owner' | 'guest' = identity?.enrolled === true && !identity.owner ? 'guest' : 'owner'
+    const canonical = identity?.label ?? ''
+    const display = canonical ? displaySpeaker(sessionId, canonical) : ''
+    if (lane === 'guest' && effectiveGuestMode(sessionId, canonical) === 'ignore') {
+      setSpeaker('已忽略' + (display || '其他人'))
+      return
+    }
+    if (lane === 'guest') setSpeaker(display || '其他人')
+    const prefix = prefs.speakerPrefix && display ? '[声纹：' + display + '] ' : ''
+    const work = transcription.then((text) => text ? prefix + text : null)
+    void work.catch(() => undefined)
+    enqueueWithOrganizer(lane, canonical, work, scheduler, utteranceEnd, true, timing, fastPath)
+  }
+
+  /**
+   * On-demand path for a completed utterance. Raw ASR starts immediately; a
+   * cheap CAM++ self-similarity gate decides whether separation is needed at
+   * all. Only a confident "same voice" result bypasses the model. Every error,
+   * timeout, short clip, unanswered enrollment or uncertain score falls back to
+   * the full separation path, so attribution quality never silently degrades.
+   */
+  const handleFastSegment = (
+    samples: Float32Array,
+    scheduler: SpeechScheduler,
+    runLimited: <T>(task: () => Promise<T>) => Promise<T>,
+  ): void => {
+    const prefs = getPreferences()
+    const startedAt = Date.now()
+    const utteranceEnd = lastUtteranceEndRef.current || startedAt
+    const timing: UtteranceTiming = {}
+    if (lastSpeechEndRef.current > 0) timing.speechEndAt = lastSpeechEndRef.current
+    const transcription = timedSamples(samples, runLimited, timing).text
+    void transcription.catch(() => undefined)
+    // Identify only after the gate. Calling it on mixed overlapping audio would
+    // update the owner/guest clusters with two voices and degrade all later
+    // attribution, so the fallback path must keep using the separated sources.
+    const probe = Promise.race<OverlapProbe | null>([
+      probeSpeakerOverlap(samples).catch(() => null),
+      new Promise((resolve) => setTimeout(() => resolve(null), 450)),
+    ])
+    classifyRef.current = classifyRef.current.then(async () => {
+      const verdict = await probe
+      const gateDoneAt = Date.now()
+      const base: SeparationLatencyDetail = {
+        mode: 'fast',
+        gateReason: verdict?.reason ?? 'probe-failed',
+        ...(verdict?.minSimilarity === undefined ? {} : { selfSimilarity: verdict.minSimilarity }),
+        ...(verdict?.ownerSimilarity === undefined ? {} : { ownerSimilarity: verdict.ownerSimilarity }),
+        ...(verdict === null ? {} : { wallMs: gateDoneAt - startedAt }),
+        modelCalls: 0,
+      }
+      timing.separationDoneAt = gateDoneAt
+      timing.separation = base
+      if (verdict?.singleSpeaker === true) {
+        const identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin)
+          .catch(() => null)
+        enqueueFastSingle(identity, transcription, timing, scheduler, utteranceEnd, true, prefs)
+        return
+      }
+
+      // Not confidently single: use the exact previous separation pipeline.
+      // The mixed ASR already running is simply left to finish unused; it never
+      // blocks this fallback, and a separation failure can still reuse it.
+      let split: SeparationResult | null = null
+      try {
+        split = await separateSegment(samples, sessionId, prefs.speakerThreshold, true, prefs.ownerMargin)
+      } catch (failure) {
+        console.warn('[dsh-voice-dialog] on-demand separation failed', failure)
+      }
+      const separationDoneAt = Date.now()
+      timing.separationDoneAt = separationDoneAt
+      timing.separation = {
+        ...base,
+        mode: 'fallback',
+        ...(split?.queueMs === undefined ? {} : { queueMs: split.queueMs }),
+        ...(split?.workerMs === undefined ? {} : { modelMs: split.workerMs }),
+        ...(split?.wallMs === undefined ? {} : { wallMs: split.wallMs }),
+        modelCalls: split === null ? 0 : 1,
+        gateReason: base.gateReason,
+      }
+      if (split?.separated === true && split.sources.length >= 2) {
+        enqueueSeparated(split, scheduler, runLimited, timing.separation)
+        return
+      }
+      // The model found one dominant stream, or failed. The raw transcript is
+      // already in flight, so this is a zero-extra-inference safety net.
+      const sourceIdentity = split?.sources?.[0]?.identity ?? null
+      const identity = sourceIdentity ?? await identifySpeaker(samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin)
+        .catch(() => null)
+      enqueueFastSingle(identity, transcription, timing, scheduler, utteranceEnd, false, prefs)
+    }).catch((failure: unknown) => {
+      console.warn('[dsh-voice-dialog] fast speaker gate failed', failure)
     })
   }
 
@@ -1020,13 +2110,16 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
 
     if (canSeparate) {
       try {
-        const split = await separateSegment(samples, sessionId, prefs.speakerThreshold)
+        const split = await separateSegment(samples, sessionId, prefs.speakerThreshold, true, prefs.ownerMargin)
         if (split.separated && split.sources.length >= 2) {
           enqueueSeparated(split, scheduler, runLimited)
           return
         }
         identity = split.sources[0]?.identity ?? null
-        if (identity) setSpeaker(displaySpeaker(sessionId, identity.label))
+        if (identity) {
+          setSpeaker(displaySpeaker(sessionId, identity.label))
+          reportSpeech(sessionId, 'speaker', displaySpeaker(sessionId, identity.label))
+        }
       } catch (failure) {
         // Separation is an enhancement. A missing device, model, or a rare
         // inference failure must leave ordinary dictation untouched.
@@ -1040,13 +2133,14 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     if (!identity && (prefs.speakerPrefix || prefs.speakerGate || prefs.guestMode !== 'steer'
       || speakerPolicy.hasCustomization(sessionId))) {
       try {
-        identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold)
+        identity = await identifySpeaker(samples, sessionId, prefs.speakerThreshold, prefs.ownerMargin)
         setSpeaker(displaySpeaker(sessionId, identity.label))
+        reportSpeech(sessionId, 'speaker', displaySpeaker(sessionId, identity.label))
       } catch (failure) {
         // A missing model must not break normal dictation; the gate is
         // stricter because it is an explicit "only me" promise.
         if (prefs.speakerGate) {
-          const message = failure instanceof Error ? failure.message : String(failure)
+          const message = failureText(failure)
           setError(message)
           return
         }
@@ -1071,18 +2165,20 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     if (lane === 'guest') setSpeaker(display || '其他人')
 
     const prefix = prefs.speakerPrefix && display ? '[声纹：' + display + '] ' : ''
+    const timing: UtteranceTiming = {}
+    if (lastSpeechEndRef.current > 0) timing.speechEndAt = lastSpeechEndRef.current
     const work = speculative
       ? (async () => {
           const text = await speculative
           return text ? prefix + text : null
         })()
-      : runLimited(async () => {
-          const text = await transcribeSamples(samples)
+      : (async () => {
+          const timed = timedSamples(samples, runLimited, timing)
+          const text = await timed.text
           return text ? prefix + text : null
-        })
-    enqueueWithOrganizer(lane, canonical, work, scheduler)
+        })()
+    enqueueWithOrganizer(lane, canonical, work, scheduler, lastUtteranceEndRef.current || Date.now(), false, timing)
   }
-
   const handleSegment = (
     samples: Float32Array,
     scheduler: SpeechScheduler,
@@ -1093,7 +2189,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     classifyRef.current = classifyRef.current
       .then(() => scheduleSegment(samples, scheduler, runLimited))
       .catch((failure: unknown) => {
-        const message = failure instanceof Error ? failure.message : String(failure)
+        const message = failureText(failure)
         setError(message)
         console.warn('[dsh-voice-dialog]', message)
       })
@@ -1134,7 +2230,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       setQueued(queued)
     },
     onError: (failure) => {
-      const message = failure instanceof Error ? failure.message : String(failure)
+      const message = failureText(failure)
       setError(message)
       console.warn('[dsh-voice-dialog]', message)
     },
@@ -1143,7 +2239,21 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const start = async (): Promise<void> => {
     setError('')
     setSpeaker('')
+    // Do not pre-judge the origin: a browser flag or a proxy can make
+    // getUserMedia work on an origin that reports isSecureContext=false. Only
+    // refuse when the API is genuinely absent, and let the real error surface.
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('这个浏览器没有麦克风接口：用 https 地址或换浏览器再试')
+      setPhase('idle')
+      return
+    }
     setPhase('starting')
+    // A dismissed permission prompt can leave the promise pending forever, and
+    // the button stays disabled ("tapping does nothing"). Give up and re-arm.
+    const startGuard = setTimeout(() => {
+      setError('启动超时：检查麦克风权限，或换用 https 地址再试')
+      setPhase('idle')
+    }, 15_000)
     try {
       const prefs = getPreferences()
       separationReadyRef.current = false
@@ -1152,9 +2262,16 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         try {
           const status = await fetchSeparationStatus()
           separationReadyRef.current = status.ready
-          // Loading the 245 MB model takes a couple of seconds; do it while
-          // the user is still listening, not after the first overlap.
-          if (status.ready) void warmSeparation().catch(() => undefined)
+          // Build the ONNX session before the microphone opens. The previous
+          // fire-and-forget warm could still be loading when the first sentence
+          // ended, which put session creation (1.5-2 s) inside separationWaitMs.
+          if (status.ready) {
+            try { await warmSeparation() }
+            catch (failure) {
+              separationReadyRef.current = false
+              console.warn('[dsh-voice-dialog] separation warmup failed', failure)
+            }
+          }
         } catch {
           // Separation is optional; ordinary dictation must still start.
         }
@@ -1168,8 +2285,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       if (!catalog.ok) throw new Error(catalog.error?.message ?? '语音识别服务不可用')
       const provider = catalog.value.providers.find((item: any) => item.id === catalog.value.selection.providerId)
       if (!provider || !['ready', 'standby', 'waking'].includes(provider.preparation.phase)) {
-        setError('语音模型未就绪，请在插件设置中准备')
-        openSettings(ctx)
+        // No sheet any more: the message itself has to carry the next step.
+        setError('语音模型未就绪：到插件设置页点“准备语音模型”，再回来点麦克风')
         setPhase('idle')
         return
       }
@@ -1178,23 +2295,40 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       schedulerRef.current = scheduler
       classifyRef.current = Promise.resolve()
       lastLaneTextRef.current = new Map()
+      lastOwnerInputRef.current = ''
       setPending(0)
       setQueued(0)
       const runLimited = createLimit(prefs.parallelAsr ? 3 : 1)
       const continuous = prefs.separateSpeakers && separationReadyRef.current
+      // The fast path still uses the continuous microphone VAD, but not the
+      // continuous separator: raw ASR starts at the endpoint and separation is
+      // only invoked if the cheap speaker gate says it may be overlapping.
+      const fastPath = continuous && prefs.separationFastPath
       separatorRef.current?.close()
       separatorRef.current = null
       let separator: ContinuousSeparation | null = null
-      if (continuous) {
+      if (continuous && !fastPath) {
         separator = new ContinuousSeparation({
           sampleRate: 16_000,
+          // A shorter window and step cut the dead time between the last
+          // syllable and the moment the segment is handed to recognition.
+          windowMs: 3000,
+          hopMs: 700,
+          // One pause value for both paths: the per-source tail must match the
+          // number the user picked, or the custom setting only half applies.
+          silenceMs: getPreferences().pauseMs,
           separate: async (window) => {
-            const split = await separateSegment(window, sessionId, prefs.speakerThreshold, false)
+            const split = await separateSegment(window, sessionId, prefs.speakerThreshold, false, prefs.ownerMargin)
             return {
               sources: split.sources.map((source) => ({
                 samples: decodeWaveBase64(source.audioBase64),
                 rms: source.rms,
               })),
+              timing: {
+                queueMs: split.queueMs ?? 0,
+                modelMs: split.workerMs ?? split.elapsedMs,
+                wallMs: split.wallMs ?? split.elapsedMs,
+              },
             }
           },
           onSegment: (segment) => { enqueueContinuous(segment, scheduler, runLimited) },
@@ -1207,18 +2341,73 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
         silenceMs: getPreferences().pauseMs,
-        threshold: getPreferences().micThreshold,
+        // 0 = adaptive noise floor; a positive preference pins the gate.
+        threshold: getPreferences().micThreshold > 0 ? getPreferences().micThreshold : undefined,
         continuous,
-        onFrame: continuous ? (samples) => { separator?.push(samples) } : undefined,
+        onFrame: continuous && !fastPath ? (samples) => { separator?.push(samples) } : undefined,
         onLevel: (value) => setLevel(value),
-        onSpeechStart: () => { sharedPlayer.unmute(); sharedPlayer.duck() },
-        onSpeechEnd: () => { sharedPlayer.restore() },
-        onSegment: continuous ? undefined : (samples) => { handleSegment(samples, scheduler, runLimited) },
+        playbackState: () => sharedPlayer.playbackState(),
+        onSpeechStart: (onset) => {
+          speechOnsetAt = onset.startedAt
+          reportSpeech(sessionId, 'start')
+          // Sound alone is not an interruption: the volume ducks, the sentence
+          // plays on. Only the host/model decides whether to hold or stop.
+          sharedPlayer.unmute()
+          if (holdTimer !== null) { clearTimeout(holdTimer); holdTimer = null }
+          sharedPlayer.duck()
+        },
+        onPlaybackStuck: () => {
+          // Last-resort only. The host has had a full second of speech:start and
+          // still has the mouth open, so stop the feedback loop once.
+          if (!sharedPlayer.playbackState().playing) return
+          sharedPlayer.cut(0, () => true)
+        },
+        // Legacy continuous path only: overlap the speculative separation
+        // with the endpoint wait. The fast path deliberately runs no model.
+        onSpeechTail: () => { separator?.prewarm() },
+        onSpeechEnd: () => {
+          const spokeMs = speechOnsetAt > 0 ? Date.now() - speechOnsetAt : 0
+          speechOnsetAt = 0
+          reportSpeech(sessionId, 'end')
+          sharedPlayer.restore()
+          // Only meaningful if a sentence was actually held; a decision that
+          // never arrives must not leave the reading stopped.
+          sharedPlayer.resumeAfterSpeech(resumeDelayForUtterance(spokeMs))
+          const now = Date.now()
+          lastUtteranceEndRef.current = now
+          lastSpeechEndRef.current = Math.max(0, now - getPreferences().pauseMs)
+          // Keep the mixed tail: if only one person is talking, its transcript
+          // can stand in for the separated lane and save a whole ASR call.
+          const tail = separator?.takeMixedTail()
+          if (tail && tail.length > 0) {
+            const samples = tail.length
+            const timing: UtteranceTiming = {}
+            const text = runLimited(async () => {
+              const call = await transcribeTimed(audioBase64(encodeWave(tail)))
+              timing.asrStartAt = call.startedAt
+              timing.asrDoneAt = call.doneAt
+              if (call.inferMs !== undefined) timing.asrInferMs = call.inferMs
+              return call.text
+            })
+            mixedTailRef.current = { samples, at: Date.now(), text, timing }
+            void text.catch(() => undefined)
+          }
+          // Do not wait for the next hop: the moment the speaker stops, the
+          // trailing window is flushed through separation instead of sitting
+          // in the buffer for up to a full step (0.7 s by default).
+          void separator?.flush()
+            .then(() => { if (separator) reportSeparationPressure(separator) })
+            .catch(() => undefined)
+        },
+        onSegment: fastPath
+          ? (samples) => { handleFastSegment(samples, scheduler, runLimited) }
+          : continuous ? undefined : (samples) => { handleSegment(samples, scheduler, runLimited) },
         onError: (failure) => {
-          setError(failure instanceof Error ? failure.message : String(failure))
+          setError(failureText(failure))
         },
       })
       await mic.start()
+      clearTimeout(startGuard)
       micRef.current = mic
       cancelRetainedStop()
       retainedMic = mic
@@ -1228,11 +2417,12 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       setActive(true)
       setPhase('listening')
     } catch (failure) {
+      clearTimeout(startGuard)
       separatorRef.current?.close()
       separatorRef.current = null
       schedulerRef.current?.dispose()
       schedulerRef.current = null
-      setError(failure instanceof Error ? failure.message : String(failure))
+      setError(failureText(failure))
       setPhase('idle')
     }
   }
@@ -1265,20 +2455,30 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
 
   return <>
     <style>{MIC_CSS}</style>
-    <Tooltip label={label} side="top" portal>
-      <span className="dsh-vd-anchor">
-        <Button className="dsh-vd-mic" size="sm" disabled={phase === 'starting'}
-          aria-label={error ? `语音对话出错：${error}` : '开始语音对话'}
-          aria-busy={phase === 'starting'} onClick={toggle}>
-          <IconMicrophoneOutlineRegular size={18} />
-        </Button>
-      </span>
-    </Tooltip>
+    <span className="dsh-vd-row" data-voice-error={error ? 'true' : 'false'}>
+      <Tooltip label={label} side="top" portal>
+        <span className="dsh-vd-anchor">
+          <Button className="dsh-vd-mic" size="sm" disabled={phase === 'starting'}
+            aria-label={error ? `语音对话出错：${error}` : '开始语音对话'}
+            aria-busy={phase === 'starting'}
+            onClick={toggle}>
+            <IconMicrophoneOutlineRegular size={18} />
+          </Button>
+        </span>
+      </Tooltip>
+      {error && <span className="dsh-vd-inlineError" role="alert">{error}</span>}
+    </span>
+    {banner && <div className="dsh-vd-banner" role="alert">
+      <span className="dsh-vd-bannerText">{banner}</span>
+      <button type="button" className="dsh-vd-bannerClose" aria-label="关闭提示"
+        onClick={() => { setBanner('') }}><IconCloseOutlineRegular size={14} /></button>
+    </div>}
   </>
 }
 
 const MIC_CSS = `
 .dsh-vd-anchor { position: relative; display: inline-flex; flex: none; }
+.dsh-vd-row { display: inline-flex; align-items: center; gap: 6px; }
 .dsh-vd-mic { width: 28px; padding: 0; flex: none; }
 .dsh-vd-captureRow { display: flex; align-items: center; gap: 12px; width: 100%; min-width: 0; min-height: 34px; }
 .dsh-vd-round { width: 32px; height: 32px; padding: 0; border-radius: 50%; flex: none;
@@ -1288,6 +2488,16 @@ const MIC_CSS = `
   color: var(--dsw-alias-label-secondary); }
 .dsh-vd-activity { display: flex; align-items: center; flex: 1; min-width: 0; font-size: 12px;
   color: var(--dsw-alias-label-secondary); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* A phone has no tooltip: the failure has to occupy real space. */
+.dsh-vd-inlineError { max-width: 320px; font-size: 12px; line-height: 1.4; color: var(--dsw-alias-label-error, #d4380d); }
+.dsh-vd-banner { position: fixed; left: 8px; right: 8px; bottom: 14px; z-index: 70; display: flex;
+  align-items: center; gap: 8px; padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.45;
+  color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-overlay, #1f1f1f);
+  border: 1px solid var(--dsw-alias-border-l1); box-shadow: 0 6px 24px rgb(0 0 0 / 35%); }
+.dsh-vd-bannerText { flex: 1; min-width: 0; }
+.dsh-vd-bannerClose { flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border: none; border-radius: 8px; background: transparent;
+  color: var(--dsw-alias-label-secondary); cursor: pointer; }
 `
 
 interface VoiceSettingsProps {
@@ -1300,6 +2510,10 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
   const [host, setHost] = useState<HostConfig | null>(null)
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
   const [busy, setBusy] = useState(false)
+  const [pauseDraft, setPauseDraft] = useState(String(getPreferences().pauseMs))
+  // '自定义' is not a stored value, so remember the choice locally; otherwise
+  // the select snaps back to the preset the moment the option is picked.
+  const [customPause, setCustomPause] = useState(false)
   const [catalogError, setCatalogError] = useState('')
   const [actionError, setActionError] = useState('')
   const [voiceprint, setVoiceprint] = useState<VoiceprintStatus | null>(null)
@@ -1320,13 +2534,13 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     let stopped = false
     const tick = async (): Promise<void> => {
       try {
-        const result = await ctx.remote.speech.catalog()
+        const result = await requireSpeech(ctx).catalog()
         if (!stopped) {
           if (result.ok) { setCatalog(result.value); setCatalogError('') }
           else setCatalogError(result.error?.message ?? '语音识别服务未连接')
         }
       } catch (failure) {
-        if (!stopped) setCatalogError(failure instanceof Error ? failure.message : String(failure))
+        if (!stopped) setCatalogError(failureText(failure))
       }
     }
     void tick()
@@ -1347,7 +2561,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       setVoiceprint(await fetchVoiceprintStatus())
       setVoiceprintError('')
     } catch (failure) {
-      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+      setVoiceprintError(failureText(failure))
     }
   }
 
@@ -1356,7 +2570,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       setSeparation(await fetchSeparationStatus())
       setSeparationError('')
     } catch (failure) {
-      setSeparationError(failure instanceof Error ? failure.message : String(failure))
+      setSeparationError(failureText(failure))
     }
   }
 
@@ -1366,7 +2580,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     try {
       setSeparation(await prepareSeparation())
     } catch (failure) {
-      setSeparationError(failure instanceof Error ? failure.message : String(failure))
+      setSeparationError(failureText(failure))
     } finally {
       setSeparationBusy(false)
     }
@@ -1378,7 +2592,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     try {
       setVoiceprint(await prepareVoiceprint())
     } catch (failure) {
-      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+      setVoiceprintError(failureText(failure))
     } finally {
       setVoiceprintBusy('')
     }
@@ -1407,7 +2621,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       }
       setVoiceprint(await fetchVoiceprintStatus())
     } catch (failure) {
-      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+      setVoiceprintError(failureText(failure))
     } finally {
       setRecording(false)
       setRecordingTarget('')
@@ -1432,7 +2646,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       await renameOtherVoiceprint(profile.id, name)
       setVoiceprint(await fetchVoiceprintStatus())
     } catch (failure) {
-      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+      setVoiceprintError(failureText(failure))
     } finally {
       setSpeakerBusy('')
     }
@@ -1446,7 +2660,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       await removeOtherVoiceprint(profile.id)
       setVoiceprint(await fetchVoiceprintStatus())
     } catch (failure) {
-      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+      setVoiceprintError(failureText(failure))
     } finally {
       setSpeakerBusy('')
     }
@@ -1459,7 +2673,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       await forgetVoiceprint()
       await refreshVoiceprint()
     } catch (failure) {
-      setVoiceprintError(failure instanceof Error ? failure.message : String(failure))
+      setVoiceprintError(failureText(failure))
     } finally {
       setVoiceprintBusy('')
     }
@@ -1540,7 +2754,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       const saved = await response.json() as { voice?: string }
       setHost((current) => current ? { ...current, voice: saved.voice ?? next } : current)
     } catch (failure) {
-      setActionError(failure instanceof Error ? failure.message : String(failure))
+      setActionError(failureText(failure))
     } finally { setBusy(false) }
   }
 
@@ -1553,7 +2767,7 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
       const saved = await response.json() as { rate?: number }
       setHost((current) => current ? { ...current, rate: saved.rate ?? next } : current)
     } catch (failure) {
-      setActionError(failure instanceof Error ? failure.message : String(failure))
+      setActionError(failureText(failure))
     }
   }
 
@@ -1589,18 +2803,24 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
     } catch (failure) {
       stopPreview()
       if (speakPreviewFallback()) return
-      setActionError(failure instanceof Error ? failure.message : String(failure))
+      setActionError(failureText(failure))
     } finally { setBusy(false) }
   }
 
   const save = (patch: Partial<VoiceDialogPreferences>): void => { setPreferences(patch); setPrefs(getPreferences()) }
+  const commitPause = (raw: string): void => {
+    const number = Number(raw)
+    if (!Number.isFinite(number)) { setPauseDraft(String(prefs.pauseMs)); return }
+    save({ pauseMs: number })
+    setPauseDraft(String(getPreferences().pauseMs))
+  }
   const invoke = async (action: () => Promise<any>): Promise<void> => {
     setBusy(true); setActionError('')
     try {
       const result = await action()
       if (result && result.ok === false) throw new Error(result.error?.message ?? '操作失败')
     } catch (failure) {
-      setActionError(failure instanceof Error ? failure.message : String(failure))
+      setActionError(failureText(failure))
     } finally { setBusy(false) }
   }
 
@@ -1625,7 +2845,9 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
         onChange={(event) => { save({ autoRead: event.target.checked }) }} />自动朗读助手回复</label>
       <label>朗读音量<input type="range" min="0" max="1" step="0.05" value={prefs.volume}
         onChange={(event) => { save({ volume: Number(event.target.value) }) }} /><span>{Math.round(prefs.volume * 100)}%</span></label>
-      <label>说话时压低到<input type="range" min="0" max="0.6" step="0.02" value={prefs.duckLevel}
+      <label>响度<input type="range" min="1" max="2.5" step="0.1" value={prefs.speechBoost}
+        onChange={(event) => { save({ speechBoost: Number(event.target.value) }) }} /><span>{prefs.speechBoost.toFixed(1)}×</span></label>
+      <label>说话时压低到<input type="range" min="0.8" max="1" step="0.02" value={prefs.duckLevel}
         onChange={(event) => { save({ duckLevel: Number(event.target.value) }) }} /><span>{Math.round(prefs.duckLevel * 100)}%</span></label>
       <label>语速<input type="range" min="-50" max="50" step="5" value={rate} disabled={!host}
         onChange={(event) => { changeRate(Number(event.target.value)) }} /><span>{rate > 0 ? '+' : ''}{rate}%</span></label>
@@ -1646,27 +2868,40 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
 
     <section>
       <h3>语音识别</h3>
-      <label>停顿多久算说完<select value={String(prefs.pauseMs)} disabled={busy}
-        onChange={(event) => { save({ pauseMs: Number(event.target.value) }) }}>
-        <option value="1200">1.2 秒（快，容易截话）</option>
-        <option value="1600">1.6 秒（默认）</option>
-        <option value="2000">2.0 秒（少截话）</option>
-        <option value="2500">2.5 秒（慢，适合思考）</option>
-      </select></label>
+      <label>停顿多久算说完
+        <select
+          value={customPause || !PAUSE_PRESETS.some(([ms]) => ms === prefs.pauseMs) ? 'custom' : String(prefs.pauseMs)}
+          disabled={busy}
+          onChange={(event) => {
+            if (event.target.value === 'custom') { setCustomPause(true); return }
+            setCustomPause(false)
+            commitPause(event.target.value)
+          }}>
+          {PAUSE_PRESETS.map(([ms, text]) => <option key={ms} value={String(ms)}>{text}</option>)}
+          <option value="custom">自定义…</option>
+        </select>
+      </label>
+      {(customPause || !PAUSE_PRESETS.some(([ms]) => ms === prefs.pauseMs)) && <label>自定义毫秒数
+        <input type="number" min={400} max={4000} step={50} value={pauseDraft} disabled={busy}
+          aria-label="自定义停顿毫秒"
+          onChange={(event) => setPauseDraft(event.target.value)}
+          onBlur={(event) => commitPause(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Enter') commitPause((event.target as HTMLInputElement).value) }} />
+      </label>}
       {selection && <label>识别服务<select value={selection.providerId} disabled={busy}
-        onChange={(event) => { void invoke(() => ctx.remote.speech.configure({ providerId: event.target.value })) }}>
+        onChange={(event) => { void invoke(() => requireSpeech(ctx).configure({ providerId: event.target.value })) }}>
         {catalog.providers.map((item: any) => <option key={item.id} value={item.id}>{item.name}</option>)}
       </select></label>}
       {selection && provider && <label>语言<select value={selection.language} disabled={busy}
-        onChange={(event) => { void invoke(() => ctx.remote.speech.configure({ language: event.target.value })) }}>
+        onChange={(event) => { void invoke(() => requireSpeech(ctx).configure({ language: event.target.value })) }}>
         {provider.languages.map((language: string) => <option key={language} value={language}>{language}</option>)}
       </select></label>}
       {provider && <p>状态：{phaseLabel(phase)}{progress ? ` · ${progress}` : ''}</p>}
       {provider?.preparation?.phase === 'failed' && <p className="dsh-vd-error">{provider.preparation.message}</p>}
       {canPrepare && <button type="button" className="dsh-vd-button" disabled={busy}
-        onClick={() => { void invoke(() => ctx.remote.speech.prepare(provider.id)) }}>准备语音模型</button>}
+        onClick={() => { void invoke(() => requireSpeech(ctx).prepare(provider.id)) }}>准备语音模型</button>}
       {preparing && phase !== 'waking' && <button type="button" className="dsh-vd-button" disabled={busy}
-        onClick={() => { void invoke(() => ctx.remote.speech.cancelPreparation(provider.id)) }}>取消准备</button>}
+        onClick={() => { void invoke(() => requireSpeech(ctx).cancelPreparation(provider.id)) }}>取消准备</button>}
       {!catalog && !catalogError && <p className="dsh-vd-muted">正在连接语音识别…</p>}
       {catalogError && <p className="dsh-vd-error" role="alert">{catalogError}</p>}
     </section>
@@ -1678,9 +2913,10 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
         onChange={(event) => { save({ speakerPrefix: event.target.checked }) }} />给语音输入加声纹前缀（我 / 客人）</label>
       <label className="dsh-vd-check"><input type="checkbox" checked={prefs.speakerGate}
         onChange={(event) => { save({ speakerGate: event.target.checked }) }} />只回应我的声音</label>
-      <label>认定阈值<input type="range" min="0.35" max="0.8" step="0.01" value={prefs.speakerThreshold}
-        onChange={(event) => { save({ speakerThreshold: Number(event.target.value) }) }} /><span>{prefs.speakerThreshold.toFixed(2)}</span></label>
-      <p className="dsh-vd-muted">阈值越高越严格；别人被当成你的概率更低，但你自己也可能被忽略。建议从 0.52 开始。</p>
+      <label>认定阈值<input type="range" min={SPEAKER_THRESHOLD_MIN} max={SPEAKER_THRESHOLD_MAX} step="0.01" value={prefs.speakerThreshold}
+        onChange={(event) => { save({ speakerThreshold: Number(event.target.value) }) }} /><span>{prefs.speakerThreshold.toFixed(2)}</span></label><label>声纹抢占余量<input type="range" min="0.04" max="0.3" step="0.01" value={prefs.ownerMargin}
+onChange={(event) => { save({ ownerMargin: Number(event.target.value) }) }} /><span>{prefs.ownerMargin.toFixed(2)}</span></label>
+      <p className="dsh-vd-muted">阈值越高越严格；别人被当成你的概率更低，但你自己也可能被忽略。建议从 0.5 开始。你的声纹默认优先，低于阈值仍会先认作你。</p>
       {voiceprint === null && !voiceprintError && <p className="dsh-vd-muted">正在检查声纹模型…</p>}
       {voiceprint && <div className="dsh-vd-vpStatus">
         <span>{voiceprint.ready ? '声纹模型已就绪' : voiceprint.modelPresent ? '缺少声纹组件' : '声纹模型未安装'}</span>
@@ -1785,10 +3021,16 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
           {device.label || `麦克风 ${index + 1}`}
         </option>)}
       </select></label>
-      <label>触发门槛<input type="range" min="0.005" max="0.08" step="0.001" value={prefs.micThreshold}
-        onChange={(event) => { save({ micThreshold: Number(event.target.value) }) }} />
-        <span>{prefs.micThreshold.toFixed(3)}</span></label>
-      <p className="dsh-vd-muted">数字越小越容易触发；环境噪音大时调高，小声说话总被漏掉时调低。默认 0.022，重新开始语音后生效。</p>
+      <label>触发门槛<select value={prefs.micThreshold === 0 ? 'auto' : 'manual'}
+        onChange={(event) => { save({ micThreshold: event.target.value === 'auto' ? 0 : 0.03 }) }}>
+        <option value="auto">自动跟随环境</option>
+        <option value="manual">手动固定</option>
+      </select></label>
+      {prefs.micThreshold > 0 && <label>门槛数值
+        <input type="range" min="0.004" max="0.08" step="0.001" value={prefs.micThreshold}
+          onChange={(event) => { save({ micThreshold: Number(event.target.value) }) }} />
+        <span>{prefs.micThreshold.toFixed(3)}</span></label>}
+      <p className="dsh-vd-muted">默认自动跟着环境噪音走；数值可手动固定，越小越容易触发。重新开始语音后生效。</p>
       <p className="dsh-vd-muted">首次使用需要允许浏览器访问麦克风；手机浏览器必须通过 HTTPS 或 localhost 访问。</p>
     </section>
   </div>
@@ -1811,6 +3053,8 @@ function phaseLabel(phase: string): string {
 }
 
 const SETTINGS_CSS = `
+.dsh-vd-pauseRow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.dsh-vd-pauseRow input { width: 96px; }
 .dsh-vd-settings { display: flex; flex-direction: column; gap: 18px; max-width: 640px; padding: 4px 2px 24px; font-size: 13px; line-height: 1.6; color-scheme: light dark; }
 .dsh-vd-settings h2 { margin: 0; font-size: 18px; }
 .dsh-vd-settings h3 { margin: 0 0 10px; font-size: 14px; }
@@ -1840,4 +3084,6 @@ const SETTINGS_CSS = `
 .dsh-vd-speakers .dsh-vd-button { padding: 4px 9px; }
 .dsh-vd-recordBar { height: 6px; overflow: hidden; border-radius: 3px; background: var(--dsw-alias-interactive-bg-hover); }
 .dsh-vd-recordBar span { display: block; height: 100%; border-radius: 3px; background: var(--dsw-alias-state-business-primary); transition: width .08s linear; }
+/* Phone: one column, full-width controls, 40px touch targets, nothing hidden
+   behind hover — the same form must be usable inside the sheet at 390px. */
 `

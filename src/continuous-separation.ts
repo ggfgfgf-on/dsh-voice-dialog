@@ -7,8 +7,34 @@ export interface ContinuousSource {
   rms?: number
 }
 
+export interface SeparationWindowTiming {
+  /** Time spent behind another host-side separation request. */
+  queueMs?: number
+  /** Worker call wall time (model inference, no queueing). */
+  modelMs?: number
+  /** Full service call wall time. */
+  wallMs?: number
+}
+
 export interface ContinuousWindowResult {
   sources: ContinuousSource[]
+  /** Optional host timings, filled by the client's transport wrapper. */
+  timing?: SeparationWindowTiming
+}
+
+/** Why a window did or did not reuse its speculative inference. */
+export interface SeparationWindowDiagnostics {
+  prewarm: 'hit' | 'miss' | 'discarded'
+  /** Time resolveWindow spent waiting for an already-running prewarm. */
+  prewarmWaitMs?: number
+  queueMs?: number
+  modelMs?: number
+  wallMs?: number
+  windowMs: number
+  /** How many model calls this window needed (0 when mixed fallback). */
+  modelCalls: number
+  /** True when backpressure closed the window from the mixed stream. */
+  mixed?: boolean
 }
 
 export interface ContinuousSegment {
@@ -17,6 +43,12 @@ export interface ContinuousSegment {
   samples: Float32Array
   /** Absolute onset in the microphone timeline. */
   onsetMs: number
+  /** Idempotency key; one utterance may reach the model only once. */
+  utteranceId?: string
+  /** True when the other lane carried speech in the same window. */
+  siblingActive?: boolean
+  /** Measured composition of the separation wait for this segment. */
+  separation?: SeparationWindowDiagnostics
 }
 
 export interface ContinuousSeparationOptions {
@@ -29,6 +61,12 @@ export interface ContinuousSeparationOptions {
   maxSegmentMs?: number
   /** Absolute RMS floor; each source's VAD threshold adapts above it. */
   threshold?: number
+  /** A window slower than this means the model is behind real time. */
+  hopBudgetMs?: number
+  /** Hard cap on how long flush() may keep running the model. */
+  flushBudgetMs?: number
+  /** When behind, skip whole windows instead of queueing more inferences. */
+  skipWhileBehind?: boolean
   separate: (samples: Float32Array, startSample: number) => Promise<ContinuousWindowResult>
   onSegment: (segment: ContinuousSegment) => void
   onError?: (error: unknown) => void
@@ -39,6 +77,9 @@ interface PendingSegment {
   samples: Float32Array
   onsetMs: number
   onsetSample: number
+  utteranceId?: string
+  siblingActive?: boolean
+  separation?: SeparationWindowDiagnostics
 }
 
 interface Lane {
@@ -142,6 +183,48 @@ export class ContinuousSeparation {
   private stopped = false
   private previous: { sources: [Float32Array, Float32Array]; start: number } | undefined
   private ready: PendingSegment[] = []
+  /**
+   * Speculative separation of the window that is about to close. Filled while
+   * the speaker is still finishing the sentence, so the 374 ms inference is
+   * not paid again after the VAD decides the utterance ended.
+   */
+  private prewarmJob: {
+    received: number
+    lastActivity: number
+    windowStart: number
+    available: number
+    result?: ContinuousWindowResult
+    timing?: SeparationWindowTiming
+    failed?: boolean
+  } | null = null
+  private prewarmPromise: Promise<void> | null = null
+  private prewarmToken = 0
+  /**
+   * Backpressure state. A separation window that costs more than one hop means
+   * the model cannot keep up with real time; queueing the next window anyway
+   * makes the backlog grow with every sentence the person speaks, which is the
+   * "it gets slower the longer I use it" report. Skipping every other window
+   * keeps a bounded, non-growing delay.
+   */
+  private readonly hopBudgetMs: number
+  private readonly flushBudgetMs: number
+  private readonly skipWhileBehind: boolean
+  private lastWindowMs = 0
+  private lastModelMs = 0
+  private flushDeadline = 0
+  private flushMs = 0
+  private flushTruncated = false
+  private skippedWindows = 0
+  private allowModelOnce = false
+  private windowSkipped = false
+  /** Set while flush() closes the tail without the model, so no word is lost. */
+  private forceMixed = false
+  private readonly prewarmStats = { started: 0, reused: 0, discarded: 0, missed: 0 }
+  private lastWindowReused = false
+  private lastWindowDiagnostics: SeparationWindowDiagnostics | undefined
+  /** Mixed-stream ring buffer, for the single-speaker speculative ASR. */
+  private mixedTail: Float32Array = new Float32Array(0)
+  private utteranceSeq = 0
 
   constructor(options: ContinuousSeparationOptions) {
     this.sampleRate = Math.max(1000, Math.floor(options.sampleRate ?? 16_000))
@@ -150,6 +233,9 @@ export class ContinuousSeparation {
     this.windowSamples = Math.round(this.sampleRate * windowMs / 1000)
     this.hopSamples = Math.round(this.sampleRate * hopMs / 1000)
     this.silenceSamples = Math.round(this.sampleRate * Math.max(100, options.silenceMs ?? 1600) / 1000)
+    this.hopBudgetMs = Math.max(40, options.hopBudgetMs ?? hopMs)
+    this.flushBudgetMs = Math.max(200, options.flushBudgetMs ?? 1200)
+    this.skipWhileBehind = options.skipWhileBehind !== false
     this.minSpeechSamples = Math.round(this.sampleRate * Math.max(50, options.minSpeechMs ?? 260) / 1000)
     this.maxSegmentSamples = Math.round(this.sampleRate * Math.max(windowMs, options.maxSegmentMs ?? 20_000) / 1000)
     this.preRollSamples = Math.round(this.sampleRate * 0.32)
@@ -169,8 +255,91 @@ export class ContinuousSeparation {
     const keep = this.windowSamples * 4
     if (this.buffer.length > keep) this.buffer = this.buffer.slice(this.buffer.length - keep)
     this.received += chunk.length
-    if (rmsOf(chunk) >= this.floorThreshold) this.lastActivitySample = this.received
+    if (rmsOf(chunk) >= this.floorThreshold) {
+      this.lastActivitySample = this.received
+      // New speech after the tail went quiet means the prewarmed window no
+      // longer describes the utterance that closes; drop it and let the
+      // regular path recompute. The in-flight promise keeps running but its
+      // token no longer matches, so it can never be reused.
+      if (this.prewarmJob) {
+        if (!this.prewarmJob.failed) {
+          this.prewarmStats.discarded += 1
+          this.prewarmStats.missed += 1
+        }
+        this.prewarmJob = null
+        this.prewarmToken += 1
+      }
+    }
+    this.mixedTail = this.mixedTail.length === 0
+      ? new Float32Array(chunk)
+      : concat(this.mixedTail, chunk)
+    if (this.mixedTail.length > this.windowSamples) {
+      this.mixedTail = this.mixedTail.slice(this.mixedTail.length - this.windowSamples)
+    }
     this.maybeProcess()
+  }
+
+  /**
+   * Speculatively separate the window that would be used if the utterance
+   * closed right now. Safe to call repeatedly from the microphone's tail-timer
+   * callback: one inference at a time, reused at most once.
+   */
+  prewarm(): void {
+    if (this.stopped || this.prewarmPromise) return
+    // Speculating while the model is already behind turns one backlog into two.
+    if (this.isLagging()) return
+    if (!this.lanes.some((lane) => lane.active)) return
+    if (!this.hasWindow(true)) return
+    const bufferStart = this.received - this.buffer.length
+    let windowStart = this.previous ? this.previous.start + this.hopSamples : bufferStart
+    if (windowStart < bufferStart) windowStart = bufferStart
+    const available = Math.min(this.windowSamples, this.received - windowStart)
+    if (available <= 0) return
+    if (this.prewarmJob
+      && this.prewarmJob.windowStart === windowStart
+      && this.prewarmJob.available === available
+      && this.prewarmJob.received === this.received) return
+    const offset = Math.max(0, windowStart - bufferStart)
+    const window = new Float32Array(this.windowSamples)
+    window.set(this.buffer.subarray(offset, offset + available), 0)
+    const token = ++this.prewarmToken
+    const job = {
+      received: this.received,
+      lastActivity: this.lastActivitySample,
+      windowStart,
+      available,
+    }
+    this.prewarmJob = job
+    this.prewarmStats.started += 1
+    this.prewarmPromise = this.separate(window, windowStart).then((result) => {
+      if (token !== this.prewarmToken || this.prewarmJob !== job) return
+      job.result = result
+      job.timing = result.timing
+    }).catch(() => {
+      if (token !== this.prewarmToken || this.prewarmJob !== job) return
+      job.failed = true
+    }).finally(() => {
+      if (token === this.prewarmToken) this.prewarmPromise = null
+    })
+  }
+
+  /** Prewarm counters plus the current hit rate, for the latency report. */
+  prewarmReport(): { started: number; reused: number; discarded: number; missed: number; hitRate: number } {
+    const { started, reused, discarded, missed } = this.prewarmStats
+    const attempts = reused + missed
+    return { started, reused, discarded, missed, hitRate: attempts === 0 ? 0 : reused / attempts }
+  }
+
+  /** True when the most recent window reused a speculative result. */
+  consumeLastReused(): boolean {
+    const value = this.lastWindowReused
+    this.lastWindowReused = false
+    return value
+  }
+
+  /** Copy of the mixed tail, for a speculative single-speaker ASR. */
+  takeMixedTail(): Float32Array {
+    return new Float32Array(this.mixedTail)
   }
 
   /** Finish buffered audio and emit every active lane. */
@@ -182,16 +351,47 @@ export class ContinuousSeparation {
       this.finalizeAll()
       return
     }
-    if (this.processing) await this.processing.catch(() => undefined)
     // Drain every remaining hop. The last window may be shorter than 4 s;
-    // zero-padding it still lets the model separate the tail.
-    for (let guard = 0; guard < 32 && this.hasWindow(true); guard++) {
-      const before = this.previous?.start
-      await this.run(true)
-      if (this.processing) await this.processing.catch(() => undefined)
-      if (this.previous?.start === before) break
+    // zero-padding it still lets the model separate the tail. The drain is
+    // capped: past the budget the remaining audio closes without a speaker
+    // split, because a late transcript is worse than a merged one — and, more
+    // importantly, because waiting for the model is what used to make the next
+    // sentence start late, which then made the queue grow.
+    const flushStartedAt = Date.now()
+    this.flushTruncated = false
+    this.flushDeadline = flushStartedAt + this.flushBudgetMs
+    try {
+      if (this.processing) {
+        await this.processing.catch(() => undefined)
+        if (Date.now() >= this.flushDeadline) this.flushTruncated = true
+      }
+      for (let guard = 0; guard < 32 && this.hasWindow(true); guard++) {
+        const remaining = this.flushDeadline - Date.now()
+        // Start another window only when the budget can pay for it: a call that
+        // lands past the deadline is exactly the unbounded wait flush() exists
+        // to remove.
+        const expected = this.lastModelMs > 0 ? this.lastModelMs : this.hopBudgetMs
+        if (remaining <= 0 || remaining < expected) {
+          // Close the tail from the mixed stream: a truncated flush must not
+          // drop words, only the speaker split.
+          this.flushTruncated = true
+          await this.coverMixedTail()
+          break
+        }
+        const before = this.previous?.start
+        await this.run(true)
+        if (this.processing && Date.now() < this.flushDeadline) {
+          await this.processing.catch(() => undefined)
+        }
+        if (this.previous?.start === before) break
+      }
+    } finally {
+      if (Date.now() - flushStartedAt > this.flushBudgetMs) this.flushTruncated = true
+      this.flushDeadline = 0
     }
-    if (this.processing) await this.processing.catch(() => undefined)
+    this.flushMs = Date.now() - flushStartedAt
+    // Never wait for a window that would land past the budget: the lanes close
+    // with the audio they already have.
     this.finalizeAll()
   }
 
@@ -217,6 +417,13 @@ export class ContinuousSeparation {
 
   private maybeProcess(): void {
     if (this.stopped) return
+    // A finishing window re-arms the pipeline through this method. Once the
+    // flush deadline has passed that re-arm would keep the last utterance
+    // waiting for windows nobody is listening to any more.
+    if (this.flushDeadline > 0 && Date.now() >= this.flushDeadline) {
+      this.flushTruncated = true
+      return
+    }
     // Do not run the separation model on an idle room. Keep the last 4 s in
     // the ring buffer so speech that starts after a quiet gap still has a
     // complete window; an active lane must still be processed so its own
@@ -262,13 +469,25 @@ export class ContinuousSeparation {
     const window = new Float32Array(this.windowSamples)
     window.set(this.buffer.subarray(offset, offset + available), 0)
     let result: ContinuousWindowResult
+    const startedAt = Date.now()
     try {
-      result = await this.separate(window, windowStart)
+      const resolved = await this.resolveWindow(window, windowStart, available)
+      result = resolved.result
+      this.lastWindowDiagnostics = resolved.diagnostics
     } catch (error) {
       // Separation is optional: keep dictating the mixed stream rather than
       // dropping the utterance. The next window retries the model.
       this.onError(error)
       result = { sources: [{ samples: window, rms: rmsOf(window) }] }
+      this.lastWindowDiagnostics = {
+        prewarm: 'miss', windowMs: Date.now() - startedAt, modelCalls: 0, mixed: true,
+      }
+    } finally {
+      this.lastWindowMs = Date.now() - startedAt
+      // A skipped window is fast by construction; judging the backlog on it
+      // would immediately re-enable the model and rebuild the queue.
+      if (!this.windowSkipped) this.lastModelMs = this.lastWindowMs
+      this.windowSkipped = false
     }
     if (this.stopped) return
 
@@ -347,6 +566,128 @@ export class ContinuousSeparation {
     this.coveredUntil = Math.max(this.coveredUntil, windowStart + available)
   }
 
+  /**
+   * Prefer the speculative result when it describes exactly this window. An
+   * in-flight prewarm for the same window is awaited instead of started
+   * twice: its 374 ms inference is already running.
+   */
+  private async resolveWindow(
+    window: Float32Array,
+    windowStart: number,
+    available: number,
+  ): Promise<{ result: ContinuousWindowResult; diagnostics: SeparationWindowDiagnostics }> {
+    const job = this.prewarmJob
+    // A tail prewarm is computed 250 ms into the closing silence. More silence
+    // arrives before the endpoint, so its `received` counter is intentionally
+    // older than the final one. The result is still valid when (a) it starts at
+    // the same window, (b) no new speech sample arrived after it started, and
+    // (c) it already contains every sample up to the last activity. The extra
+    // samples on the final window are trailing silence; zero padding them is
+    // equivalent to the smaller snapshot and saves a second 700 ms inference.
+    const speechThrough = Math.min(this.windowSamples, Math.max(0, this.lastActivitySample - windowStart))
+    const matches = job !== null
+      && job.windowStart === windowStart
+      && job.lastActivity === this.lastActivitySample
+      && job.available >= speechThrough
+    if (job && matches) {
+      const waitStartedAt = Date.now()
+      if (this.prewarmPromise) await this.prewarmPromise.catch(() => undefined)
+      if (job.result && !job.failed && this.prewarmJob === job) {
+        this.prewarmJob = null
+        this.prewarmStats.reused += 1
+        this.lastWindowReused = true
+        return {
+          result: job.result,
+          diagnostics: {
+            prewarm: 'hit',
+            prewarmWaitMs: Date.now() - waitStartedAt,
+            ...(job.timing ?? {}),
+            windowMs: Date.now() - waitStartedAt,
+            modelCalls: 1,
+          },
+        }
+      }
+    }
+    if (job) this.prewarmStats.missed += 1
+    this.lastWindowReused = false
+    if (this.forceMixed) {
+      this.windowSkipped = true
+      return {
+        result: { sources: [{ samples: window, rms: rmsOf(window) }] },
+        diagnostics: { prewarm: 'miss', windowMs: 0, modelCalls: 0, mixed: true },
+      }
+    }
+    if (this.isLagging() && !this.allowModelOnce) {
+      // Behind real time: close this window from the mixed audio instead of
+      // queueing another inference. One cheap window lets the chain drain, and
+      // the next one may use the model again, so the delay stays bounded.
+      this.skippedWindows += 1
+      this.allowModelOnce = true
+      this.windowSkipped = true
+      return {
+        result: { sources: [{ samples: window, rms: rmsOf(window) }] },
+        diagnostics: { prewarm: 'miss', windowMs: 0, modelCalls: 0, mixed: true },
+      }
+    }
+    this.allowModelOnce = false
+    const startedAt = Date.now()
+    const result = await this.separate(window, windowStart)
+    return {
+      result,
+      diagnostics: {
+        prewarm: 'miss',
+        ...(result.timing ?? {}),
+        windowMs: Date.now() - startedAt,
+        modelCalls: 1,
+      },
+    }
+  }
+
+  /**
+   * Append every remaining hop to the lanes from the mixed audio, without
+   * asking the model. Bounded and cheap: each hop is one RMS scan.
+   */
+  private async coverMixedTail(): Promise<void> {
+    this.forceMixed = true
+    try {
+      for (let guard = 0; guard < 64 && this.hasWindow(true); guard++) {
+        const before = this.previous?.start
+        await this.run(true)
+        if (this.processing) await this.processing.catch(() => undefined)
+        if (this.previous?.start === before) break
+      }
+    } finally {
+      this.forceMixed = false
+    }
+  }
+
+  /** True when the last model window cost more than one hop of audio. */
+  private isLagging(): boolean {
+    // Only a window that burns >90% of a hop is treated as behind: a 400-500 ms
+    // call on a 700 ms hop still keeps up, and skipping there would trade the
+    // speaker split for latency nobody was losing.
+    return this.skipWhileBehind && this.lastModelMs > this.hopBudgetMs * 0.9
+  }
+
+  /** Backpressure counters for the latency report. */
+  pressureReport(): {
+    lastWindowMs: number
+    lastModelMs: number
+    hopBudgetMs: number
+    skippedWindows: number
+    flushMs: number
+    flushTruncated: boolean
+  } {
+    return {
+      lastWindowMs: this.lastWindowMs,
+      lastModelMs: this.lastModelMs,
+      hopBudgetMs: this.hopBudgetMs,
+      skippedWindows: this.skippedWindows,
+      flushMs: this.flushMs,
+      flushTruncated: this.flushTruncated,
+    }
+  }
+
   private appendZeros(length: number, absStart: number): void {
     const zeros = new Float32Array(Math.max(0, length))
     this.appendLane(0, zeros, absStart, 0)
@@ -412,7 +753,14 @@ export class ContinuousSeparation {
 
   private emit(segment: PendingSegment): void {
     try {
-      this.onSegment({ slot: segment.slot, samples: segment.samples, onsetMs: segment.onsetMs })
+      this.onSegment({
+        slot: segment.slot,
+        samples: segment.samples,
+        onsetMs: segment.onsetMs,
+        ...(segment.utteranceId === undefined ? {} : { utteranceId: segment.utteranceId }),
+        ...(segment.siblingActive === undefined ? {} : { siblingActive: segment.siblingActive }),
+        ...(segment.separation === undefined ? {} : { separation: segment.separation }),
+      })
     } catch (error) {
       this.onError(error)
     }
@@ -441,11 +789,21 @@ export class ContinuousSeparation {
     const end = Math.min(lane.length, lane.lastSpeech + this.tailSamples)
     const all = flatten(lane.buffer)
     const samples = all.slice(0, Math.max(1, end))
+    // Only a lane that genuinely overlapped in time counts as a second
+    // speaker. Conservatively, any overlap keeps the full two-lane path.
+    const other = this.lanes[1 - slot]!
+    const segmentEnd = lane.startAbs + lane.length
+    const siblingActive = other.active
+      && other.startAbs < segmentEnd
+      && other.startAbs + other.length > lane.startAbs
     const pending: PendingSegment = {
       slot,
       samples,
       onsetMs: Math.round(onsetSample * 1000 / this.sampleRate),
       onsetSample,
+      utteranceId: 'cont-' + (++this.utteranceSeq) + '-' + slot,
+      siblingActive,
+      ...(this.lastWindowDiagnostics === undefined ? {} : { separation: { ...this.lastWindowDiagnostics } }),
     }
     resetLane(lane)
     if (this.hasEarlierActive(onsetSample)) this.ready.push(pending)

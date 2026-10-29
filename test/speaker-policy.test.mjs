@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { SpeakerPolicyStore } from '../lib/speaker-policy.js'
+import { SpeakerPolicyStore, decideSpeaker } from '../lib/speaker-policy.js'
 
 test('renames a guest and resolves the name in both directions', () => {
   const store = new SpeakerPolicyStore()
@@ -64,4 +64,71 @@ test('clear removes names and policies for one session only', () => {
   assert.equal(store.display('a', '客人1'), '客人1')
   assert.equal(store.effective('a', '客人1', 'queue'), 'queue')
   assert.equal(store.display('b', '客人1'), '老王')
+})
+test('an owner below the displayed threshold still wins when nobody else is close', () => {
+  // The exact measured mislabel: 0.5583 owner similarity against a 0.7 threshold.
+  assert.equal(decideSpeaker({
+    ownerEnrolled: true,
+    ownerSimilarity: 0.5583,
+    threshold: 0.7,
+    marginToOwner: 0.12,
+  }), 'owner')
+})
+
+test('a clearly better named guest takes the turn', () => {
+  assert.equal(decideSpeaker({
+    ownerEnrolled: true,
+    ownerSimilarity: 0.53,
+    threshold: 0.5,
+    namedSimilarity: 0.85,
+    namedThreshold: 0.5,
+    marginToOwner: 0.12,
+  }), 'named')
+})
+
+test('a named guest only marginally above the owner does not steal the label', () => {
+  assert.equal(decideSpeaker({
+    ownerEnrolled: true,
+    ownerSimilarity: 0.53,
+    threshold: 0.5,
+    namedSimilarity: 0.58,
+    namedThreshold: 0.5,
+    marginToOwner: 0.12,
+  }), 'owner')
+})
+
+test('a named guest wins when the owner is implausible', () => {
+  assert.equal(decideSpeaker({
+    ownerEnrolled: true,
+    ownerSimilarity: 0.1,
+    threshold: 0.5,
+    namedSimilarity: 0.8,
+    namedThreshold: 0.5,
+    marginToOwner: 0.12,
+  }), 'named')
+})
+
+test('nothing decisive falls back instead of crashing', () => {
+  assert.equal(decideSpeaker({
+    ownerEnrolled: true,
+    ownerSimilarity: 0.1,
+    threshold: 0.5,
+    namedSimilarity: 0.4,
+    namedThreshold: 0.5,
+    marginToOwner: 0.12,
+  }), 'fallback')
+  assert.equal(decideSpeaker({
+    ownerEnrolled: false,
+    ownerSimilarity: 0,
+    threshold: 0.5,
+    marginToOwner: 0,
+  }), 'fallback')
+  assert.equal(decideSpeaker({
+    ownerEnrolled: true,
+    ownerSimilarity: Number.NaN,
+    threshold: 0.5,
+    namedSimilarity: Number.NaN,
+    namedThreshold: 0.5,
+    marginToOwner: Number.NaN,
+  }), 'fallback')
 })
