@@ -71,14 +71,14 @@ export const TONE_DELTAS: Record<Tone, { rate?: number; pitch?: number; volume?:
   warm: { rate: -2, pitch: 3 },
   soft: { rate: -3, pitch: -3, volume: -8 },
   firm: { rate: -4, volume: 9 },
-  urgent: { rate: 14, pitch: 2, volume: 4 },
+  urgent: { rate: 18, pitch: 2, volume: 4 },
   bright: { rate: 5, pitch: 6 },
 }
 
 export const PACE_DELTAS: Record<Pace, { rate?: number }> = {
   even: {},
-  slower: { rate: -10 },
-  faster: { rate: 10 },
+  slower: { rate: -15 },
+  faster: { rate: 18 },
 }
 
 /**
@@ -106,20 +106,20 @@ export type StyleToken =
 
 export const STYLES: Record<StyleToken, StylePreset> = {
   tender: { tone: 'warm', pace: 'slower', pitch: 1, meaning: '温柔：慢一点、音高略抬，像在近处说话。' },
-  coy: { pace: 'slower', pitch: 4, tail: 8, meaning: '撒娇：拖慢、偏高，句尾往上带。' },
-  happy: { tone: 'bright', pace: 'faster', tail: 4, meaning: '开心：轻快明亮，句尾上扬。' },
-  surprised: { pitch: 3, rate: 3, tail: 10, meaning: '惊讶：起音偏高，句尾明显上扬。' },
-  hurt: { tone: 'soft', pace: 'slower', volume: -3, tail: -6, meaning: '委屈：放轻放慢，句尾往下沉。' },
+  coy: { pace: 'slower', pitch: 4, tail: 12, meaning: '撒娇：拖慢、偏高，句尾往上带。' },
+  happy: { tone: 'bright', pace: 'faster', tail: 7, meaning: '开心：轻快明亮，句尾上扬。' },
+  surprised: { pitch: 3, rate: 3, tail: 15, meaning: '惊讶：起音偏高，句尾明显上扬。' },
+  hurt: { tone: 'soft', pace: 'slower', volume: -3, tail: -10, meaning: '委屈：放轻放慢，句尾往下沉。' },
   shy: { tone: 'soft', pace: 'slower', volume: -5, breath: true, meaning: '害羞：气声多、音量小，中间有一下换气。' },
   serious: { tone: 'firm', meaning: '认真：结实清楚，不加装饰。' },
   stern: { tone: 'firm', rate: -4, pitch: -1, meaning: '严肃：更低更慢，压着说。' },
   hurried: { tone: 'urgent', pace: 'faster', meaning: '急促：明显加快，句子短促。' },
   sleepy: { pace: 'slower', rate: -12, pitch: -2, volume: -6, lengthen: true, meaning: '困倦：拖慢放软，句尾散掉，音高几乎不动。' },
-  playful: { tone: 'bright', pace: 'faster', tail: 6, meaning: '俏皮：快而跳，句尾上挑。' },
+  playful: { tone: 'bright', pace: 'faster', tail: 9, meaning: '俏皮：快而跳，句尾上挑。' },
   comforting: { tone: 'warm', pace: 'slower', rate: -3, volume: -4, meaning: '安慰：放慢压低一点，句尾收软。' },
-  disappointed: { tone: 'soft', pace: 'slower', lengthen: true, tail: -8, meaning: '失望：慢、软，句尾落下去。' },
+  disappointed: { tone: 'soft', pace: 'slower', lengthen: true, tail: -12, meaning: '失望：慢、软，句尾拖下去。' },
   whisper: { tone: 'soft', volume: -12, breath: true, meaning: '低语：音量明显收小，带一下换气。' },
-  hesitant: { pace: 'slower', volume: -3, tail: -3, meaning: '犹豫：慢，句尾没底气。' },
+  hesitant: { pace: 'slower', volume: -3, tail: -5, meaning: '犹豫：慢，句尾没底气。' },
   amused: { tone: 'bright', rate: 3, breath: true, meaning: '笑意：明亮，带一点笑的换气。' },
 }
 
@@ -155,7 +155,7 @@ export const ADJUSTMENTS: { field: string; min: number; max: number; meaning: st
 
 /** Text constructs the model may set per step. */
 export const CONSTRUCTS: { value: string; meaning: string }[] = [
-  { value: 'lengthen', meaning: '把句尾拖长、收得软一点。' },
+  { value: 'lengthen', meaning: '把最后几个字放慢拖长，不是加一个停顿。' },
   { value: 'breath', meaning: '加一个换气的缝和一句尾的轻声，听起来更近。' },
 ]
 
@@ -232,16 +232,23 @@ const toNumber = (value: unknown, min: number, max: number): number | undefined 
   return clampNumber(Math.round(number), min, max)
 }
 
-/** Ending contour for a style: a short ramp over the last characters. */
-function tailMarks(say: string, tail: number): ProsodyMark[] | undefined {
+/**
+ * Shape the end of a line. `tail` bends the pitch and `lengthen` SLOWS the last
+ * syllables, which is the only way the engine actually draws a sound out: a dash
+ * in the text just becomes a pause, and a pause is not a lengthened syllable.
+ */
+function endingMarks(say: string, tail: number, lengthen: boolean): ProsodyMark[] | undefined {
   const chars = Array.from(say)
   const closed = /[。！？!?，,、…—]$/u.test(say)
   const end = closed ? chars.length - 1 : chars.length
-  if (end < 4) return undefined
+  if (end < 3) return undefined
   const count = Math.min(3, end)
   const marks: ProsodyMark[] = []
   for (let index = 0; index < count; index += 1) {
-    marks.push({ at: end - count + index, pitch: Math.round((tail * (index + 1)) / count) })
+    const mark: ProsodyMark = { at: end - count + index }
+    if (tail !== 0) mark.pitch = Math.round((tail * (index + 1)) / count)
+    if (lengthen) mark.rate = -7 - index * 6
+    marks.push(mark)
   }
   return marks
 }
@@ -260,8 +267,8 @@ function applyStylePreset(unit: VoiceUnit, style: StyleToken): void {
   if (preset.volume !== undefined && unit.volume === undefined) unit.volume = preset.volume
   if (preset.breath === true && unit.breath === undefined) unit.breath = true
   if (preset.lengthen === true && unit.lengthen === undefined) unit.lengthen = true
-  if (preset.tail !== undefined && unit.mark === undefined) {
-    const mark = tailMarks(unit.say ?? '', preset.tail)
+  if (unit.mark === undefined && (preset.tail !== undefined || preset.lengthen === true)) {
+    const mark = endingMarks(unit.say ?? '', preset.tail ?? 0, preset.lengthen === true)
     if (mark !== undefined) unit.mark = mark
   }
 }
@@ -357,6 +364,11 @@ export function normalizeVoiceUnits(input: unknown): VoiceUnit[] {
       if (mark !== undefined) unit.mark = mark
     }
     if (style !== undefined) applyStylePreset(unit, style as StyleToken)
+    // An explicit lengthen becomes a slowed tail too: text cannot stretch a sound.
+    if (unit.mark === undefined && unit.lengthen === true) {
+      const mark = endingMarks(unit.say ?? '', 0, true)
+      if (mark !== undefined) unit.mark = mark
+    }
     units.push(unit)
   }
   return units
@@ -619,13 +631,12 @@ export function breathSeam(text: string): [string, string] | undefined {
 }
 
 /**
- * Text-level delivery constructs. `lengthen` runs first, then `breath`; both
- * are idempotent, so applying this twice returns the same string.
+ * Text-level constructs. Only `breath` touches the text now: `lengthen` is a
+ * slowed tail in the prosody, because a dash here is read as a pause.
  */
 export function applyExpression(unit: VoiceUnit): string {
   let text = typeof unit.say === 'string' ? unit.say : ''
   if (text === '') return ''
-  if (unit.lengthen === true) text = lengthenTail(text)
   if (unit.breath === true) text = breathe(text)
   return text
 }

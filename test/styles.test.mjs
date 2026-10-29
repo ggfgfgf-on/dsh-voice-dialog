@@ -27,7 +27,7 @@ test('a style paints an ending contour on the last characters', () => {
   const rising = unitOf({ say: '你就答应我嘛', style: 'coy' })
   const marks = resolveMarks(rising)
   assert.ok(marks.length > 1)
-  assert.equal(marks[marks.length - 1].pitch, 8)
+  assert.equal(marks[marks.length - 1].pitch, STYLES.coy.tail)
   assert.ok(marks[0].pitch < marks[marks.length - 1].pitch)
   const falling = unitOf({ say: '算了那下次再说吧', style: 'disappointed' })
   const tail = resolveMarks(falling)

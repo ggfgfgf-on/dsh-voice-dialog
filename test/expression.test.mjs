@@ -37,7 +37,11 @@ test('intent tokens map to the documented acoustics', () => {
   })
   assert.deepEqual(effectiveProsody({ say: 'x', tone: 'soft' }, ZERO), tone('soft'))
   assert.deepEqual(effectiveProsody({ say: 'x', tone: 'urgent' }, ZERO), tone('urgent'))
-  assert.deepEqual(effectiveProsody({ say: 'x', pace: 'slower' }, ZERO), { rate: -10, pitch: 0, volume: 0 })
+  assert.deepEqual(effectiveProsody({ say: 'x', pace: 'slower' }, ZERO), {
+    rate: PACE_DELTAS.slower.rate ?? 0,
+    pitch: 0,
+    volume: 0,
+  })
   assert.deepEqual(effectiveProsody({ say: 'x' }, ZERO), ZERO)
 })
 
@@ -48,9 +52,9 @@ test('numbers are adjustments on top of a non-default base', () => {
 
 test('numbers then tokens, clamped once at the end', () => {
   const base = { rate: 10, pitch: 0, volume: 0 }
-  // 10 base + 20 step + 14 urgent = 44
-  assert.equal(effectiveProsody({ say: 'x', rate: 20, tone: 'urgent' }, base).rate, 44)
-  // 45 base + 40 step + 14 urgent = 99 -> clamped to 50
+  // base + step + urgent, one clamp at the end
+  const urgent = TONE_DELTAS.urgent.rate ?? 0
+  assert.equal(effectiveProsody({ say: 'x', rate: 20, tone: 'urgent' }, base).rate, 10 + 20 + urgent)
   assert.equal(effectiveProsody({ say: 'x', rate: 40, tone: 'urgent' }, { rate: 45, pitch: 0, volume: 0 }).rate, 50)
   assert.equal(effectiveProsody({ say: 'x', volume: 90 }, { rate: 0, pitch: 0, volume: 90 }).volume, 100)
 })
@@ -106,15 +110,19 @@ test('a stressed word splits the unit into three, the middle one firm', () => {
   assert.equal(splitStress({ say: '没有这个词', stress: ['缺'] }).length, 1)
 })
 
-test('text constructs are idempotent', () => {
-  const lengthen = { say: '好的。', lengthen: true }
-  assert.equal(applyExpression(lengthen), '好的——')
-  assert.equal(applyExpression({ ...lengthen, say: applyExpression(lengthen) }), '好的——')
+test('a lengthen slows the tail instead of adding a pause', () => {
+  const unit = { say: '好的我是说。', lengthen: true }
+  assert.equal(applyExpression(unit), '好的我是说。')
+  const [normalized] = normalizeVoiceUnits([unit])
+  const marks = normalized.mark ?? []
+  assert.equal(marks.length, 3)
+  assert.ok(marks.every((mark) => (mark.rate ?? 0) < 0))
+  assert.ok((marks[2].rate ?? 0) < (marks[0].rate ?? 0))
+})
+
+test('text constructs stay idempotent', () => {
   const breath = { say: '今天天气不错我们出去走走吧', breath: true }
   const once = applyExpression(breath)
   assert.equal(applyExpression({ ...breath, say: once }), once)
-  const both = { say: '我明白了。', lengthen: true, breath: true }
-  const bothOnce = applyExpression(both)
-  assert.equal(applyExpression({ ...both, say: bothOnce }), bothOnce)
   assert.equal(applyExpression({ say: '已经——' }), '已经——')
 })
