@@ -102,6 +102,8 @@ interface VoiceFrame {
   sentenceId?: number
   /** Zero-based position inside the sentence. */
   chunkIndex?: number
+  /** Silence this block asked for before the next one, in ms. */
+  gapAfterMs?: number
   text: string
   audio: string
   error?: string
@@ -1325,8 +1327,8 @@ class TtsPlayer {
     if (this.onPlay) { try { this.onPlay(frame) } catch { /* logging only */ } }
     this.audio.onended = () => {
       this.cleanupUrl()
-      // A declared gap only delays the next block; nothing is inserted today.
-      const gapMs = this.speechProfile.betweenBlocksMs
+      // A per-block gap wins over the profile gap; nothing is inserted otherwise.
+      const gapMs = typeof frame.gapAfterMs === 'number' ? frame.gapAfterMs : this.speechProfile.betweenBlocksMs
       if (gapMs > 0 && this.queue.length > 0) {
         this.gapTimer = setTimeout(() => {
           this.gapTimer = null

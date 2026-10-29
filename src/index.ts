@@ -20,6 +20,10 @@ import { hasSpeechContent, sanitizeForSpeech, SentenceSegmenter, stripFillerHead
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { VisibleVoiceFilter } from './voice-marker.ts'
 import { createEdgeTts, rateToProsody, TtsQueue, type VoiceFrame } from './tts-queue.ts'
+import {
+  ADJUSTMENTS, applyExpression, CONSTRUCTS, EXPRESS_TOKENS, expressionProsody, normalizeVoiceUnits,
+  pauseMsFor, splitStress, STEP_LIMITS, VOCABULARY, type VoiceUnit,
+} from './expression.ts'
 import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
 import { decodeAudioFrames } from './audio-transport.ts'
@@ -307,14 +311,17 @@ const SAME_SPEAKER_SIMILARITY = 0.62
       + 'sentence being spoken and then drops the rest (default for normal answers), immediate cuts at once, '
       + 'never keeps playing to the end. Declare it before or during a long answer when the listener is likely to talk over you. '
       + 'The owner cannot be renamed or ignored. Do not call this for ordinary questions. The microphone stays on after stop. '
-      + 'Action speech declares how your own answer is split, paced and interrupted: every field is optional and only overrides the built-in default, e.g. {"interruption":"sentence","mergeMaxChars":80,"betweenBlocksMs":150}.',
+      + 'Action speech declares how your own answer is split, paced and interrupted: every field is optional and only overrides the built-in default, e.g. {"interruption":"sentence","mergeMaxChars":80,"betweenBlocksMs":150}. '
+      + 'Action express is an OPTIONAL assist for delivery detail: it speaks an ordered sequence of steps, each either a speak step (say plus optional tone, pace, stress, breath, lengthen, rate, pitch, volume) or a pause step. ' + 'The optional numbers are per-step adjustments on top of the plugin base and shape THAT step only; they never replace the base. '
+      + 'Without it nothing changes and a normal answer keeps today\'s delivery. It shapes how YOUR OWN speech sounds, not a settings panel; you express intent and the plugin owns the acoustics. '
+      + 'Action capabilities publishes the authoritative token vocabulary (tone/pace/pause with a one-line meaning each) and the current read-only base; call it instead of guessing a token name.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: {
           type: 'string',
-          enum: ['volume', 'rate', 'stop', 'repeat', 'speaker', 'yield', 'speech'],
+          enum: ['volume', 'rate', 'stop', 'repeat', 'speaker', 'yield', 'speech', 'express', 'capabilities'],
           description: 'volume adjusts playback loudness; rate adjusts speaking speed for following sentences; stop silences the current reply; repeat replays the last reply; speaker renames a guest voiceprint and/or changes how that guest is delivered; yield declares how your own read-aloud speech may be interrupted.',
         },
         level: { type: 'number', minimum: 0, maximum: 1, description: 'Absolute playback volume for action volume.' },
@@ -337,6 +344,27 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             separationSilenceMs: { type: 'number', minimum: 400, maximum: 4000, description: 'Tail silence for a separated speaker stream.' },
           },
         },
+        sequence: {
+          type: 'array',
+          maxItems: 12,
+          description: 'Ordered steps for action express. Steps play in array order; one call may carry a whole reply or a single special line.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              say: { type: 'string', description: 'Text to speak for this step, at most 200 characters.' },
+              rate: { type: 'number', minimum: STEP_LIMITS.rate.min, maximum: STEP_LIMITS.rate.max, description: STEP_LIMITS.rate.meaning },
+              pitch: { type: 'number', minimum: STEP_LIMITS.pitch.min, maximum: STEP_LIMITS.pitch.max, description: STEP_LIMITS.pitch.meaning },
+              volume: { type: 'number', minimum: STEP_LIMITS.volume.min, maximum: STEP_LIMITS.volume.max, description: STEP_LIMITS.volume.meaning },
+              tone: { type: 'string', enum: [...EXPRESS_TOKENS.tone], description: 'Delivery colour; the plugin maps it to acoustics.' },
+              pace: { type: 'string', enum: [...EXPRESS_TOKENS.pace], description: 'Local pace intent for this step.' },
+              stress: { type: 'array', items: { type: 'string' }, maxItems: 4, description: 'Words inside say to lean on; each becomes a short emphasised fragment.' },
+              breath: { type: 'boolean', description: 'Breathy delivery: a soft seam and a trailing pause.' },
+              lengthen: { type: 'boolean', description: 'Draw the tail out instead of closing it hard.' },
+              pause: { type: 'string', enum: [...EXPRESS_TOKENS.pause], description: 'A silence with no text.' },
+            },
+          },
+        },
         mode: { type: 'string', enum: ['sentence', 'immediate', 'never'], description: 'Interruption contract for action yield: sentence finishes the audible sentence then drops the rest (default), immediate cuts now, never lets the reply finish uninterrupted.' },
       },
       required: ['action'],
@@ -355,6 +383,9 @@ const SAME_SPEAKER_SIMILARITY = 0.62
           name: { type: 'string' },
           mode: { type: 'string' },
           profile: { type: 'object' },
+          lines: { type: 'number' },
+          expressAvailable: { type: 'boolean' },
+          vocabulary: { type: 'object' },
         },
         required: ['ok', 'action'],
       },
@@ -363,6 +394,69 @@ const SAME_SPEAKER_SIMILARITY = 0.62
     execute: (args: unknown) => {
       const input = (args ?? {}) as Record<string, unknown>
       const action = input.action
+      if (action === 'capabilities') {
+        return Promise.resolve({
+          ok: true,
+          action: 'capabilities',
+          expressAvailable: true,
+          vocabulary: {
+            tone: VOCABULARY.tone,
+            pace: VOCABULARY.pace,
+            pause: VOCABULARY.pause,
+            adjustments: ADJUSTMENTS,
+            constructs: CONSTRUCTS,
+          },
+          base: queue.prosodyBase(),
+        })
+      }
+      if (action === 'express') {
+        const requested = input.sequence ?? input.units ?? input.lines
+        const steps = normalizeVoiceUnits(requested)
+        if (steps.length === 0) {
+          throw new Error('voice_dialog express needs at least one valid step')
+        }
+        let live: string | undefined
+        let seenAt = -Infinity
+        for (const [id, at] of activeVoice) {
+          if (!voiceSessionLive(id)) continue
+          if (at > seenAt) { seenAt = at; live = id }
+        }
+        if (live === undefined) throw new Error('voice_dialog express needs a live voice session')
+        const base = queue.prosodyBase()
+        const replyId = 'express-' + Date.now()
+        const expanded: VoiceUnit[] = []
+        for (const step of steps) {
+          if (step.pause !== undefined) { expanded.push(step); continue }
+          for (const piece of splitStress(step)) expanded.push(piece)
+        }
+        // Buffer one step so a following pause becomes the gap AFTER the block
+        // it follows, which is where the listener actually hears it.
+        type Ready = { text: string; prosody: { rate: string; pitch: string; volume: string }; gapAfterMs: number }
+        let buffered: Ready | null = null
+        let chunkIndex = 0
+        let spoken = 0
+        const flush = (): void => {
+          if (buffered === null) return
+          const ready = buffered
+          buffered = null
+          queue.enqueue(live as string, ready.text, replyId, 0, {
+            prosody: ready.prosody,
+            ...(ready.gapAfterMs > 0 ? { gapAfterMs: ready.gapAfterMs } : {}),
+            chunkIndex: chunkIndex++,
+          })
+        }
+        for (const step of expanded) {
+          if (step.pause !== undefined) {
+            if (buffered !== null) buffered.gapAfterMs += pauseMsFor(step.pause)
+            continue
+          }
+          flush()
+          buffered = { text: applyExpression(step), prosody: expressionProsody(step, base), gapAfterMs: 0 }
+          spoken += 1
+        }
+        flush()
+        return Promise.resolve({ ok: true, action: 'express', lines: spoken })
+      }
       if (action === 'speech') {
         const declared = normalizeSpeechProfile(input.profile)
         if (Object.keys(declared).length === 0) {
@@ -444,7 +538,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         broadcast('control', { action, rate: applied })
         return Promise.resolve({ ok: true, action, rate: applied })
       }
-      throw new Error('voice_dialog action must be volume, rate, stop, repeat, speaker, yield or speech')
+      throw new Error('voice_dialog action must be volume, rate, stop, repeat, speaker, yield, speech, express or capabilities')
     },
   }))
 

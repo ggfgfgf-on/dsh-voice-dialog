@@ -28,6 +28,8 @@ export interface VoiceFrame {
   sentenceId?: number
   /** Zero-based position of this block inside its sentence. */
   chunkIndex?: number
+  /** Silence the page leaves after this block before the next one, in ms. */
+  gapAfterMs?: number
   /** Markdown-stripped sentence text (shown as live caption). */
   text: string
   /** Base64 MP3 bytes (24kHz mono); empty when `error` is set. */
@@ -53,6 +55,10 @@ export interface TtsQueueItem {
   round: number
   sentenceId?: number
   chunkIndex?: number
+  /** Per-item SSML prosody; falls back to the queue-level prosody. */
+  prosody?: ProsodyOptions
+  /** Silence the page leaves after this item, in ms. */
+  gapAfterMs?: number
 }
 
 /** Read-only view of the host-side synthesis queue for the page. */
@@ -93,6 +99,17 @@ const MERGE_RUN_MAX_ITEMS = 6
 const MERGE_JOINER = '，'
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Parse an SSML percent ('+10%', 'default') back into a number. */
+function parsePercent(value: string | undefined): number {
+  if (typeof value !== 'string') return 0
+  const trimmed = value.trim()
+  if (trimmed === '' || trimmed === 'default') return 0
+  const match = /^([+-]?\d+(?:\.\d+)?)%$/.exec(trimmed)
+  if (!match) return 0
+  const number = Number(match[1])
+  return Number.isFinite(number) ? Math.round(number) : 0
+}
 
 /** Convert a signed percentage (-50..50) into the SSML relative rate. */
 export function rateToProsody(rate: number): string {
@@ -173,6 +190,8 @@ interface QueuedSentence {
   replyId?: string
   sentenceId?: number
   chunkIndex?: number
+  prosody?: ProsodyOptions
+  gapAfterMs?: number
 }
 
 /**
@@ -286,6 +305,12 @@ function joinSynthesisText(left: string, right: string): string {
  * A non-mergeable head is still returned with count 1 so the pump can consume
  * it through the same path as a merged run.
  */
+/** Stable identity of one item's prosody, used to refuse a mechanical seam. */
+function prosodySignature(prosody: ProsodyOptions | undefined): string {
+  if (prosody === undefined) return ''
+  return [prosody.rate ?? '', prosody.pitch ?? '', prosody.volume ?? ''].join('|')
+}
+
 export function mergeSynthesisRun(
   items: readonly TtsQueueItem[],
   limits: SynthesisLimits = DEFAULT_SYNTHESIS_LIMITS,
@@ -303,6 +328,10 @@ export function mergeSynthesisRun(
     const next = items[count]
     if (!next || next.replyId !== first.replyId) break
     if (characterCount(next.text.trim()) > limits.mergeMaxChars) break
+    // A prosody change or a declared pause is a real seam: never merge across it.
+    if (prosodySignature(next.prosody) !== prosodySignature(first.prosody)) break
+    const previous = items[count - 1]
+    if (previous !== undefined && (previous.gapAfterMs ?? 0) > 0) break
     const joined = joinSynthesisText(text, next.text)
     if (characterCount(joined) > limits.mergeRunMaxChars) break
     text = joined
@@ -364,6 +393,15 @@ export class TtsQueue {
 
   limitsView(): SynthesisLimits {
     return { ...this.limits }
+  }
+
+  /** The queue's base prosody as numbers; intent deltas resolve against this. */
+  prosodyBase(): { rate: number; pitch: number; volume: number } {
+    return {
+      rate: parsePercent(this.prosody?.rate),
+      pitch: parsePercent(this.prosody?.pitch),
+      volume: parsePercent(this.prosody?.volume),
+    }
   }
 
   /** Switch the Edge voice and drop the old handshake; queued text uses the new voice. */
@@ -438,7 +476,14 @@ export class TtsQueue {
     text: string,
     replyId?: string,
     round = 0,
-    block: { sentenceId?: number; chunkIndex?: number } = {},
+    block: {
+      sentenceId?: number
+      chunkIndex?: number
+      /** Per-item SSML prosody; falls back to the queue-level prosody. */
+      prosody?: ProsodyOptions
+      /** Silence the page should leave after this block. */
+      gapAfterMs?: number
+    } = {},
   ): void {
     let q = this.queues.get(sessionId)
     if (!q) {
@@ -452,10 +497,14 @@ export class TtsQueue {
       ? Math.max(0, Math.trunc(block.sentenceId)) : undefined
     const chunkIndex = typeof block.chunkIndex === 'number' && Number.isFinite(block.chunkIndex)
       ? Math.max(0, Math.trunc(block.chunkIndex)) : undefined
+    const gapAfterMs = typeof block.gapAfterMs === 'number' && Number.isFinite(block.gapAfterMs)
+      ? Math.max(0, Math.min(3000, Math.trunc(block.gapAfterMs))) : undefined
     q.pending.push({
       text, epoch: q.epoch, round: Math.max(0, Math.trunc(round)), replyId,
       ...(sentenceId === undefined ? {} : { sentenceId }),
       ...(chunkIndex === undefined ? {} : { chunkIndex }),
+      ...(block.prosody === undefined ? {} : { prosody: block.prosody }),
+      ...(gapAfterMs === undefined ? {} : { gapAfterMs }),
     })
     void this.pump(sessionId, q)
   }
@@ -613,7 +662,7 @@ export class TtsQueue {
             try {
               // A reset cleared the handshake, so later attempts dial again.
               if (attempt > 1) await this.ensureReady()
-              const { audioStream } = await this.tts.toStream(withSpeechPause(run.text), this.prosody)
+              const { audioStream } = await this.tts.toStream(withSpeechPause(run.text), item.prosody ?? this.prosody)
               const chunks: Buffer[] = []
               for await (const chunk of audioStream) {
                 if (this.isCancelled(q, item)) break
@@ -647,6 +696,7 @@ export class TtsQueue {
               replyId: item.replyId,
               ...(item.sentenceId === undefined ? {} : { sentenceId: item.sentenceId }),
               ...(item.chunkIndex === undefined ? {} : { chunkIndex: item.chunkIndex }),
+              ...(item.gapAfterMs === undefined ? {} : { gapAfterMs: item.gapAfterMs }),
               text: run.text,
               audio: buf.toString('base64'),
             }

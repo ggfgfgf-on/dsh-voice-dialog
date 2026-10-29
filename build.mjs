@@ -29,6 +29,7 @@ const TEST_SURFACES = [
   'audio-transport',
   'barge-in',
   'continuous-separation',
+  'expression',
   'fast-lane',
   'frame-order',
   'gate-prompt',
