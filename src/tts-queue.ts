@@ -46,6 +46,15 @@ export interface TtsCancelResult {
   active: boolean
 }
 
+/** One sentence still waiting behind the synthesizer. */
+export interface TtsQueueItem {
+  text: string
+  replyId?: string
+  round: number
+  sentenceId?: number
+  chunkIndex?: number
+}
+
 /** Read-only view of the host-side synthesis queue for the page. */
 export interface TtsQueueSnapshot {
   /** The synthesizer is working, opening, or waiting out a retry. */
@@ -54,6 +63,8 @@ export interface TtsQueueSnapshot {
   active: boolean
   /** Sentences waiting behind the current one. */
   pending: number
+  /** The full waiting list, oldest first; the host is the only owner. */
+  items: TtsQueueItem[]
   /** Current sentence text, bounded for display. */
   text?: string
   replyId?: string
@@ -350,12 +361,19 @@ export class TtsQueue {
   /** Read-only snapshot used by the page's live status line. */
   snapshot(sessionId: string): TtsQueueSnapshot {
     const q = this.queues.get(sessionId)
-    if (!q) return { busy: false, active: false, pending: 0 }
+    if (!q) return { busy: false, active: false, pending: 0, items: [] }
     const current = q.current
     return {
       busy: q.busy,
       active: current !== null,
       pending: q.pending.length,
+      items: q.pending.map((item) => ({
+        text: item.text,
+        round: item.round,
+        ...(item.replyId === undefined ? {} : { replyId: item.replyId }),
+        ...(item.sentenceId === undefined ? {} : { sentenceId: item.sentenceId }),
+        ...(item.chunkIndex === undefined ? {} : { chunkIndex: item.chunkIndex }),
+      })),
       ...(current === null ? {} : {
         text: current.text.slice(0, 120),
         ...(current.replyId === undefined ? {} : { replyId: current.replyId }),

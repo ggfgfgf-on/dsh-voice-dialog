@@ -108,14 +108,6 @@ interface HostConfig {
   enabled: boolean
 }
 
-interface HostTtsState {
-  busy: boolean
-  active: boolean
-  pending: number
-  text?: string
-  replyId?: string
-}
-
 interface VoiceprintProfile {
   id: string
   name: string
@@ -267,29 +259,6 @@ function cancelHostTts(sessionId: string, replyId?: string): void {
     }),
     keepalive: true,
   }).catch(() => undefined)
-}
-
-async function fetchHostTtsState(sessionId: string): Promise<HostTtsState | null> {
-  try {
-    const response = await fetch(apiUrl('/tts-state'), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId, clientId: CLIENT_ID }),
-      keepalive: true,
-    })
-    if (!response.ok) return null
-    const value = await response.json() as Partial<HostTtsState>
-    if (typeof value.busy !== 'boolean' || typeof value.pending !== 'number') return null
-    return {
-      busy: value.busy,
-      active: value.active === true,
-      pending: Math.max(0, Math.trunc(value.pending)),
-      ...(typeof value.text === 'string' ? { text: value.text } : {}),
-      ...(typeof value.replyId === 'string' ? { replyId: value.replyId } : {}),
-    }
-  } catch {
-    return null
-  }
 }
 
 function loadConfig(): Promise<HostConfig> {
@@ -1413,7 +1382,6 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const [phase, setPhase] = useState<'idle' | 'starting' | 'listening'>('idle')
   const [pending, setPending] = useState(0)
   const [queued, setQueued] = useState(0)
-  const [hostTts, setHostTts] = useState<HostTtsState | null>(null)
   const [error, setError] = useState('')
   const [speaker, setSpeaker] = useState('')
   /** A failure must be readable without hovering: phones have no tooltips. */
@@ -1489,26 +1457,6 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       sharedPlayer.onCancelTts = undefined
     }
   }, [])
-
-  // The page only receives frames after synthesis, so the host queue is the
-  // authoritative "still owed" count. Poll while listening rather than guessing
-  // from local playback.
-  useEffect(() => {
-    if (!active) { setHostTts(null); return }
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const poll = async (): Promise<void> => {
-      const state = await fetchHostTtsState(sessionId)
-      if (cancelled) return
-      setHostTts(state)
-      timer = setTimeout(() => { void poll() }, 1200)
-    }
-    void poll()
-    return () => {
-      cancelled = true
-      if (timer !== null) clearTimeout(timer)
-    }
-  }, [active, sessionId])
 
   useEffect(() => {
     const onPageHide = (): void => { reportVoiceState(sessionId, false, true) }
@@ -2515,8 +2463,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const activity = pending > 0
     ? queued > 0 ? `并行识别 ${pending} 段 · ${queued} 条语音排队` : `正在并行识别（${pending}）…`
     : queued > 0 ? `语音排队（${queued}）…` : ''
-  const hostActivity = (hostTts?.pending ?? 0) > 0 ? `后台还有 ${hostTts?.pending} 句待读` : ''
-  const activeActivity = activity || hostActivity
+  const activeActivity = activity
   const label = error || (active
     ? activeActivity || (speaker ? `正在听…（${speaker}）` : '正在听…点击结束')
     : '语音对话：点一下开始，多人插话按优先级排队，回答自动朗读')

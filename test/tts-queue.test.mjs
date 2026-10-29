@@ -248,6 +248,7 @@ test('snapshot exposes the current sentence and the waiting count', async () => 
     busy: true,
     active: true,
     pending: 1,
+    items: [{ text: '后面排队的一句', round: 0, replyId: 'reply-state' }],
     text: '正在合成的一句',
     replyId: 'reply-state',
   })
@@ -258,6 +259,7 @@ test('snapshot exposes the current sentence and the waiting count', async () => 
     busy: false,
     active: false,
     pending: 0,
+    items: [],
   })
   await queue.close()
 })
