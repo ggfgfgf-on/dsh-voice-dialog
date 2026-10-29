@@ -1,0 +1,180 @@
+{
+  "label": "after-clean",
+  "measuredAt": "2026-10-28T13:00:28.410Z",
+  "rounds": 3,
+  "environment": {
+    "asr": "SenseVoice int8 native worker, threads=2",
+    "asrStartupMs": 970.2,
+    "separation": "MossFormer2 ONNX backend=dml",
+    "voiceprint": "CAM++ sherpa-onnx native",
+    "endpoint": "real ContinuousSeparation + deterministic two-source stub, sep delay = measured median"
+  },
+  "medians": {
+    "packMs": 3.6,
+    "asrInferenceMs": 126.5,
+    "asrTransportMs": 12.4,
+    "asrWallMs": 137.5,
+    "voiceprintMs": 36.6,
+    "separationMs": 695.6,
+    "sepWindowMs": 4000,
+    "guestEndpointWaitMs": 700.9,
+    "ownerEndpointWaitMs": 700.9
+  },
+  "means": {
+    "packMs": 4.2,
+    "asrInferenceMs": 159.5,
+    "voiceprintMs": 44.8,
+    "separationMs": 707.1
+  },
+  "endpointRuns": [
+    {
+      "guestWaitMs": 700.6,
+      "ownerWaitMs": 700.5,
+      "events": 2,
+      "guestSamples": 1560,
+      "ownerSamples": 5240
+    },
+    {
+      "guestWaitMs": 704.5,
+      "ownerWaitMs": 704.5,
+      "events": 2,
+      "guestSamples": 1560,
+      "ownerSamples": 5240
+    },
+    {
+      "guestWaitMs": 700.9,
+      "ownerWaitMs": 700.9,
+      "events": 2,
+      "guestSamples": 1560,
+      "ownerSamples": 5240
+    }
+  ],
+  "rows": [
+    {
+      "round": 1,
+      "file": "speech1.wav",
+      "samples": 53281,
+      "payloadBytes": 142207,
+      "packMs": 3.5932000000002517,
+      "voiceprintMs": 24.274599999999737,
+      "asrWallMs": 110.26389999999992,
+      "asrInferenceMs": 94.20659999999998,
+      "asrTransportMs": 16.05729999999994,
+      "separationMs": 738.9609,
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "label": "说话人1"
+    },
+    {
+      "round": 1,
+      "file": "speech2.wav",
+      "samples": 88401,
+      "payloadBytes": 235859,
+      "packMs": 3.369400000000496,
+      "voiceprintMs": 35.66349999999966,
+      "asrWallMs": 126.57790000000023,
+      "asrInferenceMs": 112.08230000000003,
+      "asrTransportMs": 14.495600000000195,
+      "separationMs": 695.5789000000004,
+      "text": "This is a latency benchmark for the local speech recognition engine running on this computer.",
+      "label": "说话人1"
+    },
+    {
+      "round": 1,
+      "file": "speech3.wav",
+      "samples": 179761,
+      "payloadBytes": 479487,
+      "packMs": 7.14180000000033,
+      "voiceprintMs": 76.54709999999977,
+      "asrWallMs": 233.07899999999972,
+      "asrInferenceMs": 219.09109999999964,
+      "asrTransportMs": 13.987900000000081,
+      "separationMs": 688.1972000000005,
+      "text": "Please measure the time from the end of speech until the recognized words enter the queue. We need three complete runs, and then we will compare the median before and after the optimization.",
+      "label": "说话人1"
+    },
+    {
+      "round": 2,
+      "file": "speech1.wav",
+      "samples": 53281,
+      "payloadBytes": 142207,
+      "packMs": 1.8715999999994892,
+      "voiceprintMs": 22.273299999999836,
+      "asrWallMs": 102.89580000000024,
+      "asrInferenceMs": 88.02390000000014,
+      "asrTransportMs": 14.871900000000096,
+      "separationMs": 693.6068999999998,
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "label": "说话人1"
+    },
+    {
+      "round": 2,
+      "file": "speech2.wav",
+      "samples": 88401,
+      "payloadBytes": 235859,
+      "packMs": 3.8067000000000917,
+      "voiceprintMs": 36.920500000000175,
+      "asrWallMs": 164.7494999999999,
+      "asrInferenceMs": 158.1853000000001,
+      "asrTransportMs": 6.564199999999801,
+      "separationMs": 717.9976999999999,
+      "text": "This is a latency benchmark for the local speech recognition engine running on this computer.",
+      "label": "说话人1"
+    },
+    {
+      "round": 2,
+      "file": "speech3.wav",
+      "samples": 179761,
+      "payloadBytes": 479487,
+      "packMs": 6.629500000000007,
+      "voiceprintMs": 75.25849999999991,
+      "asrWallMs": 299.8157999999994,
+      "asrInferenceMs": 290.52190000000064,
+      "asrTransportMs": 9.293899999998757,
+      "separationMs": 676.6702999999998,
+      "text": "Please measure the time from the end of speech until the recognized words enter the queue. We need three complete runs, and then we will compare the median before and after the optimization.",
+      "label": "说话人1"
+    },
+    {
+      "round": 3,
+      "file": "speech1.wav",
+      "samples": 53281,
+      "payloadBytes": 142207,
+      "packMs": 1.8749000000007072,
+      "voiceprintMs": 22.425900000000183,
+      "asrWallMs": 92.1804000000011,
+      "asrInferenceMs": 80.95160000000033,
+      "asrTransportMs": 11.228800000000774,
+      "separationMs": 668.2934999999998,
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "label": "说话人1"
+    },
+    {
+      "round": 3,
+      "file": "speech2.wav",
+      "samples": 88401,
+      "payloadBytes": 235859,
+      "packMs": 3.4268000000010943,
+      "voiceprintMs": 36.613499999999476,
+      "asrWallMs": 137.52480000000105,
+      "asrInferenceMs": 126.48220000000038,
+      "asrTransportMs": 11.042600000000675,
+      "separationMs": 771.3024000000005,
+      "text": "This is a latency benchmark for the local speech recognition engine running on this computer.",
+      "label": "说话人1"
+    },
+    {
+      "round": 3,
+      "file": "speech3.wav",
+      "samples": 179761,
+      "payloadBytes": 479487,
+      "packMs": 6.106100000000879,
+      "voiceprintMs": 73.49900000000162,
+      "asrWallMs": 278.6373000000003,
+      "asrInferenceMs": 266.28689999999915,
+      "asrTransportMs": 12.350400000001173,
+      "separationMs": 712.8934999999983,
+      "text": "Please measure the time from the end of speech until the recognized words enter the queue. We need three complete runs, and then we will compare the median before and after the optimization.",
+      "label": "说话人1"
+    }
+  ]
+}

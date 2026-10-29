@@ -52,6 +52,7 @@ const TEST_SURFACES = [
   'speaker',
   'speaker-policy',
   'speech-filter',
+  'speech-profile',
   'tts-queue',
   'utterance-coalescer',
   'voice-marker',

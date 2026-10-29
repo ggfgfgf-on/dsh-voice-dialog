@@ -1,0 +1,62 @@
+{
+  "rounds": 3,
+  "samples": 64000,
+  "old": {
+    "encodeMs": 2.34,
+    "rttMs": 1.17,
+    "decodeMs": 0.23,
+    "totalMs": 3.52,
+    "bytes": 170746,
+    "samples": [
+      [
+        2.34,
+        2.29,
+        2.35
+      ],
+      [
+        1.42,
+        0.93,
+        1.17
+      ],
+      [
+        0.23,
+        0.22,
+        0.25
+      ]
+    ]
+  },
+  "new": {
+    "encodeMs": 0.22,
+    "rttMs": 0.59,
+    "decodeMs": 0.08,
+    "totalMs": 0.81,
+    "bytes": 128044,
+    "samples": [
+      [
+        0.22,
+        0.23,
+        0.21
+      ],
+      [
+        0.64,
+        0.57,
+        0.59
+      ],
+      [
+        0.08,
+        0.09,
+        0.08
+      ]
+    ]
+  },
+  "payload": {
+    "oldBytes": 170746,
+    "newBytes": 128044,
+    "shrinkPct": 25.01
+  },
+  "delta": {
+    "encodeMs": 2.12,
+    "decodeMs": 0.15,
+    "totalMs": 2.71
+  }
+}

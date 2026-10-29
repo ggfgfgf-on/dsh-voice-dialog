@@ -187,6 +187,37 @@ export function withSpeechPause(text: string): string {
   return clean + '，'
 }
 
+/** Per-queue synthesis limits; the defaults equal today's live constants. */
+export interface SynthesisLimits {
+  mergeMaxChars: number
+  mergeRunMaxChars: number
+  mergeRunMaxItems: number
+}
+
+export const DEFAULT_SYNTHESIS_LIMITS: SynthesisLimits = {
+  mergeMaxChars: MERGE_ITEM_MAX_CHARS,
+  mergeRunMaxChars: MERGE_RUN_MAX_CHARS,
+  mergeRunMaxItems: MERGE_RUN_MAX_ITEMS,
+}
+
+/** Clamp a declared limit set onto the current one; invalid fields are ignored. */
+export function normalizeSynthesisLimits(
+  input: Partial<SynthesisLimits> | null | undefined,
+  base: SynthesisLimits = DEFAULT_SYNTHESIS_LIMITS,
+): SynthesisLimits {
+  if (!input || typeof input !== 'object') return { ...base }
+  const pick = (value: unknown, low: number, high: number, fallback: number): number => {
+    const number = typeof value === 'number' ? value : Number.NaN
+    if (!Number.isFinite(number)) return fallback
+    return Math.min(high, Math.max(low, Math.round(number)))
+  }
+  return {
+    mergeMaxChars: pick(input.mergeMaxChars, 8, 400, base.mergeMaxChars),
+    mergeRunMaxChars: pick(input.mergeRunMaxChars, 8, 1200, base.mergeRunMaxChars),
+    mergeRunMaxItems: pick(input.mergeRunMaxItems, 1, 32, base.mergeRunMaxItems),
+  }
+}
+
 /** One Edge TTS request may represent several consecutive short queue items. */
 export interface MergedSynthesisRun {
   /** Text to synthesize in one request. */
@@ -255,22 +286,25 @@ function joinSynthesisText(left: string, right: string): string {
  * A non-mergeable head is still returned with count 1 so the pump can consume
  * it through the same path as a merged run.
  */
-export function mergeSynthesisRun(items: readonly TtsQueueItem[]): MergedSynthesisRun {
+export function mergeSynthesisRun(
+  items: readonly TtsQueueItem[],
+  limits: SynthesisLimits = DEFAULT_SYNTHESIS_LIMITS,
+): MergedSynthesisRun {
   const first = items[0]
   if (!first) return { text: '', count: 0 }
 
   let text = first.text
   let count = 1
-  if (characterCount(first.text.trim()) > MERGE_ITEM_MAX_CHARS) {
+  if (characterCount(first.text.trim()) > limits.mergeMaxChars) {
     return { text, count }
   }
 
-  while (count < MERGE_RUN_MAX_ITEMS && count < items.length) {
+  while (count < limits.mergeRunMaxItems && count < items.length) {
     const next = items[count]
     if (!next || next.replyId !== first.replyId) break
-    if (characterCount(next.text.trim()) > MERGE_ITEM_MAX_CHARS) break
+    if (characterCount(next.text.trim()) > limits.mergeMaxChars) break
     const joined = joinSynthesisText(text, next.text)
-    if (characterCount(joined) > MERGE_RUN_MAX_CHARS) break
+    if (characterCount(joined) > limits.mergeRunMaxChars) break
     text = joined
     count += 1
   }
@@ -302,6 +336,8 @@ export class TtsQueue {
   private readonly synthAttempts: number
   private readonly retryDelayMs: number
   private ready: Promise<void> | null = null
+  /** Model-declared merge limits; the defaults are today's behaviour. */
+  private limits: SynthesisLimits = DEFAULT_SYNTHESIS_LIMITS
 
   constructor(options: {
     voice?: string
@@ -318,6 +354,16 @@ export class TtsQueue {
     this.retryDelayMs = Number.isFinite(options.retryDelayMs)
       ? Math.max(0, Math.floor(options.retryDelayMs as number))
       : SYNTH_RETRY_DELAY_MS
+  }
+
+  /** Apply a model-declared merge limit set; returns the effective limits. */
+  setLimits(next: Partial<SynthesisLimits>): SynthesisLimits {
+    this.limits = normalizeSynthesisLimits(next, this.limits)
+    return this.limits
+  }
+
+  limitsView(): SynthesisLimits {
+    return { ...this.limits }
   }
 
   /** Switch the Edge voice and drop the old handshake; queued text uses the new voice. */
@@ -552,7 +598,7 @@ export class TtsQueue {
       await this.ensureReady()
       q.failures = 0
       while (q.pending.length > 0) {
-        const run = mergeSynthesisRun(q.pending)
+        const run = mergeSynthesisRun(q.pending, this.limits)
         const item = q.pending.shift()!
         // The head becomes `current` as before. The rest of a merged run stays
         // in pending until its one request settles, so snapshot/cancel counts

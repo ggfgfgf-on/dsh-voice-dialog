@@ -20,6 +20,11 @@ import {
   type InterruptionMode,
 } from './interruption.ts'
 import {
+  normalizeSpeechProfile,
+  resolveSpeechProfile,
+  type SpeechProfile,
+} from './speech-profile.ts'
+import {
   getPreferences, setPreferences, subscribePreferences,
   SPEAKER_THRESHOLD_MAX, SPEAKER_THRESHOLD_MIN, type VoiceDialogPreferences,
 } from './preferences.ts'
@@ -103,9 +108,11 @@ interface VoiceFrame {
 }
 
 interface VoiceControl {
-  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker' | 'yield'
+  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker' | 'yield' | 'speech'
   /** Model-declared interruption contract for its own speech. */
   mode?: InterruptionMode
+  /** Model-declared speech profile (action speech). */
+  profile?: SpeechProfile
   level?: number
   rate?: number
   delta?: number
@@ -561,6 +568,24 @@ class TtsPlayer {
   private afterCut: VoiceFrame[] = []
   /** How the model declared its own speech may be interrupted; default finishes the sentence. */
   private interruptionMode: InterruptionMode = DEFAULT_INTERRUPTION_MODE
+  /** What the model declared; empty means today's behaviour. */
+  private declaredSpeech: SpeechProfile = {}
+  /** Resolved profile: declaration first, defaults fill the gaps. */
+  private speechProfile: Required<SpeechProfile> = resolveSpeechProfile(null)
+  /** Pending gap between two spoken blocks. */
+  private gapTimer: ReturnType<typeof setTimeout> | null = null
+
+  /** The raw declaration, for layers that must keep the user's own setting. */
+  declaredSpeechSettings(): SpeechProfile {
+    return this.declaredSpeech
+  }
+
+  /** Cancel a pending between-blocks gap so a stop cannot resume audio. */
+  private clearGap(): void {
+    if (this.gapTimer === null) return
+    clearTimeout(this.gapTimer)
+    this.gapTimer = null
+  }
   /** A 'sentence' contract asked to hold; it fires at the next boundary, never mid-sentence. */
   private pendingBoundaryYield = false
   private cutReplyId: string | undefined
@@ -833,6 +858,15 @@ class TtsPlayer {
 
   /** Apply a control broadcast from the model-facing voice_dialog tool. */
   control(control: VoiceControl): void {
+    if (control.action === 'speech') {
+      this.declaredSpeech = normalizeSpeechProfile(control.profile)
+      this.speechProfile = resolveSpeechProfile(this.declaredSpeech)
+      // One owner for the interruption contract, whichever action declared it.
+      if (isInterruptionMode(this.speechProfile.interruption)) {
+        this.interruptionMode = this.speechProfile.interruption
+      }
+      return
+    }
     if (control.action === 'yield') {
       if (isInterruptionMode(control.mode)) this.interruptionMode = control.mode
       return
@@ -876,6 +910,7 @@ class TtsPlayer {
   }
 
   private halt(): void {
+    this.clearGap()
     this.abandonYield()
     this.pendingBoundaryYield = false
     this.queue.length = 0
@@ -1288,7 +1323,20 @@ class TtsPlayer {
     this.frameStats.played += 1
     this.reportFrame('played', frame)
     if (this.onPlay) { try { this.onPlay(frame) } catch { /* logging only */ } }
-    this.audio.onended = () => { this.cleanupUrl(); this.playNext() }
+    this.audio.onended = () => {
+      this.cleanupUrl()
+      // A declared gap only delays the next block; nothing is inserted today.
+      const gapMs = this.speechProfile.betweenBlocksMs
+      if (gapMs > 0 && this.queue.length > 0) {
+        this.gapTimer = setTimeout(() => {
+          this.gapTimer = null
+          if (!this.active || this.muted) return
+          this.playNext()
+        }, gapMs)
+        return
+      }
+      this.playNext()
+    }
     this.audio.onerror = () => { this.cleanupUrl(); this.playNext() }
     void this.audio.play().catch(() => {
       // Autoplay was blocked: keep the frame so the first gesture can replay it.
@@ -2551,6 +2599,12 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       const fastPath = continuous && prefs.separationFastPath
       separatorRef.current?.close()
       separatorRef.current = null
+      // A declared close window only overrides the user's own pause setting.
+      const declaredSpeech = sharedPlayer.declaredSpeechSettings()
+      const micSilenceMs = typeof declaredSpeech.micSilenceMs === 'number'
+        ? declaredSpeech.micSilenceMs : getPreferences().pauseMs
+      const separationSilenceMs = typeof declaredSpeech.separationSilenceMs === 'number'
+        ? declaredSpeech.separationSilenceMs : getPreferences().pauseMs
       let separator: ContinuousSeparation | null = null
       if (continuous && !fastPath) {
         separator = new ContinuousSeparation({
@@ -2561,7 +2615,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           hopMs: 700,
           // One pause value for both paths: the per-source tail must match the
           // number the user picked, or the custom setting only half applies.
-          silenceMs: getPreferences().pauseMs,
+          silenceMs: separationSilenceMs,
           separate: async (window) => {
             const split = await separateSegment(window, sessionId, prefs.speakerThreshold, false, prefs.ownerMargin)
             return {
@@ -2585,7 +2639,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       }
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
-        silenceMs: getPreferences().pauseMs,
+        silenceMs: micSilenceMs,
         // 0 = adaptive noise floor; a positive preference pins the gate.
         threshold: getPreferences().micThreshold > 0 ? getPreferences().micThreshold : undefined,
         continuous,

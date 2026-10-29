@@ -20,6 +20,7 @@ import { hasSpeechContent, sanitizeForSpeech, SentenceSegmenter, stripFillerHead
 import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { VisibleVoiceFilter } from './voice-marker.ts'
 import { createEdgeTts, rateToProsody, TtsQueue, type VoiceFrame } from './tts-queue.ts'
+import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
 import { decodeAudioFrames } from './audio-transport.ts'
 import { encodeWavBase64, SeparationService } from './separation.ts'
@@ -64,9 +65,11 @@ const lastUserSpeech = new Map<string, string>()
 let fastLaneEnabled = true
 
 export interface VoiceControl {
-  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker' | 'yield'
+  action: 'volume' | 'rate' | 'stop' | 'repeat' | 'speaker' | 'yield' | 'speech'
   /** Interruption contract for the assistant's own speech; only for action yield. */
   mode?: 'sentence' | 'immediate' | 'never'
+  /** Model-declared speech profile; only for action speech. */
+  profile?: SpeechProfile
   level?: number
   rate?: number
   delta?: number
@@ -134,6 +137,8 @@ export function apply(ctx: Context, config: Config): void {
 const SAME_SPEAKER_SIMILARITY = 0.62
   let voice = storedVoice(config.voice)
   let rate = storedRate(config.rate)
+  /** The model's own speech declaration; empty means "use today's behaviour". */
+  let declaredSpeechProfile: SpeechProfile = {}
   type SseSend = (event: 'audio' | 'control', data: VoiceFrame | VoiceControl) => void
   const clients = new Set<SseSend>()
   const queue = new TtsQueue({ voice })
@@ -301,14 +306,15 @@ const SAME_SPEAKER_SIMILARITY = 0.62
       + 'Action yield declares how your OWN speech may be interrupted while it is read aloud: mode sentence finishes the '
       + 'sentence being spoken and then drops the rest (default for normal answers), immediate cuts at once, '
       + 'never keeps playing to the end. Declare it before or during a long answer when the listener is likely to talk over you. '
-      + 'The owner cannot be renamed or ignored. Do not call this for ordinary questions. The microphone stays on after stop.',
+      + 'The owner cannot be renamed or ignored. Do not call this for ordinary questions. The microphone stays on after stop. '
+      + 'Action speech declares how your own answer is split, paced and interrupted: every field is optional and only overrides the built-in default, e.g. {"interruption":"sentence","mergeMaxChars":80,"betweenBlocksMs":150}.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: {
           type: 'string',
-          enum: ['volume', 'rate', 'stop', 'repeat', 'speaker', 'yield'],
+          enum: ['volume', 'rate', 'stop', 'repeat', 'speaker', 'yield', 'speech'],
           description: 'volume adjusts playback loudness; rate adjusts speaking speed for following sentences; stop silences the current reply; repeat replays the last reply; speaker renames a guest voiceprint and/or changes how that guest is delivered; yield declares how your own read-aloud speech may be interrupted.',
         },
         level: { type: 'number', minimum: 0, maximum: 1, description: 'Absolute playback volume for action volume.' },
@@ -317,6 +323,20 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         speaker: { type: 'string', description: 'Guest voiceprint label for action speaker, e.g. 客人1, 说话人1, or a name the model assigned earlier; use * for all guests. The owner 我 cannot be changed.' },
         policy: { type: 'string', enum: ['queue', 'steer', 'ignore', 'default'], description: 'Delivery policy for action speaker: queue, steer, ignore, or default to restore the browser setting.' },
         name: { type: 'string', description: 'New short name for this guest voiceprint, e.g. 老婆 or 老王. Future transcripts and policies can use it. Only for a specific guest, not * or 我.' },
+        profile: {
+          type: 'object',
+          additionalProperties: false,
+          description: 'Speech profile for action speech. Every field is optional and only overrides the built-in default.',
+          properties: {
+            interruption: { type: 'string', enum: ['sentence', 'immediate', 'never'], description: 'How your own speech may be interrupted. sentence finishes the sentence being spoken.' },
+            mergeMaxChars: { type: 'number', minimum: 8, maximum: 400, description: 'Longest line that may join a merged synthesis request.' },
+            mergeRunMaxChars: { type: 'number', minimum: 8, maximum: 1200, description: 'Hard cap for one merged synthesis request.' },
+            mergeRunMaxItems: { type: 'number', minimum: 1, maximum: 32, description: 'How many lines may share one synthesis request.' },
+            betweenBlocksMs: { type: 'number', minimum: 0, maximum: 2000, description: 'Silence inserted between spoken blocks; 0 starts the next block at once.' },
+            micSilenceMs: { type: 'number', minimum: 400, maximum: 4000, description: 'Silence that closes the listener utterance before recognition.' },
+            separationSilenceMs: { type: 'number', minimum: 400, maximum: 4000, description: 'Tail silence for a separated speaker stream.' },
+          },
+        },
         mode: { type: 'string', enum: ['sentence', 'immediate', 'never'], description: 'Interruption contract for action yield: sentence finishes the audible sentence then drops the rest (default), immediate cuts now, never lets the reply finish uninterrupted.' },
       },
       required: ['action'],
@@ -334,6 +354,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
           policy: { type: 'string' },
           name: { type: 'string' },
           mode: { type: 'string' },
+          profile: { type: 'object' },
         },
         required: ['ok', 'action'],
       },
@@ -342,6 +363,20 @@ const SAME_SPEAKER_SIMILARITY = 0.62
     execute: (args: unknown) => {
       const input = (args ?? {}) as Record<string, unknown>
       const action = input.action
+      if (action === 'speech') {
+        const declared = normalizeSpeechProfile(input.profile)
+        if (Object.keys(declared).length === 0) {
+          throw new Error('voice_dialog speech needs at least one valid profile field')
+        }
+        declaredSpeechProfile = { ...declaredSpeechProfile, ...declared }
+        queue.setLimits({
+          mergeMaxChars: declaredSpeechProfile.mergeMaxChars,
+          mergeRunMaxChars: declaredSpeechProfile.mergeRunMaxChars,
+          mergeRunMaxItems: declaredSpeechProfile.mergeRunMaxItems,
+        })
+        broadcast('control', { action: 'speech', profile: declaredSpeechProfile })
+        return Promise.resolve({ ok: true, action: 'speech', profile: declaredSpeechProfile })
+      }
       if (action === 'yield') {
         const rawMode = input.mode
         const mode = rawMode === undefined
@@ -409,7 +444,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         broadcast('control', { action, rate: applied })
         return Promise.resolve({ ok: true, action, rate: applied })
       }
-      throw new Error('voice_dialog action must be volume, rate, stop, repeat, speaker or yield')
+      throw new Error('voice_dialog action must be volume, rate, stop, repeat, speaker, yield or speech')
     },
   }))
 
