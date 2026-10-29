@@ -116,3 +116,110 @@ test('a transient synthesis failure retries on a fresh attempt', async () => {
   assert.equal(frames[0].error, undefined)
   await queue.close()
 })
+
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+const magicMp3 = () => Buffer.from([0xff, 0xfb, 0x90, 0x64])
+
+test('cancelReply drops only the targeted reply and keeps the active one', async () => {
+  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural', synthAttempts: 1 })
+  const gate = deferred()
+  const started = deferred()
+  queue.tts = {
+    setMetadata: async () => undefined,
+    toStream: async (text) => {
+      if (text.startsWith('第一句')) {
+        started.resolve()
+        return {
+          audioStream: (async function* () {
+            await gate.promise
+            yield magicMp3()
+          })(),
+        }
+      }
+      return { audioStream: (async function* () { yield magicMp3() })() }
+    },
+    close: async () => undefined,
+  }
+  const frames = []
+  queue.subscribe((frame) => frames.push(frame))
+  queue.enqueue('session-cancel-pending', '第一句', 'reply-keep')
+  queue.enqueue('session-cancel-pending', '第二句', 'reply-drop')
+  await started.promise
+  const result = queue.cancelReply('session-cancel-pending', 'reply-drop')
+  assert.deepEqual(result, { pending: 1, active: false })
+  gate.resolve()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.deepEqual(frames.map((frame) => frame.replyId), ['reply-keep'])
+  await queue.close()
+})
+
+test('cancelReply invalidates a sentence already inside the synthesizer', async () => {
+  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural', synthAttempts: 1 })
+  const gate = deferred()
+  const started = deferred()
+  let first = true
+  queue.tts = {
+    setMetadata: async () => undefined,
+    toStream: async () => {
+      if (first) {
+        first = false
+        started.resolve()
+        return {
+          audioStream: (async function* () {
+            yield magicMp3()
+            await gate.promise
+            yield magicMp3()
+          })(),
+        }
+      }
+      return { audioStream: (async function* () { yield magicMp3() })() }
+    },
+    close: async () => undefined,
+  }
+  const frames = []
+  queue.subscribe((frame) => frames.push(frame))
+  queue.enqueue('session-cancel-active', '旧回答', 'reply-old')
+  await started.promise
+  const result = queue.cancelReply('session-cancel-active', 'reply-old')
+  assert.deepEqual(result, { pending: 1, active: true })
+  gate.resolve()
+  queue.enqueue('session-cancel-active', '新回答', 'reply-new')
+  await new Promise((resolve) => setTimeout(resolve, 70))
+  assert.deepEqual(frames.map((frame) => frame.replyId), ['reply-new'])
+  await queue.close()
+})
+
+test('cancel stops the whole session and reports active plus pending work', async () => {
+  const queue = new TtsQueue({ voice: 'zh-CN-XiaoxiaoNeural', synthAttempts: 1 })
+  const gate = deferred()
+  const started = deferred()
+  queue.tts = {
+    setMetadata: async () => undefined,
+    toStream: async () => {
+      started.resolve()
+      return {
+        audioStream: (async function* () {
+          await gate.promise
+          yield magicMp3()
+        })(),
+      }
+    },
+    close: async () => undefined,
+  }
+  const frames = []
+  queue.subscribe((frame) => frames.push(frame))
+  queue.enqueue('session-cancel-all', '第一句', 'reply-a')
+  queue.enqueue('session-cancel-all', '第二句', 'reply-b')
+  await started.promise
+  const result = queue.cancel('session-cancel-all')
+  assert.deepEqual(result, { pending: 2, active: true })
+  gate.resolve()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.deepEqual(frames, [])
+  await queue.close()
+})

@@ -645,6 +645,33 @@ export function apply(ctx: Context, config: Config): void {
     )
   }
 
+  // The page owns playback, so an interrupt must also tell the host to stop
+  // synthesizing sentences nobody will hear. A reply id narrows the cancel to
+  // the reply being cut; omitting it is the explicit "stop speaking" path.
+  const ttsCancelHandler = async (req: unknown, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readJson(req)
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+      if (!sessionId) { writeJson(res, 400, { error: 'missing sessionId' }); return }
+      const clientId = typeof body.clientId === 'string' ? body.clientId.trim() : ''
+      const owner = voiceOwner.get(sessionId)
+      if (owner !== undefined && clientId !== '' && owner.clientId !== clientId) {
+        writeJson(res, 409, { error: 'another tab owns this voice session' })
+        return
+      }
+      const replyId = typeof body.replyId === 'string' ? body.replyId.trim().slice(0, 200) : ''
+      const result = replyId === '' ? queue.cancel(sessionId) : queue.cancelReply(sessionId, replyId)
+      writeJson(res, 200, { ok: true, ...result })
+    } catch (error) {
+      writeJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
+    ctx.effect(() =>
+      ctx.webServer.register({ kind: 'exact', path: `${prefix}/tts-cancel`, handler: ttsCancelHandler }),
+    )
+  }
+
   // Persisted voice selection. The client owns the catalog; the host only
   // validates the id, switches the live queue and stores the choice.
   ctx.effect(() =>

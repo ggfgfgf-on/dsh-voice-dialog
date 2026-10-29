@@ -247,6 +247,20 @@ function reportPlayback(sessionId: string, playing: boolean): void {
   }).catch(() => undefined)
 }
 
+/** Tell the host to stop synthesizing old sentences nobody will hear. */
+function cancelHostTts(sessionId: string, replyId?: string): void {
+  void fetch(apiUrl('/tts-cancel'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      sessionId,
+      clientId: CLIENT_ID,
+      ...(replyId === undefined ? {} : { replyId }),
+    }),
+    keepalive: true,
+  }).catch(() => undefined)
+}
+
 function loadConfig(): Promise<HostConfig> {
   if (configPromise === null) {
     configPromise = fetch(`${BOOTSTRAP_BASE}/config`)
@@ -515,6 +529,8 @@ class TtsPlayer {
   onPlay: ((frame: VoiceFrame) => void) | undefined
   /** Perception hook: the mouth opening and closing, as the host sees it. */
   onPlayback: ((playing: boolean, sessionId: string | undefined) => void) | undefined
+  /** Host-side cleanup when part or all of the spoken queue is discarded. */
+  onCancelTts: ((sessionId: string, replyId?: string) => void) | undefined
   private lastReplyId: string | undefined
   /** Reply id of the most recently queued frame, to detect a superseded answer. */
   private lastQueuedReplyId: string | undefined
@@ -697,19 +713,21 @@ class TtsPlayer {
    * Organizer-driven cut: fade the current sentence, drop unread old frames,
    * then let frames that arrived during the fade start the new answer.
    */
-  cut(expectedVersion: number, isCurrent: (version: number) => boolean): boolean {
+  cutNow(): boolean {
     if (!this.active || this.muted || !this.sessionId) return false
-    if (!isCurrent(expectedVersion)) return false
     if (!this.playing && this.queue.length === 0) return false
     const token = ++this.cutToken
     this.cutting = true
     this.cutReplyId = this.currentFrame?.replyId
+    // Only the audible reply is invalidated. A new answer already in flight
+    // must keep synthesizing, so this never becomes a full-session cancel.
+    if (this.cutReplyId !== undefined) this.onCancelTts?.(this.sessionId, this.cutReplyId)
     // One writer fades the sentence out and schedules its own recovery, so a
     // fade to zero can never outlive the interruption.
     this.gainRig.cutFade()
     setTimeout(() => {
       if (token !== this.cutToken) return
-      if (!this.active || !isCurrent(expectedVersion)) {
+      if (!this.active) {
         const pending = this.afterCut
         this.afterCut = []
         this.cutting = false
@@ -793,6 +811,9 @@ class TtsPlayer {
   }
 
   private stopAll(): void {
+    // The host queue continues synthesizing independently of playback. Cancel
+    // it too, or old sentences arrive later and look like a ghost repeat.
+    if (this.sessionId) this.onCancelTts?.(this.sessionId)
     // Keep the last reply in memory: "闭嘴" followed by "重复一遍" is valid.
     this.halt()
     this.muted = true
@@ -1053,6 +1074,7 @@ class TtsPlayer {
   }
 
   private clear(): void {
+    if (this.sessionId) this.onCancelTts?.(this.sessionId)
     this.abandonYield()
     this.queue.length = 0
     this.afterCut = []
@@ -1428,7 +1450,12 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     sharedPlayer.onPlayback = (playing, sessionId) => {
       if (sessionId) reportPlayback(sessionId, playing)
     }
-    return () => { sharedPlayer.onPlay = undefined; sharedPlayer.onPlayback = undefined }
+    sharedPlayer.onCancelTts = (sessionId, replyId) => cancelHostTts(sessionId, replyId)
+    return () => {
+      sharedPlayer.onPlay = undefined
+      sharedPlayer.onPlayback = undefined
+      sharedPlayer.onCancelTts = undefined
+    }
   }, [])
 
   useEffect(() => {
@@ -1742,7 +1769,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           // Perception first: owner speech is reported to the host/model and
           // never cut here. Only an explicitly steered guest still cuts.
           if (plan.interrupt && allowInterrupt && lane !== 'owner') {
-            sharedPlayer.cut(0, () => true)
+            sharedPlayer.cutNow()
           }
         }).catch(() => undefined)
       }
@@ -1828,7 +1855,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
             return
           }
           if (guestMode === 'steer' && plan.action === 'interrupt') {
-            sharedPlayer.cut(0, () => true)
+            sharedPlayer.cutNow()
             entry.setMode('steer')
           }
         }).catch(() => undefined)
@@ -2360,7 +2387,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           // Last-resort only. The host has had a full second of speech:start and
           // still has the mouth open, so stop the feedback loop once.
           if (!sharedPlayer.playbackState().playing) return
-          sharedPlayer.cut(0, () => true)
+          sharedPlayer.cutNow()
         },
         // Legacy continuous path only: overlap the speculative separation
         // with the endpoint wait. The fast path deliberately runs no model.
@@ -2448,8 +2475,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       {activity || error
         ? <span className="dsh-vd-activity" role="status">{error || activity}</span>
         : <LiveWave level={level} />}
-      <Button type="button" className="dsh-vd-round" size="sm" aria-label="结束语音对话"
-        onClick={() => { void stop() }}><IconStopFillRegular size={14} /></Button>
+      <Button type="button" className="dsh-vd-round" size="sm" aria-label="停止朗读"
+        title="停止朗读，麦克风继续保持收听"
+        onClick={() => sharedPlayer.control({ action: 'stop' })}><IconStopFillRegular size={14} /></Button>
     </div>
   </>
 

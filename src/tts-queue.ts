@@ -38,6 +38,14 @@ export interface VoiceFrame {
 
 export type FrameListener = (frame: VoiceFrame) => void
 
+/** Result of a host-side cancel, used by the client control route. */
+export interface TtsCancelResult {
+  /** Pending or in-flight sentences invalidated by this request. */
+  pending: number
+  /** Whether a sentence was synthesizing when the request arrived. */
+  active: boolean
+}
+
 const MP3_MAGIC = 0xff
 /** First retry delay after a failed TTS handshake; doubles every attempt. */
 const RETRY_BASE_MS = 1000
@@ -149,10 +157,14 @@ export function withSpeechPause(text: string): string {
 
 interface SessionQueue {
   pending: QueuedSentence[]
+  /** The sentence currently inside the synthesis pump. */
+  current: QueuedSentence | null
   busy: boolean
   seq: number
   /** Bumped by cancel(); sentences carrying a stale epoch are dropped. */
   epoch: number
+  /** Reply ids cancelled while their sentence was already synthesizing. */
+  cancelledReplies: Set<string>
   /** Consecutive `ensureReady` failures; drives the backoff. */
   failures: number
   /** Pending retry timer, if the pump is waiting out a backoff. */
@@ -262,7 +274,10 @@ export class TtsQueue {
   ): void {
     let q = this.queues.get(sessionId)
     if (!q) {
-      q = { pending: [], busy: false, seq: 0, epoch: 0, failures: 0, retry: null }
+      q = {
+        pending: [], current: null, busy: false, seq: 0, epoch: 0,
+        cancelledReplies: new Set(), failures: 0, retry: null,
+      }
       this.queues.set(sessionId, q)
     }
     const sentenceId = typeof block.sentenceId === 'number' && Number.isFinite(block.sentenceId)
@@ -282,13 +297,47 @@ export class TtsQueue {
    * one session (barge-in). Sentences enqueued after this call get the new
    * epoch and play normally.
    */
-  cancel(sessionId: string): void {
+  cancel(sessionId: string): TtsCancelResult {
     const q = this.queues.get(sessionId)
-    if (q) {
-      q.epoch++
-      q.pending.length = 0
-      this.clearRetry(q)
+    if (!q) return { pending: 0, active: false }
+    const active = q.current !== null && q.current.epoch === q.epoch
+    const pending = q.pending.length + (active ? 1 : 0)
+    q.epoch++
+    q.pending.length = 0
+    q.cancelledReplies.clear()
+    this.clearRetry(q)
+    return { pending, active }
+  }
+
+  /**
+   * Cancel only one assistant reply. Pending sentences are removed immediately;
+   * a sentence already inside the synthesizer is invalidated so its frame is
+   * dropped as soon as the audio stream yields again.
+   */
+  cancelReply(sessionId: string, replyId: string): TtsCancelResult {
+    if (!replyId) return this.cancel(sessionId)
+    const q = this.queues.get(sessionId)
+    if (!q) return { pending: 0, active: false }
+    const before = q.pending.length
+    for (let index = q.pending.length - 1; index >= 0; index -= 1) {
+      if (q.pending[index]?.replyId === replyId) q.pending.splice(index, 1)
     }
+    const active = q.current?.replyId === replyId
+    if (active) {
+      q.cancelledReplies.add(replyId)
+      while (q.cancelledReplies.size > 16) {
+        const oldest = q.cancelledReplies.values().next().value
+        if (oldest === undefined) break
+        q.cancelledReplies.delete(oldest)
+      }
+    }
+    return { pending: before - q.pending.length + (active ? 1 : 0), active }
+  }
+
+  /** True when a pending/current sentence was invalidated by a cancel call. */
+  private isCancelled(q: SessionQueue, item: QueuedSentence): boolean {
+    return item.epoch !== q.epoch
+      || (item.replyId !== undefined && q.cancelledReplies.has(item.replyId))
   }
 
   /** Stop the backoff timer (if any) and let a fresh enqueue pump at once. */
@@ -346,6 +395,8 @@ export class TtsQueue {
       q.failures = 0
       while (q.pending.length > 0) {
         const item = q.pending.shift()!
+        if (this.isCancelled(q, item)) continue
+        q.current = item
         let buf: Buffer | undefined
         let lastError: unknown
         for (let attempt = 1; attempt <= this.synthAttempts; attempt++) {
@@ -355,6 +406,7 @@ export class TtsQueue {
             const { audioStream } = await this.tts.toStream(withSpeechPause(item.text), this.prosody)
             const chunks: Buffer[] = []
             for await (const chunk of audioStream) {
+              if (this.isCancelled(q, item)) break
               chunks.push(chunk as Buffer)
             }
             buf = Buffer.concat(chunks)
@@ -372,6 +424,7 @@ export class TtsQueue {
           }
         }
         try {
+          if (this.isCancelled(q, item)) continue
           if (!buf) throw lastError instanceof Error ? lastError : new Error(String(lastError))
           // A valid MP3 frame starts with a sync word; drop metadata garbage.
           if (buf.length === 0 || buf[0] !== MP3_MAGIC) continue
@@ -400,7 +453,11 @@ export class TtsQueue {
           const message = e instanceof Error ? e.message : String(e)
           // eslint-disable-next-line no-console
           console.warn('[dsh-voice-dialog] synthesis failed: ' + message)
-          if (item.epoch === q.epoch) this.emitFailure(sessionId, q, item.text, item.replyId, message, item.round, item)
+          if (!this.isCancelled(q, item)) {
+            this.emitFailure(sessionId, q, item.text, item.replyId, message, item.round, item)
+          }
+        } finally {
+          if (q.current === item) q.current = null
         }
       }
     } catch (e) {

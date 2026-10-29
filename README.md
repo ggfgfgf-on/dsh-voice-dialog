@@ -4,7 +4,7 @@ Continuous voice conversation for [DeepSeek Harness](https://github.com/deepseek
 
 ## What it does
 
-- **One microphone, no mode button.** The composer microphone starts and stops continuous listening. There is no floating panel and no second toolbar control.
+- **One microphone, no mode button.** The composer microphone starts and stops continuous listening. There is no floating panel and no second toolbar control. While listening, the expanded row has a separate stop-reading button: it cancels sentences still being synthesized on the host but leaves the microphone open.
 - **Continuous dictation.** A small VAD closes an utterance after ~1.4 s of silence and transcribes it through DSH speech-to-text. With simultaneous-speech separation enabled, the endpoint is tracked per separated source: your lane closes after its own 1.6 s of silence even while someone next to you keeps talking. Speech from the enrolled owner is sent with `session.prompt(..., "queue")` by default, so it waits for the current reply; a setting switches it to `steer` for immediate barge-in. Other speakers are queued by default. Up to three utterances are transcribed in parallel; recognition is parallel, while delivery is one strict FIFO queue in speaking order. The microphone opening threshold is adjustable, so quiet speech can trigger sooner while a noisy room can be made less sensitive.
 - **Read-aloud while listening.** The host taps `llm/stream`, segments assistant text into sentences, synthesizes Edge TTS audio, and streams it over SSE. A long first sentence starts at its first natural comma once it has enough words, so the first audio does not wait for the final full stop. Playback is gated by the microphone: starting the mic enables it, stopping the mic stops accepting new sentences but drains the audio already queued. If Edge is unreachable, sentences use the platform speech voice instead of disappearing.
 - **Priority barge-in.** When you start speaking, the reply is ducked (not stopped). Owner speech is queued with `session.prompt(..., "queue")` by default, so the reply you are listening to is not cut off; the setting can switch it to `steer`. Guest speech enters the same FIFO queue in speaking order, so a nearby interjection does not derail the current answer; guests can also be made to steer immediately or be ignored.
@@ -61,7 +61,7 @@ from `dsh.profile.bundles` (or disable it in the Plugins page) before enabling
 1. Open a conversation and click the microphone in the composer.
 2. Speak normally. Pauses close an utterance and insert it into the running turn.
 3. Assistant replies are read aloud automatically while the microphone is listening.
-4. Click the red microphone (or the stop button in the expanded row) to stop listening. Queued audio finishes; new sentences are not read. Spoken commands such as “轻一点”, “重复一遍” or “别说了” are routed to the model, which calls `voice_dialog`.
+4. Click the red microphone to stop listening; queued audio finishes and new sentences are not read. The square button stops read-aloud without closing the microphone, and also cancels old sentences still queued on the host. Spoken commands such as “轻一点”, “重复一遍” or “别说了” are routed to the model, which calls `voice_dialog`.
 
 If the speech model is not prepared, the microphone opens this plugin page so you can download/prepare it. The page also shows the live provider state and download progress.
 
