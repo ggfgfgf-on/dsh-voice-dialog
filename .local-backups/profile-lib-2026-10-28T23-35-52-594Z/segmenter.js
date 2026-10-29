@@ -1,0 +1,228 @@
+const TERMINAL = /[。！？!?；;…\n]/;
+const SKIP_PREFIX = /^[\s.,，、:：;；!?！？)\]）"'”’〉》】]+$/;
+const VOICE_DIRECTIVE = /\[\[\s*voice\s*[:：][\s\S]*?\]\]/gi;
+function stripVoiceDirectives(text) {
+  return text.replace(VOICE_DIRECTIVE, " ");
+}
+function plainText(text) {
+  return stripVoiceDirectives(String(text)).replace(/```[\s\S]*?```/g, " ").replace(/`[^`]*`/g, " ").replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/^#{1,6}\s+/gm, "").replace(/\*\*([^*]+)\*\*/g, "$1").replace(/\*([^*]+)\*/g, "$1").replace(/^[-*+]\s+/gm, "").replace(/^\d+\.\s+/gm, "").replace(/<\/?[a-zA-Z][^>]*>/g, " ").replace(/https?:\/\/[^\s]+/g, " ").replace(/\b[A-Za-z]:\\[^\s，。！？；：、）】》]+/g, " ").replace(/(?:^|[\s(（])\/[A-Za-z0-9_.\-/]{2,}/g, " ").replace(/\b[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|json|md|py|sh|ps1|yml|yaml|toml|log)\b/gi, " ");
+}
+const CJK = /[\u3400-\u9fff]/;
+function hasSpeechContent(text) {
+  return CJK.test(text);
+}
+function sanitizeForSpeech(text) {
+  return plainText(String(text)).replace(/\s+/g, " ").trim();
+}
+function classifyFenceLine(line) {
+  if (line.includes("\n")) return "text";
+  let spaces = 0;
+  while (spaces < line.length && line[spaces] === " ") spaces++;
+  if (spaces > 3) return "text";
+  const rest = line.slice(spaces);
+  if (rest.length === 0) return "pending";
+  const marker = rest[0];
+  if (marker !== "`" && marker !== "~") return "text";
+  let run = 0;
+  while (run < rest.length && rest[run] === marker) run++;
+  if (run >= 3) return "fence";
+  return run < rest.length ? "text" : "pending";
+}
+class MarkdownStreamFilter {
+  inFence = false;
+  /** At a line start: the next characters decide whether a fence opens. */
+  atLineStart = true;
+  /** Leading spaces + marker run buffered until the line is decided. */
+  lookahead = "";
+  inlineCode = false;
+  // Closing-fence detection for the current line inside a fence.
+  fenceLineClosed = false;
+  fenceRun = 0;
+  fenceChar = "";
+  fenceIndent = 0;
+  push(chunk) {
+    let out = "";
+    for (const ch of chunk) {
+      out += this.inFence ? this.pushFenced(ch) : this.pushNormal(ch);
+    }
+    return out;
+  }
+  /**
+   * End of stream: a fence that never closed means the model cut off mid-code,
+   * so its remaining content is dropped rather than spoken.
+   */
+  flush() {
+    if (this.inFence) {
+      this.reset();
+      return "";
+    }
+    const pending = this.lookahead;
+    this.lookahead = "";
+    this.atLineStart = false;
+    let out = "";
+    for (const ch of pending) out += this.normalChar(ch);
+    return out;
+  }
+  reset() {
+    this.inFence = false;
+    this.atLineStart = true;
+    this.lookahead = "";
+    this.inlineCode = false;
+    this.resetFenceLine();
+  }
+  resetFenceLine() {
+    this.fenceLineClosed = false;
+    this.fenceRun = 0;
+    this.fenceChar = "";
+    this.fenceIndent = 0;
+  }
+  /** Inside a fence: drop everything until a closing fence line. */
+  pushFenced(ch) {
+    if (ch === "\n") {
+      this.resetFenceLine();
+      this.atLineStart = true;
+      return "";
+    }
+    this.atLineStart = false;
+    if (this.fenceLineClosed) return "";
+    if (this.fenceRun === 0 && this.fenceIndent < 4 && ch === " ") {
+      this.fenceIndent++;
+      return "";
+    }
+    if (ch === "`" || ch === "~") {
+      if (this.fenceRun === 0) this.fenceChar = ch;
+      if (ch === this.fenceChar) {
+        this.fenceRun++;
+        if (this.fenceRun >= 3) {
+          this.inFence = false;
+          this.fenceLineClosed = true;
+        }
+        return "";
+      }
+    }
+    this.fenceLineClosed = true;
+    return "";
+  }
+  /** Outside a fence: detect fence openers, strip inline backticks. */
+  pushNormal(ch) {
+    if (this.atLineStart && !this.inlineCode) {
+      const next = this.lookahead + ch;
+      const verdict = classifyFenceLine(next);
+      if (verdict === "fence") {
+        this.inFence = true;
+        this.lookahead = "";
+        this.atLineStart = false;
+        this.resetFenceLine();
+        return "";
+      }
+      if (verdict === "text") {
+        this.lookahead = "";
+        this.atLineStart = false;
+        let out = "";
+        for (const c of next) out += this.normalChar(c);
+        return out;
+      }
+      this.lookahead = next;
+      return "";
+    }
+    return this.normalChar(ch);
+  }
+  normalChar(ch) {
+    if (ch === "\n") {
+      this.atLineStart = true;
+      return ch;
+    }
+    this.atLineStart = false;
+    if (ch === "`") {
+      this.inlineCode = !this.inlineCode;
+      return "";
+    }
+    return ch;
+  }
+}
+function splitSentences(chunk) {
+  const sentences = [];
+  let start = 0;
+  const re = /[。！？!?；;…\n]+|\.(?=\s|$)/g;
+  let m;
+  let lastEnd = 0;
+  while ((m = re.exec(chunk)) !== null) {
+    const end = m.index + m[0].length;
+    sentences.push(chunk.slice(start, end));
+    start = end;
+    lastEnd = end;
+  }
+  return { sentences, tail: chunk.slice(lastEnd) };
+}
+class SentenceSegmenter {
+  buffer = "";
+  maxChars;
+  firstClauseChars;
+  emitted = false;
+  /** Removes markdown constructs that span deltas (fences, inline code). */
+  markdown = new MarkdownStreamFilter();
+  constructor(options = {}) {
+    this.maxChars = options.maxSentenceChars ?? 200;
+    this.firstClauseChars = Math.max(0, options.firstClauseChars ?? 0);
+  }
+  /** Feed a raw delta; returns the complete sentences it completes. */
+  feed(chunk) {
+    const cleaned = plainText(this.markdown.push(chunk));
+    if (!cleaned) return [];
+    this.buffer += cleaned;
+    const { sentences, tail } = splitSentences(this.buffer);
+    this.buffer = tail;
+    const out = [];
+    for (const s of sentences) {
+      const t = stripVoiceDirectives(s).trim();
+      if (t && !SKIP_PREFIX.test(t)) out.push(t);
+    }
+    if (out.length > 0) this.emitted = true;
+    if (!this.emitted && this.firstClauseChars > 0) {
+      const clause = this.takeFirstClause();
+      if (clause) {
+        out.push(clause);
+        this.emitted = true;
+      }
+    }
+    if (this.buffer.length > this.maxChars) {
+      const cut = this.buffer.search(/[，,、\s]/);
+      const idx = cut > 0 ? cut : Math.floor(this.maxChars / 2);
+      const head = this.buffer.slice(0, idx).trim();
+      this.buffer = this.buffer.slice(idx);
+      if (head) {
+        out.push(head);
+        this.emitted = true;
+      }
+    }
+    return out;
+  }
+  takeFirstClause() {
+    const re = /[,，、]/g;
+    let match;
+    while ((match = re.exec(this.buffer)) !== null) {
+      const end = match.index + 1;
+      const head = this.buffer.slice(0, end).trim();
+      if (head.replace(/\s/g, "").length < this.firstClauseChars) continue;
+      this.buffer = this.buffer.slice(end);
+      return head;
+    }
+    return "";
+  }
+  /** Flush the remaining buffer (end of stream). */
+  flush() {
+    const rest = plainText(this.markdown.flush());
+    if (rest) this.buffer += rest;
+    const t = stripVoiceDirectives(this.buffer).trim();
+    this.buffer = "";
+    if (t && !SKIP_PREFIX.test(t)) return [t];
+    return [];
+  }
+}
+export {
+  SentenceSegmenter,
+  hasSpeechContent,
+  plainText,
+  sanitizeForSpeech,
+  splitSentences
+};

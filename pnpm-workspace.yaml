@@ -1,0 +1,4 @@
+allowBuilds:
+  esbuild: set this to true or false
+  msedge-tts: set this to true or false
+  onnxruntime-node: set this to true or false

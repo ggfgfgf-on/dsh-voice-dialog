@@ -59,6 +59,8 @@ export interface TtsQueueItem {
   prosody?: ProsodyOptions
   /** Silence the page leaves after this item, in ms. */
   gapAfterMs?: number
+  /** Inline SSML for character-level shaping; `text` stays the plain sentence. */
+  ssml?: string
 }
 
 /** Read-only view of the host-side synthesis queue for the page. */
@@ -318,6 +320,9 @@ export function mergeSynthesisRun(
   const first = items[0]
   if (!first) return { text: '', count: 0 }
 
+  // A marked block carries its own SSML: never fold it into a neighbour.
+  if (first.ssml !== undefined) return { text: first.text, count: 1 }
+
   let text = first.text
   let count = 1
   if (characterCount(first.text.trim()) > limits.mergeMaxChars) {
@@ -327,6 +332,7 @@ export function mergeSynthesisRun(
   while (count < limits.mergeRunMaxItems && count < items.length) {
     const next = items[count]
     if (!next || next.replyId !== first.replyId) break
+    if (next.ssml !== undefined) break
     if (characterCount(next.text.trim()) > limits.mergeMaxChars) break
     // A prosody change or a declared pause is a real seam: never merge across it.
     if (prosodySignature(next.prosody) !== prosodySignature(first.prosody)) break
@@ -483,6 +489,8 @@ export class TtsQueue {
       prosody?: ProsodyOptions
       /** Silence the page should leave after this block. */
       gapAfterMs?: number
+      /** Inline SSML for character-level shaping; the text stays plain. */
+      ssml?: string
     } = {},
   ): void {
     let q = this.queues.get(sessionId)
@@ -504,6 +512,7 @@ export class TtsQueue {
       ...(sentenceId === undefined ? {} : { sentenceId }),
       ...(chunkIndex === undefined ? {} : { chunkIndex }),
       ...(block.prosody === undefined ? {} : { prosody: block.prosody }),
+      ...(typeof block.ssml === 'string' && block.ssml !== '' ? { ssml: block.ssml } : {}),
       ...(gapAfterMs === undefined ? {} : { gapAfterMs }),
     })
     void this.pump(sessionId, q)
@@ -638,6 +647,18 @@ export class TtsQueue {
     ;(q.retry as unknown as { unref?: () => void }).unref?.()
   }
 
+  /**
+   * Full request SSML for a marked block. The readaloud endpoint rejects a
+   * <prosody> nested inside another, so this document has exactly one level and
+   * every span in `fragment` already carries its resolved values.
+   */
+  private ssmlDocument(fragment: string): string {
+    const locale = /^([a-z]{2,}-[A-Z]{2})/u.exec(this.voice)?.[1] ?? 'en-US'
+    return '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+      + 'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="' + locale + '">'
+      + '<voice name="' + this.voice + '">' + fragment + '</voice></speak>'
+  }
+
   private async pump(sessionId: string, q: SessionQueue): Promise<void> {
     // A queued retry owns the next attempt: enqueues arriving during the
     // backoff must not bypass it.
@@ -662,7 +683,11 @@ export class TtsQueue {
             try {
               // A reset cleared the handshake, so later attempts dial again.
               if (attempt > 1) await this.ensureReady()
-              const { audioStream } = await this.tts.toStream(withSpeechPause(run.text), item.prosody ?? this.prosody)
+              // A marked block carries fully resolved inline SSML and is sent as
+              // its own document; plain text keeps the historical wrapper.
+              const { audioStream } = item.ssml === undefined
+                ? await this.tts.toStream(withSpeechPause(run.text), item.prosody ?? this.prosody)
+                : await this.tts.rawToStream(this.ssmlDocument(item.ssml))
               const chunks: Buffer[] = []
               for await (const chunk of audioStream) {
                 if (this.isCancelled(q, item)) break

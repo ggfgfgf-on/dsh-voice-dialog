@@ -21,8 +21,8 @@ import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { VisibleVoiceFilter } from './voice-marker.ts'
 import { createEdgeTts, rateToProsody, TtsQueue, type VoiceFrame } from './tts-queue.ts'
 import {
-  ADJUSTMENTS, applyExpression, CONSTRUCTS, EXPRESS_TOKENS, expressionProsody, normalizeVoiceUnits,
-  pauseMsFor, splitStress, STEP_LIMITS, VOCABULARY, type VoiceUnit,
+  ADJUSTMENTS, applyExpression, CONSTRUCTS, EXPRESS_TOKENS, expressionProsody, expressionSsmlChunks,
+  MARK_LIMITS, normalizeVoiceUnits, pauseMsFor, splitStress, STEP_LIMITS, VOCABULARY, type VoiceUnit,
 } from './expression.ts'
 import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
@@ -361,6 +361,25 @@ const SAME_SPEAKER_SIMILARITY = 0.62
               stress: { type: 'array', items: { type: 'string' }, maxItems: 4, description: 'Words inside say to lean on; each becomes a short emphasised fragment.' },
               breath: { type: 'boolean', description: 'Breathy delivery: a soft seam and a trailing pause.' },
               lengthen: { type: 'boolean', description: 'Draw the tail out instead of closing it hard.' },
+              mark: {
+                type: 'array',
+                maxItems: MARK_LIMITS.max,
+                description: MARK_LIMITS.meaning,
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    at: { type: 'integer', minimum: 0, maximum: 199, description: '从第几个字开始（从 0 数，按字符计）。' },
+                    to: { type: 'integer', minimum: 0, maximum: 200, description: '到第几个字为止，不含该字；不填就只改一个字。' },
+                    tone: { type: 'string', enum: [...EXPRESS_TOKENS.tone], description: '这几个字的语气。' },
+                    pace: { type: 'string', enum: [...EXPRESS_TOKENS.pace], description: '这几个字的语速。' },
+                    rate: { type: 'number', minimum: STEP_LIMITS.rate.min, maximum: STEP_LIMITS.rate.max, description: '这几个字的语速增减。' },
+                    pitch: { type: 'number', minimum: STEP_LIMITS.pitch.min, maximum: STEP_LIMITS.pitch.max, description: '这几个字的音高增减。' },
+                    volume: { type: 'number', minimum: STEP_LIMITS.volume.min, maximum: STEP_LIMITS.volume.max, description: '这几个字的响度增减。' },
+                  },
+                  required: ['at'],
+                },
+              },
               pause: { type: 'string', enum: [...EXPRESS_TOKENS.pause], description: 'A silence with no text.' },
             },
           },
@@ -406,6 +425,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             pause: VOCABULARY.pause,
             adjustments: ADJUSTMENTS,
             constructs: CONSTRUCTS,
+            mark: MARK_LIMITS,
           },
           base: queue.prosodyBase(),
         })
@@ -432,27 +452,41 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         }
         // Buffer one step so a following pause becomes the gap AFTER the block
         // it follows, which is where the listener actually hears it.
-        type Ready = { text: string; prosody: { rate: string; pitch: string; volume: string }; gapAfterMs: number }
-        let buffered: Ready | null = null
+        type Ready = {
+          text: string
+          prosody: { rate: string; pitch: string; volume: string }
+          gapAfterMs: number
+          ssml?: string
+        }
+        // A marked step expands to several requests, so the buffer is a list.
+        let buffered: Ready[] = []
         let chunkIndex = 0
         let spoken = 0
         const flush = (): void => {
-          if (buffered === null) return
-          const ready = buffered
-          buffered = null
-          queue.enqueue(live as string, ready.text, replyId, 0, {
-            prosody: ready.prosody,
-            ...(ready.gapAfterMs > 0 ? { gapAfterMs: ready.gapAfterMs } : {}),
-            chunkIndex: chunkIndex++,
-          })
+          if (buffered.length === 0) return
+          for (const ready of buffered) {
+            queue.enqueue(live as string, ready.text, replyId, 0, {
+              prosody: ready.prosody,
+              ...(ready.ssml === undefined ? {} : { ssml: ready.ssml }),
+              ...(ready.gapAfterMs > 0 ? { gapAfterMs: ready.gapAfterMs } : {}),
+              chunkIndex: chunkIndex++,
+            })
+          }
+          buffered = []
         }
         for (const step of expanded) {
           if (step.pause !== undefined) {
-            if (buffered !== null) buffered.gapAfterMs += pauseMsFor(step.pause)
+            const last = buffered[buffered.length - 1]
+            if (last !== undefined) last.gapAfterMs += pauseMsFor(step.pause)
             continue
           }
           flush()
-          buffered = { text: applyExpression(step), prosody: expressionProsody(step, base), gapAfterMs: 0 }
+          const prosody = expressionProsody(step, base)
+          const chunks = expressionSsmlChunks(step, base)
+          buffered = chunks === undefined
+            // A marked step keeps its text verbatim: rewriting it would move the marks.
+            ? [{ text: applyExpression(step), prosody, gapAfterMs: 0 }]
+            : chunks.map((chunk) => ({ text: chunk.text, ssml: chunk.ssml, prosody, gapAfterMs: 0 }))
           spoken += 1
         }
         flush()

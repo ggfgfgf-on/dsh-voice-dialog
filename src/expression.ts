@@ -35,6 +35,25 @@ export interface VoiceUnit {
   lengthen?: boolean
   /** A silence with no text. */
   pause?: PauseToken
+  /** Character-level marks: repaint the audio of a few characters inside `say`. */
+  mark?: ProsodyMark[]
+}
+
+/**
+ * One mark inside a unit. `at` is a 0-based character index; `to` is the
+ * exclusive end, so a bare `at` paints exactly one character. Every field is an
+ * ADDITIONAL delta for that range, layered on the unit's own delivery; the unit's
+ * prosody still wraps the whole request, so a mark is a LOCAL extra. Overlapping
+ * marks add up, and the usual clamps apply once at the end.
+ */
+export interface ProsodyMark {
+  at: number
+  to?: number
+  tone?: Tone
+  pace?: Pace
+  rate?: number
+  pitch?: number
+  volume?: number
 }
 
 /** Backwards-compatible alias. */
@@ -67,6 +86,15 @@ export const STEP_LIMITS = {
 } as const
 
 export type StepLimitKey = keyof typeof STEP_LIMITS
+
+/** Character-level marks: what they are, written for the model. */
+export const MARK_LIMITS = {
+  max: 24,
+  fields: ['at', 'to', 'tone', 'pace', 'rate', 'pitch', 'volume'],
+  meaning: '一句话里的局部标定：at/to 圈出从第几个字到第几个字（从 0 数，to 不含），只改那几个字。'
+    + '可以给 tone、pace、rate、pitch、volume，都是在这句已有语气之上再叠的局部变化，重叠会相加。'
+    + '给了标定之后这句的文字不再被自动改写，位置才对得上。',
+} as const
 
 /** Numeric adjustment fields, derived from the same bounds used at synthesis. */
 export const ADJUSTMENTS: { field: string; min: number; max: number; meaning: string }[] =
@@ -156,6 +184,38 @@ const toNumber = (value: unknown, min: number, max: number): number | undefined 
   return clampNumber(Math.round(number), min, max)
 }
 
+/** Read a model-declared mark sequence; unusable marks are dropped, not repaired. */
+function normalizeMarks(input: unknown): ProsodyMark[] | undefined {
+  if (!Array.isArray(input)) return undefined
+  const marks: ProsodyMark[] = []
+  for (const entry of input) {
+    if (marks.length >= MARK_LIMITS.max) break
+    if (entry === null || typeof entry !== 'object') continue
+    const row = entry as Record<string, unknown>
+    const at = toNumber(row.at, 0, MAX_TEXT - 1)
+    if (at === undefined) continue
+    const tone = row.tone === undefined ? undefined : (typeof row.tone === 'string' ? row.tone.trim() : '')
+    if (tone !== undefined && !TONES.has(tone)) continue
+    const pace = row.pace === undefined ? undefined : (typeof row.pace === 'string' ? row.pace.trim() : '')
+    if (pace !== undefined && !PACES.has(pace)) continue
+    const mark: ProsodyMark = { at }
+    const to = toNumber(row.to, 0, MAX_TEXT)
+    if (to !== undefined && to > at) mark.to = to
+    const rate = toNumber(row.rate, STEP_LIMITS.rate.min, STEP_LIMITS.rate.max)
+    if (rate !== undefined && rate !== 0) mark.rate = rate
+    const pitch = toNumber(row.pitch, STEP_LIMITS.pitch.min, STEP_LIMITS.pitch.max)
+    if (pitch !== undefined && pitch !== 0) mark.pitch = pitch
+    const volume = toNumber(row.volume, STEP_LIMITS.volume.min, STEP_LIMITS.volume.max)
+    if (volume !== undefined && volume !== 0) mark.volume = volume
+    if (tone !== undefined) mark.tone = tone as Tone
+    if (pace !== undefined) mark.pace = pace as Pace
+    if (mark.tone === undefined && mark.pace === undefined
+      && mark.rate === undefined && mark.pitch === undefined && mark.volume === undefined) continue
+    marks.push(mark)
+  }
+  return marks.length > 0 ? marks : undefined
+}
+
 /**
  * Keep at most 12 usable units. An unknown tone/pace/pause token rejects the
  * whole unit: a wrong label must never be silently spoken as neutral.
@@ -207,6 +267,10 @@ export function normalizeVoiceUnits(input: unknown): VoiceUnit[] {
     }
     if (row.breath === true) unit.breath = true
     if (row.lengthen === true) unit.lengthen = true
+    if (row.mark !== undefined) {
+      const mark = normalizeMarks(row.mark)
+      if (mark !== undefined) unit.mark = mark
+    }
     units.push(unit)
   }
   return units
@@ -263,6 +327,115 @@ export function expressionProsody(unit: VoiceUnit, base: ProsodyBase): { rate: s
   }
 }
 
+/** One resolved piece of a marked unit: text plus the local delta painted on it. */
+export interface MarkSpan {
+  text: string
+  rate: number
+  pitch: number
+  volume: number
+}
+
+/** A mark's full delta, intent tokens folded in the same way as a step. */
+function markDelta(mark: ProsodyMark): ResolvedProsody {
+  const tone = mark.tone === undefined ? TONE_DELTAS.neutral : TONE_DELTAS[mark.tone]
+  const pace = mark.pace === undefined ? PACE_DELTAS.even : PACE_DELTAS[mark.pace]
+  return {
+    rate: (mark.rate ?? 0) + (tone.rate ?? 0) + (pace.rate ?? 0),
+    pitch: (mark.pitch ?? 0) + (tone.pitch ?? 0),
+    volume: (mark.volume ?? 0) + (tone.volume ?? 0),
+  }
+}
+
+/**
+ * Paint one delta per character, then fold equal neighbours into spans. This is
+ * the single place character marks become audio; undefined means nothing usable
+ * was marked and the plain path stays untouched.
+ */
+export function resolveMarks(unit: VoiceUnit): MarkSpan[] | undefined {
+  const text = typeof unit.say === 'string' ? unit.say : ''
+  const marks = unit.mark
+  if (text === '' || marks === undefined || marks.length === 0) return undefined
+  const chars = Array.from(text)
+  const lanes: ResolvedProsody[] = chars.map(() => ({ rate: 0, pitch: 0, volume: 0 }))
+  let painted = false
+  for (const mark of marks) {
+    if (mark.at < 0 || mark.at >= chars.length) continue
+    const to = Math.min(chars.length, Math.max(mark.at + 1, mark.to ?? mark.at + 1))
+    const delta = markDelta(mark)
+    if (delta.rate === 0 && delta.pitch === 0 && delta.volume === 0) continue
+    painted = true
+    for (let index = mark.at; index < to; index += 1) {
+      const lane = lanes[index] as ResolvedProsody
+      lane.rate += delta.rate
+      lane.pitch += delta.pitch
+      lane.volume += delta.volume
+    }
+  }
+  if (!painted) return undefined
+  const spans: MarkSpan[] = []
+  for (let index = 0; index < chars.length; index += 1) {
+    const lane = lanes[index] as ResolvedProsody
+    const last = spans[spans.length - 1]
+    if (last !== undefined && last.rate === lane.rate && last.pitch === lane.pitch
+      && last.volume === lane.volume) {
+      last.text += chars[index]
+      continue
+    }
+    spans.push({ text: chars[index] as string, rate: lane.rate, pitch: lane.pitch, volume: lane.volume })
+  }
+  return spans
+}
+
+const escapeXml = (text: string): string => text
+  .replace(/&/gu, '&amp;')
+  .replace(/</gu, '&lt;')
+  .replace(/>/gu, '&gt;')
+  .replace(/"/gu, '&quot;')
+  .replace(/'/gu, '&apos;')
+
+/**
+ * Measured on the live readaloud endpoint: two <prosody> elements in one request
+ * synthesize, three close the socket before turn.end. Every request this module
+ * builds therefore carries at most two, and a unit with more marked regions is
+ * spoken as consecutive chunks. Nesting is refused as well, so a marked chunk is
+ * sent without the template wrapper and every element holds FULL values.
+ */
+export const MAX_SPANS_PER_REQUEST = 2
+
+/** One request's worth of marked text; the plain text is kept for the fallback. */
+export interface SsmlChunk {
+  text: string
+  ssml: string
+}
+
+/**
+ * Split one marked unit into per-request chunks of at most two prosody elements.
+ * Returns undefined when nothing usable was marked, so the plain path (and its
+ * byte-identical requests) stays untouched.
+ */
+export function expressionSsmlChunks(unit: VoiceUnit, base: ProsodyBase): SsmlChunk[] | undefined {
+  const spans = resolveMarks(unit)
+  if (spans === undefined) return undefined
+  const step = effectiveProsody(unit, base)
+  const solved = spans.map((span) => ({
+    text: span.text,
+    rate: clampNumber(step.rate + span.rate, -RATE_LIMIT, RATE_LIMIT),
+    pitch: clampNumber(step.pitch + span.pitch, -PITCH_LIMIT, PITCH_LIMIT),
+    volume: clampNumber(step.volume + span.volume, -VOLUME_LIMIT, VOLUME_LIMIT),
+  }))
+  const chunks: SsmlChunk[] = []
+  for (let index = 0; index < solved.length; index += MAX_SPANS_PER_REQUEST) {
+    const group = solved.slice(index, index + MAX_SPANS_PER_REQUEST)
+    chunks.push({
+      text: group.map((span) => span.text).join(''),
+      ssml: group.map((span) => '<prosody rate="' + signedPercent(span.rate)
+        + '" pitch="' + signedPercent(span.pitch) + '" volume="' + signedPercent(span.volume)
+        + '">' + escapeXml(span.text) + '</prosody>').join(''),
+    })
+  }
+  return chunks
+}
+
 /** Silence a pause unit asks for. */
 export function pauseMsFor(pause: PauseToken): number {
   return PAUSE_MS[pause] ?? 0
@@ -275,7 +448,8 @@ export function pauseMsFor(pause: PauseToken): number {
  */
 export function splitStress(unit: VoiceUnit): VoiceUnit[] {
   const text = typeof unit.say === 'string' ? unit.say : ''
-  if (text === '' || unit.pause !== undefined) return [unit]
+  // Marks are character positions; splitting the text would move them.
+  if (text === '' || unit.pause !== undefined || (unit.mark?.length ?? 0) > 0) return [unit]
   const words = (unit.stress ?? []).filter((word) => word !== '' && text.includes(word))
   if (words.length === 0) return [unit]
   const word = words[0]!
