@@ -9,7 +9,9 @@ import { DEFAULT_SPEECH_PROFILE, normalizeSpeechProfile } from '../lib/speech-pr
 const owner = { lane: 'owner', canonical: '我' }
 
 test('early start is off unless the model declares it', () => {
-  assert.equal(DEFAULT_SPEECH_PROFILE.earlyStart, 'off')
+  // The master switch is on by default: the turnTaking declaration decides when
+  // it may be used, so the switch itself must not silently block 'immediate'.
+  assert.equal(DEFAULT_SPEECH_PROFILE.earlyStart, 'partial')
   assert.equal(earlyStartEnabled(null), false)
   assert.equal(earlyStartEnabled({}), false)
   assert.equal(earlyStartEnabled({ earlyStart: 'off' }), false)

@@ -44,7 +44,7 @@ import {
 import { inputGateTraceFields, type InputGateDecision } from './input-gate.ts'
 import { decideChunks, decidePlan } from './plan.ts'
 import { createEarlyStart, earlyStartEnabled, type EarlyStart } from './early-start.ts'
-import { dedupePartial, partialFeedEnabled, partialIntervalFor, shouldFirePartial } from './partial-asr.ts'
+import { dedupePartial, partialIntervalFor, planFromPartial, shouldFirePartial } from './partial-asr.ts'
 import { chunkRawSegments } from './chunker.ts'
 import { createRecordStream } from './record-stream.ts'
 import { createPlaybackRecorder } from './playback-record.ts'
@@ -319,7 +319,11 @@ function apiUrl(path: string): string {
  * subagent results are spoken only for sessions that report active.
  */
 function reportVoiceState(sessionId: string, active: boolean, unloading = false): void {
-  const body = JSON.stringify({ sessionId, active, clientId: CLIENT_ID })
+  // The wait is a read-only fact for the host: only it decides whether a
+  // turn-taking declaration is relevant at all (0 ms is fixed, not declared).
+  let waitMs: number | undefined
+  try { waitMs = getPreferences().pauseMs } catch { waitMs = undefined }
+  const body = JSON.stringify({ sessionId, active, clientId: CLIENT_ID, ...(waitMs === undefined ? {} : { waitMs }) })
   try {
     if (unloading && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
       navigator.sendBeacon(apiUrl('/voice-state'), new Blob([body], { type: 'application/json' }))
@@ -2047,11 +2051,28 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           text: piece.text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, ''),
         }))
         : [{ text: spoken, at: arrivedAt, lane, canonical }]
-      // Early start is the only path that plans BEFORE the utterance closes, and
-      // it runs only when the model declared it: a declaration-free session is
-      // byte-identical to before. Provisional items reach the fast lane only;
-      // the slow queue is untouched until the corpus closes.
-      const earlyStartOn = earlyStartEnabled(sharedPlayer.declaredSpeechSettings())
+      // Early start is the only path that plans BEFORE the utterance closes.
+      // Whether it may run is the model's declaration (turnTaking), not a
+      // constant in this file: 400 ms is only the fallback when it says nothing.
+      // Provisional items reach the fast lane only; the slow queue is untouched
+      // until the corpus closes.
+      const declaredTurn = sharedPlayer.declaredSpeechSettings()
+      const turnWait = typeof declaredTurn.micSilenceMs === 'number'
+        ? declaredTurn.micSilenceMs : getPreferences().pauseMs
+      // The declaration is data. Absent, the historical behaviour runs; nothing
+      // here derives a meaning from the wait value.
+      const turnMode = declaredTurn.turnTaking === 'listen' || declaredTurn.turnTaking === 'immediate'
+        ? declaredTurn.turnTaking : 'auto'
+      const earlyStartOn = earlyStartEnabled(declaredTurn) && planFromPartial(turnMode, turnWait)
+      // Mechanical execution of the declaration: listen means the record is
+      // written and no reply plan is made. The code does not ask why.
+      if (turnMode === 'listen') {
+        noteUtteranceText(trace, spoken)
+        release()
+        markUtteranceStage(trace, 'enqueue')
+        finish({ organizerAction: 'turn-listen' })
+        return
+      }
       if (earlyStartOn && rawSegments.length > 1) {
         earlyRef.current = earlyRef.current ?? createEarlyStart({
           speak: (line) => { const entry = enqueue(line, -1); entry.setMode('steer') },
@@ -2885,10 +2906,13 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
               text: fresh, lane, final: false,
               startedAt: Math.max(0, info.at - info.speechMs), endedAt: info.at,
             })
-            // A long wait keeps the partial out of the plan: the sentence is
-            // probably still being spoken, so half of it is not a plan yet.
-            if (!partialFeedEnabled(micSilenceMs)) return
-            if (!earlyStartEnabled(sharedPlayer.declaredSpeechSettings())) return
+            // Declaration first: listen never plans, immediate always may, and
+            // auto falls back to the wait boundary (400 ms) when nothing is said.
+            const declaredNow = sharedPlayer.declaredSpeechSettings()
+            const modeNow = declaredNow.turnTaking === 'listen' || declaredNow.turnTaking === 'immediate'
+              ? declaredNow.turnTaking : 'auto'
+            if (!earlyStartEnabled(declaredNow)) return
+            if (!planFromPartial(modeNow, micSilenceMs)) return
             earlyRef.current?.partial([fresh], {
               lane, canonical: lane, playing: sharedPlayer.busy(), queued: scheduler.status().queued,
             })

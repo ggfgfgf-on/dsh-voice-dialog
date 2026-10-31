@@ -366,7 +366,8 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             warmOpen: { type: 'boolean', description: 'true opens the reply by picking the listener half sentence up ("对,你刚说那个") before new content. Use it right after you were interrupted, not for a fresh question.' },
             firstBlockChars: { type: 'number', minimum: 4, maximum: 12, description: 'How few characters the FIRST block may speak on (default 8). Lower starts the voice sooner; 5 is a good value when your reply opens with a long clause.' },
             firstBlockDeadlineMs: { type: 'number', minimum: 0, maximum: 2000, description: 'If the opening words are still unpunctuated after this long, speak what has arrived, e.g. 700. 0 is off. Use 700-900 when your first sentence tends to be long.' },
-            earlyStart: { type: 'string', enum: ['off', 'partial'], description: 'off (default) plans only after the listener stops. partial lets unfinished speech produce a provisional plan that can be withdrawn when the sentence closes, so a short reaction may start before the listener is done. Anything already spoken is never taken back.' },
+            earlyStart: { type: 'string', enum: ['off', 'partial'], description: 'Master switch for planning from unfinished speech. partial (default) lets the turnTaking rule use partial text; off never plans before the utterance closes. Anything already spoken is never taken back.' },
+            turnTaking: { type: 'string', enum: ['listen', 'auto', 'immediate'], description: 'When you take the turn; this is an interface, the default is only a mechanical fallback. listen records and does not reply, so you may simply listen. auto (default) decides from the real wait: partial text joins the plan only within 400 ms, a longer wait records it without planning on it. immediate replies as soon as the utterance closes and plans from partials whatever the wait is. Recording of what the listener says never stops. The status fields in action capabilities (waitMs, userSpeaking, lastUtteranceClosed, interrupting) are always reported as they are; the declaration is only what to do with them.' },
           },
         },
         sequence: {
@@ -483,6 +484,34 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             styles: STYLE_TOKENS.map((value) => ({ value, meaning: STYLES[value].meaning })),
           },
           base: queue.prosodyBase(),
+          // Raw floor facts. Nothing here is interpreted for the model: it is
+          // what the code observes, and the declaration says what to do with it.
+          turn: (() => {
+            let live: string | undefined
+            let at = -Infinity
+            for (const [id, seen] of activeVoice) {
+              if (!voiceSessionLive(id)) continue
+              if (seen > at) { at = seen; live = id }
+            }
+            if (live === undefined) {
+              return {
+                waitMs: null, mode: 'unknown', immediate: false,
+                userSpeaking: false, lastUtteranceClosed: false,
+                meaning: '当前没有语音会话。',
+              }
+            }
+            const waitMs = turnWait.get(live)
+            const state = speechState.get(live)
+            return {
+              waitMs: waitMs ?? null,
+              speaker: state?.speaker ?? null,
+              userSpeaking: state?.speaking ?? false,
+              lastUtteranceClosed: (state?.lastEnd ?? 0) > 0,
+              interrupting: (state?.speaking ?? false) && (mouthState.get(live)?.playing ?? false),
+              declared: declaredSpeechProfile.turnTaking ?? null,
+              meaning: '原样状态，不做解释：怎么对待它们由声明决定。',
+            }
+          })(),
         })
       }
       if (action === 'express') {
@@ -677,6 +706,8 @@ const SAME_SPEAKER_SIMILARITY = 0.62
   // Who is talking right now. The client reports every start and every stop, so
   // the model senses the floor instead of being told about it by a judge.
   const speechState = new Map<string, { speaking: boolean; since: number; lastEnd: number; speaker?: string }>()
+/** The browser's own wait, reported with the heartbeat; a read-only fact for the model. */
+const turnWait = new Map<string, number>()
   /** Whether the assistant's own voice is coming out of the speaker. */
   const mouthState = new Map<string, { playing: boolean; at: number }>()
   const speakDirect = (sessionId: string, text: string, source: string): void => {
@@ -871,6 +902,9 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         writeJson(res, 200, { ok: true })
         return
       }
+      if (typeof body.waitMs === 'number' && Number.isFinite(body.waitMs)) {
+        turnWait.set(sessionId, Math.min(4000, Math.max(0, Math.round(body.waitMs))))
+      }
       if (body.active === true) {
         activeVoice.set(sessionId, Date.now())
         // The most recent heartbeat owns playback until it stops or expires.
@@ -884,6 +918,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         if (owner === undefined || clientId === '' || owner.clientId === clientId) {
           activeVoice.delete(sessionId)
           organizerHistories.delete(sessionId)
+          turnWait.delete(sessionId)
         }
       }
       writeJson(res, 200, { ok: true })

@@ -2,9 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   PARTIAL_ASR_DEFAULT_MS, PARTIAL_FEED_MAX_WAIT_MS, PARTIAL_MIN_SPEECH_MS, PARTIAL_WINDOW_MS,
-  clampPartialMs, dedupePartial, partialFeedEnabled, partialIntervalFor, shouldFirePartial,
-  trimPartialWindow,
+  clampPartialMs, dedupePartial, partialFeedEnabled, partialIntervalFor, planFromPartial,
+  shouldFirePartial, trimPartialWindow,
 } from '../lib/partial-asr.js'
+import { DEFAULT_SPEECH_PROFILE, normalizeSpeechProfile } from '../lib/speech-profile.js'
 import { DEFAULT_PREFERENCES, PARTIAL_ASR_MAX_MS, clampPartialAsr, clampPause } from '../lib/preferences.js'
 import { createRecordStream } from '../lib/record-stream.js'
 import { sanitizeLatencyRecord } from '../lib/latency.js'
@@ -83,6 +84,19 @@ test('partial asr: the wait decides only how the text is used', () => {
   assert.equal(partialFeedEnabled(900), false)
   assert.equal(partialFeedEnabled(-1), false)
   assert.equal(partialFeedEnabled(Number.NaN), false)
+})
+
+test('turnTaking: the declaration is executed, and absence keeps the old rule', () => {
+  assert.equal(DEFAULT_SPEECH_PROFILE.turnTaking, 'auto')
+  assert.deepEqual(normalizeSpeechProfile({ turnTaking: 'listen' }), { turnTaking: 'listen' })
+  assert.deepEqual(normalizeSpeechProfile({ turnTaking: 'immediate' }), { turnTaking: 'immediate' })
+  assert.deepEqual(normalizeSpeechProfile({ turnTaking: 'shout' }), {})
+  // Mechanical: listen never plans, immediate always may, absent follows the wait.
+  assert.equal(planFromPartial('listen', 0), false)
+  assert.equal(planFromPartial('immediate', 900), true)
+  assert.equal(planFromPartial('auto', 400), true)
+  assert.equal(planFromPartial('auto', 401), false)
+  assert.equal(planFromPartial(undefined, 900), false, 'no declaration: the historical boundary')
 })
 
 test('partial asr: a long wait still records the partial, it just does not plan on it', () => {

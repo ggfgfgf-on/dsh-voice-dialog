@@ -9,6 +9,8 @@ export type InterruptionMode = 'sentence' | 'immediate' | 'never'
 
 /** Whether unfinished speech may drive a provisional plan. Off by default. */
 export type EarlyStartMode = 'off' | 'partial'
+/** Who takes the turn, and on what evidence. Absent means the mechanical 'auto'. */
+export type TurnTakingMode = 'listen' | 'auto' | 'immediate'
 
 export interface SpeechProfile {
   /** How the assistant's own speech may be interrupted by the listener. */
@@ -46,11 +48,19 @@ export interface SpeechProfile {
   /** Release the first block this long after the first token even without punctuation; 0 off. */
   firstBlockDeadlineMs?: number
   /**
-   * 'off' (default) waits for the utterance to close before planning anything.
-   * 'partial' lets unfinished speech produce a PROVISIONAL plan that may be
-   * withdrawn when the corpus closes; anything already spoken stays spoken.
+   * Master switch for planning from unfinished speech. 'partial' (default) lets
+   * the turnTaking rule below use partial text; 'off' never plans before the
+   * utterance closes. Anything already spoken stays spoken either way.
    */
   earlyStart?: EarlyStartMode
+  /**
+   * When to take the turn. This is the interface, not a policy: the code only
+   * supplies a mechanical default when it is absent.
+   *   listen    - record only, do not reply and do not take the floor
+   *   auto      - decide from the real wait; 400 ms is the mechanical fallback
+   *   immediate - reply the moment the utterance closes, planning from partials
+   */
+  turnTaking?: TurnTakingMode
 }
 
 /** Pace modes. Natural is the default: variance, not a fixed interval. */
@@ -79,7 +89,8 @@ export const DEFAULT_SPEECH_PROFILE: Required<SpeechProfile> = {
   warmOpen: false,
   firstBlockChars: 8,
   firstBlockDeadlineMs: 0,
-  earlyStart: 'off',
+  earlyStart: 'partial',
+  turnTaking: 'auto',
 }
 
 const INTERRUPTION_MODES: readonly string[] = ['sentence', 'immediate', 'never']
@@ -100,6 +111,7 @@ const NUMERIC_RANGES: ReadonlyArray<readonly [keyof SpeechProfile, number, numbe
 ]
 
 const RHYTHM_MODES: readonly string[] = ['natural', 'off']
+const TURN_TAKING_MODES: readonly string[] = ['listen', 'auto', 'immediate']
 const EARLY_START_MODES: readonly string[] = ['off', 'partial']
 
 function clampInteger(value: unknown, low: number, high: number): number | undefined {
@@ -131,6 +143,10 @@ export function normalizeSpeechProfile(input: unknown): SpeechProfile {
   const earlyStart = record.earlyStart
   if (typeof earlyStart === 'string' && EARLY_START_MODES.includes(earlyStart)) {
     profile.earlyStart = earlyStart as EarlyStartMode
+  }
+  const turnTaking = record.turnTaking
+  if (typeof turnTaking === 'string' && TURN_TAKING_MODES.includes(turnTaking)) {
+    profile.turnTaking = turnTaking as TurnTakingMode
   }
   if (typeof record.warmOpen === 'boolean') profile.warmOpen = record.warmOpen
   for (const [key, low, high] of NUMERIC_RANGES) {

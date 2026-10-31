@@ -16,13 +16,19 @@
  *                     sentence is probably not finished yet)
  */
 
+import type { TurnTakingMode } from './speech-profile.js'
+
 /** Ceiling for the audio one partial call may carry, so a long utterance stays bounded. */
 export const PARTIAL_WINDOW_MS = 10_000
 /** A partial call on less speech than this cannot say anything useful. */
 export const PARTIAL_MIN_SPEECH_MS = 300
 /** Default spacing between partial recognitions while someone is speaking. */
 export const PARTIAL_ASR_DEFAULT_MS = 400
-/** At or below this wait, partial text may join the plan; above it, it is recorded only. */
+/**
+ * The AUTO boundary: at or below this wait a partial may join the plan, above it
+ * it is recorded only. A mechanical fallback, not a policy - the turnTaking
+ * declaration always overrides it.
+ */
 export const PARTIAL_FEED_MAX_WAIT_MS = 400
 
 /** Intervals derived from a setting are bounded the same way. */
@@ -49,6 +55,17 @@ export function partialIntervalFor(storedMs: number = PARTIAL_ASR_DEFAULT_MS): n
 export function partialFeedEnabled(waitMs: number): boolean {
   const wait = Number(waitMs)
   return Number.isFinite(wait) && wait >= 0 && wait <= PARTIAL_FEED_MAX_WAIT_MS
+}
+
+/**
+ * Whether partial text may shape a reply plan, given the model's turn-taking
+ * declaration. Absent (or unrecognised) a declaration, 'auto' is the mechanical
+ * default; the wait alone then decides, exactly as before this option existed.
+ */
+export function planFromPartial(mode: TurnTakingMode | undefined, waitMs: number): boolean {
+  if (mode === 'listen') return false
+  if (mode === 'immediate') return true
+  return partialFeedEnabled(waitMs)
 }
 
 export interface PartialGateInput {
