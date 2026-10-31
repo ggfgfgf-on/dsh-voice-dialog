@@ -58,6 +58,7 @@ const TEST_SURFACES = [
   'segmenter',
   'separation',
   'separation-align',
+  'stream-profile',
   'separation-gate',
   'separation-worker',
   'speaker',

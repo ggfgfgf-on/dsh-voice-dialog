@@ -26,6 +26,7 @@ import {
   STYLE_TOKENS, VOCABULARY, type VoiceUnit,
 } from './expression.ts'
 import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
+import { declaredAck, firstBlockShape, innerPauseFor, warmOpenDeclared } from './stream-profile.ts'
 import { planAck, type PlanItem } from './plan.ts'
 import { PLAN_LOG_ROUTES } from './plan-log.ts'
 import { RECORD_LOG_ROUTES } from './record-log.ts'
@@ -57,6 +58,8 @@ export const inject = ['webServer', 'tools', 'systemPrompt', 'llm']
 /** Fixed bootstrap path so the client can discover a custom basePath. */
 const BOOTSTRAP_BASE = '/dsh-voice-dialog-api'
 const SETTINGS_FILE = join(homedir(), '.dsh', 'voice-dialog', 'settings.json')
+/** A signal that is never aborted: auxiliary calls that nothing cancels still need one. */
+const NO_CANCEL_SIGNAL = new AbortController().signal
 
 /** Staged-rewriter model call, provided by apply() so the tap stays ctx-free. */
 let rewriteModel: ((sessionId: string, prompt: string, signal: AbortSignal) => Promise<string>) | undefined
@@ -837,7 +840,7 @@ const turnWait = new Map<string, number>()
     }, (assistantText) => {
       const clean = sanitizeForSpeech(assistantText)
       if (clean) organizerHistoryFor(sessionId).add('assistant', clean)
-    })
+    }, () => declaredSpeechProfile)
   })
 
   ctx.effect(() =>
@@ -878,7 +881,7 @@ const turnWait = new Map<string, number>()
   // The browser owns microphone lifetime; the host only needs to know which
   // parent sessions are currently allowed to speak background results. A
   // short client heartbeat refreshes the entry so a crashed tab expires.
-  const voiceStateHandler = async (req: unknown, res: ServerResponse): Promise<void> => {
+  const voiceStateHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     try {
       const body = await readJson(req)
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
@@ -935,7 +938,7 @@ const turnWait = new Map<string, number>()
   // The page owns playback, so an interrupt must also tell the host to stop
   // synthesizing sentences nobody will hear. A reply id narrows the cancel to
   // the reply being cut; omitting it is the explicit "stop speaking" path.
-  const ttsCancelHandler = async (req: unknown, res: ServerResponse): Promise<void> => {
+  const ttsCancelHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     try {
       const body = await readJson(req)
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
@@ -959,7 +962,7 @@ const turnWait = new Map<string, number>()
     )
   }
 
-  const ttsStateHandler = async (req: unknown, res: ServerResponse): Promise<void> => {
+  const ttsStateHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     try {
       const body = await readJson(req)
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
@@ -1366,7 +1369,7 @@ const turnWait = new Map<string, number>()
           signal: controller.signal,
           sessionId: sessionId as GenerateOptions['sessionId'],
           purpose: 'voice-organizer',
-        } as GenerateOptions)
+        } as unknown as GenerateOptions)
         for await (const chunk of stream) {
           if (chunk.type === 'text-delta') raw += chunk.text
           else if (chunk.type === 'reasoning-delta') reasoning += (chunk as { text?: string }).text ?? ''
@@ -1430,7 +1433,7 @@ const turnWait = new Map<string, number>()
         signal,
         sessionId,
         purpose: 'voice-organizer',
-      } as GenerateOptions)) {
+      } as unknown as GenerateOptions)) {
         if (chunk.type === 'text-delta') text += chunk.text
       }
     } catch {
@@ -1459,7 +1462,7 @@ const turnWait = new Map<string, number>()
         signal,
         sessionId,
         purpose: 'voice-organizer',
-      } as GenerateOptions)) {
+      } as unknown as GenerateOptions)) {
         if (chunk.type === 'text-delta') text += chunk.text
       }
     } catch {
@@ -1489,7 +1492,7 @@ const turnWait = new Map<string, number>()
         signal,
         sessionId,
         purpose: 'voice-organizer',
-      } as GenerateOptions)) {
+      } as unknown as GenerateOptions)) {
         if (chunk.type === 'text-delta') text += chunk.text
       }
     } catch {
@@ -1517,7 +1520,7 @@ const turnWait = new Map<string, number>()
         signal,
         sessionId,
         purpose: 'voice-organizer',
-      } as GenerateOptions)) {
+      } as unknown as GenerateOptions)) {
         if (chunk.type === 'text-delta') text += chunk.text
       }
     } catch {
@@ -1766,6 +1769,9 @@ async function* tapStream(
   queue: TtsQueue,
   control: (command: VoiceControl) => void,
   recordAssistant: (text: string) => void,
+  // The declaration is a local of apply(); the pipeline runs above it, so it
+  // gets a reader and always reads the current value, never a snapshot.
+  getProfile: () => SpeechProfile,
 ): AsyncIterable<StreamChunk> {
   // One monotonically increasing round per assistant reply; frames carry it
   // so the client can tell a late old-reply frame from a fresh one.
@@ -1777,10 +1783,9 @@ async function* tapStream(
   // The first block may speak earlier than the historical 8 characters, and a
   // deadline may release it before punctuation arrives. Both are declarations;
   // with none the segmenter behaves exactly as before.
-  const firstBlockChars = typeof declaredSpeechProfile.firstBlockChars === 'number'
-    ? declaredSpeechProfile.firstBlockChars : 8
-  const segmenter = new SentenceSegmenter({ firstClauseChars: firstBlockChars })
-  const firstBlockDeadlineMs = declaredSpeechProfile.firstBlockDeadlineMs ?? 0
+  const firstBlock = firstBlockShape(getProfile)
+  const segmenter = new SentenceSegmenter({ firstClauseChars: firstBlock.chars })
+  const firstBlockDeadlineMs = firstBlock.deadlineMs
   let firstBlockSpoken = false
   let firstBlockTimer: ReturnType<typeof setTimeout> | null = null
   const clearFirstBlockTimer = (): void => {
@@ -1811,7 +1816,7 @@ async function* tapStream(
     const text = typeof item.text === 'string' ? item.text : ''
     if (text.length === 0) return
     hostRecord.append('reply', { text, reason: item.reason, priority: item.priority ?? 0 })
-    const innerPauseMs = declaredSpeechProfile.innerPauseMs ?? 0
+    const innerPauseMs = innerPauseFor(getProfile)
     const seam = split && innerPauseMs > 0
       ? splitInnerPause(text, { innerMs: innerPauseMs })
       : undefined
@@ -1904,7 +1909,7 @@ async function* tapStream(
       if (attentionModel && blocks.length > 1) {
         try {
           const raw = await attentionModel(
-            sessionId, buildAttentionPrompt(blocks, publishedLines, question), undefined)
+            sessionId, buildAttentionPrompt(blocks, publishedLines, question), NO_CANCEL_SIGNAL)
           const map = parseAttentionMap(raw, blocks.length)
           if (map) plan = attentionForSpeech(map, blocks)
         } catch { /* the composer speaks without a plan */ }
@@ -1912,7 +1917,7 @@ async function* tapStream(
       if (settled) return
       const answer = await model(
         sessionId, buildSpeakerPrompt(text, publishedLines, question, plan,
-          { warmOpen: declaredSpeechProfile.warmOpen === true }), undefined)
+          { warmOpen: warmOpenDeclared(getProfile) }), NO_CANCEL_SIGNAL)
       finish(parseSpeakerLines(answer))
     })().catch(() => { finish([]) })
   }
@@ -1966,10 +1971,8 @@ async function* tapStream(
     // at most once, before the answer takes the floor.
     // The acknowledgement is a plan item (L3): planAck carries the model's own
     // wording, and the fast lane (L4) decides only how to put it out.
-    const ackItem = planAck(
-      String(declaredSpeechProfile.backchannel ?? ''),
-      typeof declaredSpeechProfile.backchannelAfterMs === 'number' ? declaredSpeechProfile.backchannelAfterMs : 0,
-    )
+    const ack = declaredAck(getProfile)
+    const ackItem = planAck(ack.text, ack.afterMs)
     if (ackItem) {
       hostRecord.append('plan', {
         kind: ackItem.kind, lane: ackItem.lane, reason: ackItem.reason,

@@ -45,6 +45,53 @@ test('record log: the batch can supply the session id', () => {
   assert.equal(sanitizeRecordEvent({ kind: 'plan', sessionId: 'own' }, 'session-9').sessionId, 'own')
 })
 
+test('record log: a voiceprint keeps its confidence and enrolment flags', () => {
+  const item = sanitizeRecordEvent({
+    kind: 'voiceprint', lane: 'owner', canonical: '我', speaker: '我',
+    confidence: 0.873, owner: true, enrolled: true,
+    audio: 'AAAA', embedding: [0.1, 0.2],
+  })
+  assert.equal(item.confidence, 0.873)
+  assert.equal(item.owner, true)
+  assert.equal(item.enrolled, true)
+  assert.equal(item.speaker, '我')
+  assert.equal('audio' in item, false)
+  assert.equal('embedding' in item, false)
+  // Out of range is clamped, wrong types are dropped rather than coerced.
+  assert.equal(sanitizeRecordEvent({ kind: 'voiceprint', confidence: 3 }).confidence, 1)
+  assert.equal(sanitizeRecordEvent({ kind: 'voiceprint', confidence: -2 }).confidence, 0)
+  assert.equal('confidence' in sanitizeRecordEvent({ kind: 'voiceprint', confidence: 'high' }), false)
+  assert.equal('owner' in sanitizeRecordEvent({ kind: 'voiceprint', owner: 'yes' }), false)
+})
+
+test('record log: a separation outcome carries every source lane', () => {
+  const item = sanitizeRecordEvent({
+    kind: 'source', lane: 'owner', canonical: '我', separated: true, sources: 2,
+    mode: 'full', elapsedMs: 412,
+    lanes: [{ lane: 'owner', similarity: 0.71 }, { lane: 'guest', similarity: 0.32 }],
+    audio: 'AAAA',
+  })
+  assert.equal(item.separated, true)
+  assert.equal(item.sources, 2)
+  assert.equal(item.mode, 'full')
+  assert.equal(item.elapsedMs, 412)
+  assert.deepEqual(item.lanes, [
+    { lane: 'owner', similarity: 0.71 }, { lane: 'guest', similarity: 0.32 },
+  ])
+  assert.equal('audio' in item, false)
+  // The list is bounded, and a forged lane name is not a lane.
+  assert.equal(sanitizeRecordEvent({
+    kind: 'source', lanes: [{ lane: 'a' }, { lane: 'b' }, { lane: 'c' }, { lane: 'd' }, { lane: 'e' }],
+  }).lanes.length, 4)
+  assert.equal('lanes' in sanitizeRecordEvent({ kind: 'source', lanes: [{ similarity: 0.5 }] }), false)
+  assert.equal(sanitizeRecordEvent({ kind: 'source', sources: 99 }).sources, 16)
+})
+
+test('record log: an event without the new detail stays exactly as before', () => {
+  const plain = sanitizeRecordEvent({ kind: 'transcript', lane: 'owner', text: '一句' })
+  assert.deepEqual(Object.keys(plain), ['sessionId', 'seq', 'at', 'kind', 'lane', 'canonical', 'text', 'reason'])
+})
+
 test('record log: a throwing sink never reaches the caller', () => {
   const flushed = []
   const stream = createRecordStream({

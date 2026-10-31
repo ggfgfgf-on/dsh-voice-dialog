@@ -24,6 +24,7 @@ export type RecordLogKind =
   | 'transcript'
   | 'partial'
   | 'voiceprint'
+  | 'source'
   | 'barge-in'
   | 'playback'
   | 'reply'
@@ -31,8 +32,14 @@ export type RecordLogKind =
   | 'custom'
 
 const KINDS: readonly string[] = [
-  'transcript', 'partial', 'voiceprint', 'barge-in', 'playback', 'reply', 'plan', 'custom',
+  'transcript', 'partial', 'voiceprint', 'source', 'barge-in', 'playback', 'reply', 'plan', 'custom',
 ]
+
+/** One separated source: which lane it sounded like, and how strongly. */
+export interface RecordSourceLane {
+  lane: string
+  similarity?: number
+}
 const LANES: readonly string[] = ['owner', 'guest', 'fast', 'slow', '']
 
 export interface RecordLogItem {
@@ -44,6 +51,17 @@ export interface RecordLogItem {
   canonical: string
   text: string
   reason: string
+  /** Voiceprint detail, kept only when the event carries it. */
+  confidence?: number
+  owner?: boolean
+  enrolled?: boolean
+  speaker?: string
+  /** Separation detail: what the split decided, not what it was asked to do. */
+  separated?: boolean
+  sources?: number
+  mode?: string
+  elapsedMs?: number
+  lanes?: RecordSourceLane[]
 }
 
 const shortString = (value: unknown, limit: number): string =>
@@ -52,9 +70,33 @@ const shortString = (value: unknown, limit: number): string =>
 const finiteInt = (value: unknown, fallback = 0): number =>
   typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback
 
+const clamp01 = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : undefined
+
+const optionalBool = (value: unknown): boolean | undefined =>
+  typeof value === 'boolean' ? value : undefined
+
+/** Up to four source lanes; a split that claims more is not a two-speaker split. */
+function sanitizeLanes(value: unknown): RecordSourceLane[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const lanes: RecordSourceLane[] = []
+  for (const entry of value.slice(0, 4)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const record = entry as Record<string, unknown>
+    const lane = shortString(record.lane, RECORD_LABEL_LIMIT)
+    if (!lane) continue
+    const similarity = clamp01(record.similarity)
+    lanes.push(similarity === undefined ? { lane } : { lane, similarity })
+  }
+  return lanes.length > 0 ? lanes : undefined
+}
+
 /**
  * Keep only the agreed fields; anything else is dropped unread. Audio, raw
  * samples, model prompts and unfiltered transcript are never fields here.
+ *
+ * The voiceprint and separation detail is optional: an event that never carried
+ * it stays byte-identical to the old line, so old logs and new logs read alike.
  */
 export function sanitizeRecordEvent(raw: unknown, sessionId = ''): RecordLogItem | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -62,7 +104,7 @@ export function sanitizeRecordEvent(raw: unknown, sessionId = ''): RecordLogItem
   const kind = typeof record.kind === 'string' && KINDS.includes(record.kind) ? record.kind : ''
   if (!kind) return null
   const lane = typeof record.lane === 'string' && LANES.includes(record.lane) ? record.lane : ''
-  return {
+  const item: RecordLogItem = {
     sessionId: shortString(record.sessionId, 64) || shortString(sessionId, 64),
     seq: Math.max(0, finiteInt(record.seq)),
     at: finiteInt(record.at, Date.now()),
@@ -72,6 +114,25 @@ export function sanitizeRecordEvent(raw: unknown, sessionId = ''): RecordLogItem
     text: shortString(record.text, RECORD_TEXT_LIMIT),
     reason: shortString(record.reason, 40),
   }
+  const confidence = clamp01(record.confidence)
+  if (confidence !== undefined) item.confidence = confidence
+  const owner = optionalBool(record.owner)
+  if (owner !== undefined) item.owner = owner
+  const enrolled = optionalBool(record.enrolled)
+  if (enrolled !== undefined) item.enrolled = enrolled
+  const speaker = shortString(record.speaker, RECORD_LABEL_LIMIT)
+  if (speaker) item.speaker = speaker
+  const separated = optionalBool(record.separated)
+  if (separated !== undefined) item.separated = separated
+  const sources = finiteInt(record.sources, -1)
+  if (sources >= 0) item.sources = Math.min(16, sources)
+  const mode = shortString(record.mode, 16)
+  if (mode) item.mode = mode
+  const elapsedMs = finiteInt(record.elapsedMs, -1)
+  if (elapsedMs >= 0) item.elapsedMs = Math.min(600_000, elapsedMs)
+  const lanes = sanitizeLanes(record.lanes)
+  if (lanes) item.lanes = lanes
+  return item
 }
 
 /** Append one record event. A lost line must never break a delivery. */

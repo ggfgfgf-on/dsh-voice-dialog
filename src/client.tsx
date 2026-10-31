@@ -1702,6 +1702,27 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     })
     return identity
   }
+
+  /**
+   * L1: one separation outcome is a record of its own — whether it split, how
+   * many sources came back, which lane each sounded like, how strong that was,
+   * and what it cost. Recorded for every outcome; it never gates anything.
+   */
+  const recordSeparation = (split: SeparationResult, mode: string): void => {
+    voiceRecordStream.append('source', {
+      separated: split.separated === true,
+      sources: split.sources.length,
+      mode,
+      elapsedMs: Math.max(0, Math.round(split.wallMs ?? split.elapsedMs ?? 0)),
+      lanes: split.sources.map((source) => {
+        const identity = source.identity
+        if (!identity) return { lane: 'unknown' }
+        return typeof identity.similarity === 'number'
+          ? { lane: laneForIdentity(identity), similarity: identity.similarity }
+          : { lane: laneForIdentity(identity) }
+      }),
+    })
+  }
   const identifySpeakerForLane = async (
     samples: Float32Array,
     laneHint: SpeakerLane,
@@ -2254,7 +2275,6 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         if (action.kind === 'reply' && action.lane === 'fast') {
           // A spoken stop still steers delivery, but the page does not cut:
           // the host/model sees the line and decides how to stop the mouth.
-          organizerRef.current?.cancel()
           release()
           entry = enqueue(text, -1)
           entry.setMode('steer')
@@ -2587,6 +2607,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         modelCalls: split === null ? 0 : 1,
         gateReason: base.gateReason,
       }
+      if (split) recordSeparation(split, 'fallback')
       if (split?.separated === true && split.sources.length >= 2) {
         enqueueSeparated(split, scheduler, runLimited, timing.separation)
         return
@@ -2625,6 +2646,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     if (canSeparate) {
       try {
         const split = await separateSegment(samples, sessionId, prefs.speakerThreshold, true, prefs.ownerMargin)
+        recordSeparation(split, 'full')
         if (split.separated && split.sources.length >= 2) {
           enqueueSeparated(split, scheduler, runLimited)
           return
@@ -2723,7 +2745,6 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     resolveSpeaker: (name) => speakerPolicy.resolve(sessionId, name),
     onControl: (control) => {
       if (control.action === 'interrupt') {
-        organizerRef.current?.cancel()
         sharedPlayer.control({ action: 'stop' })
         sharedPlayer.unmute()
         // With a follow-up request the scheduler sends it as a steer, which
@@ -2864,6 +2885,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           silenceMs: separationSilenceMs,
           separate: async (window) => {
             const split = await separateSegment(window, sessionId, prefs.speakerThreshold, false, prefs.ownerMargin)
+            // The continuous path runs every hop: only a real split is news.
+            if (split.separated && split.sources.length >= 2) recordSeparation(split, 'continuous')
             return {
               sources: split.sources.map((source) => ({
                 samples: decodeWaveBase64(source.audioBase64),

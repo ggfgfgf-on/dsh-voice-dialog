@@ -16,6 +16,8 @@ export type RecordKind =
   /** Speech the listener has not finished yet; recorded, never acted on by L1. */
   | 'partial'
   | 'voiceprint'
+  /** One separation outcome: whether it split, how many sources, their lanes. */
+  | 'source'
   | 'barge-in'
   | 'playback'
   | 'reply'
