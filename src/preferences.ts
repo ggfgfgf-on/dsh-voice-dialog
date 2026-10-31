@@ -42,6 +42,11 @@ export interface VoiceDialogPreferences {
   separationFastPath: boolean
   /** Let a parallel model decide whether to interrupt, queue, or ignore. */
   organizerEnabled: boolean
+  /**
+   * L2 chunk cap: cut one delivery into several raw chunks past this many
+   * characters. 0 (default) never cuts, so the listener hears today's flow.
+   */
+  chunkMaxChars: number
 }
 
 const STORAGE_KEY = 'dsh-voice-dialog.preferences'
@@ -69,6 +74,7 @@ const DEFAULTS: VoiceDialogPreferences = {
   separateSpeakers: true,
   separationFastPath: true,
   organizerEnabled: true,
+  chunkMaxChars: 0,
 }
 
 function clampPause(value: unknown, fallback: number): number {
@@ -93,6 +99,12 @@ function clampMargin(value: unknown, fallback: number): number {
 function clampBoost(value: unknown, fallback: number): number {
   const number = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(number) ? Math.min(2.5, Math.max(1, Math.round(number * 10) / 10)) : fallback
+}
+
+/** 0 = no cap; 400 is a paragraph nobody says in one breath. */
+function clampChunkMax(value: unknown, fallback: number): number {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? Math.min(400, Math.max(0, Math.round(number))) : fallback
 }
 
 function clampMicThreshold(value: unknown, fallback: number): number {
@@ -144,6 +156,7 @@ function parse(raw: string | null): VoiceDialogPreferences {
       separateSpeakers: typeof value.separateSpeakers === 'boolean' ? value.separateSpeakers : DEFAULTS.separateSpeakers,
       separationFastPath: typeof value.separationFastPath === 'boolean' ? value.separationFastPath : DEFAULTS.separationFastPath,
       organizerEnabled: typeof value.organizerEnabled === 'boolean' ? value.organizerEnabled : DEFAULTS.organizerEnabled,
+      chunkMaxChars: clampChunkMax(value.chunkMaxChars, DEFAULTS.chunkMaxChars),
     }
   } catch {
     return { ...DEFAULTS }
@@ -175,6 +188,7 @@ export function setPreferences(patch: Partial<VoiceDialogPreferences>): VoiceDia
   next.separateSpeakers = typeof next.separateSpeakers === 'boolean' ? next.separateSpeakers : DEFAULTS.separateSpeakers
   next.separationFastPath = typeof next.separationFastPath === 'boolean' ? next.separationFastPath : DEFAULTS.separationFastPath
   next.organizerEnabled = typeof next.organizerEnabled === 'boolean' ? next.organizerEnabled : DEFAULTS.organizerEnabled
+  next.chunkMaxChars = clampChunkMax(next.chunkMaxChars, DEFAULTS.chunkMaxChars)
   current = next
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)) } catch { /* private mode */ }
   for (const listener of listeners) listener(next)

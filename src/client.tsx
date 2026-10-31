@@ -10,6 +10,7 @@ import { MicrophoneLoop, recordVoiceSample, type MicPlaybackSnapshot } from './m
 import { ContinuousSeparation, dedupeTranscript, type ContinuousSegment } from './continuous-separation.ts'
 import {
   createUtteranceCoalescer, UTTERANCE_COALESCE_WINDOW_MS, type UtteranceCoalescer,
+  type UtteranceCoalescerPiece,
 } from './utterance-coalescer.ts'
 import {
   decideBoundaryHold,
@@ -34,8 +35,7 @@ import { createVolumeReporter } from './volume-report.ts'
 import { SpeechScheduler, type GuestMode } from './scheduler.ts'
 import {
   applyReorganization, ORGANIZER_PENDING_ITEM_CHARS, ORGANIZER_PENDING_LIMIT,
-  ORGANIZER_PENDING_TOTAL_CHARS, shouldDeliverOrganizerAction, SpeechOrganizer,
-  type OrganizerRequest,
+  ORGANIZER_PENDING_TOTAL_CHARS, SpeechOrganizer,
 } from './organizer.ts'
 import { parseQueueControl } from './queue-control.ts'
 import {
@@ -45,6 +45,7 @@ import { inputGateTraceFields, type InputGateDecision } from './input-gate.ts'
 import { decidePlan } from './plan.ts'
 import { chunkRawSegments } from './chunker.ts'
 import { createRecordStream } from './record-stream.ts'
+import { createPlaybackRecorder } from './playback-record.ts'
 import { resumeDelayForUtterance, YIELD_RESUME_AFTER_SPEECH_MS } from './yield.ts'
 import { echoGate, noiseGate, type SpokenSample } from './gates.ts'
 import { FrameWindow, orderOf, playBlockReason, shouldPlayFrame } from './frame-order.ts'
@@ -57,7 +58,7 @@ import {
   type SeparationLatencyDetail, type TraceInput, type UtteranceTrace, type UtteranceTiming,
 } from './latency.ts'
 import {
-  canReuseSpeculativeAsr, firstDelivery, shouldCallGate,
+  canReuseSpeculativeAsr, firstDelivery,
 } from './routing.ts'
 
 /**
@@ -71,6 +72,35 @@ const voiceRecordStream = createRecordStream({ capacity: 256 })
  * so a delivery can be replayed instead of guessed at.
  */
 const voicePlanStream = createRecordStream({ capacity: 128 })
+
+/** L1 playback events: a phase change, never the frame-by-frame heartbeat. */
+const playbackRecorder = createPlaybackRecorder(voiceRecordStream)
+
+/**
+ * Plan items are also persisted by the host (L3 stream) so a delivery can be
+ * replayed. Batched like every other side channel: a failed post never reaches
+ * the live path.
+ */
+const planPostQueue: Array<Record<string, unknown>> = []
+let planPostTimer: ReturnType<typeof setTimeout> | undefined
+
+function queuePlanPost(sessionId: string, item: Record<string, unknown>): void {
+  planPostQueue.push({ sessionId, ...item })
+  if (planPostTimer !== undefined) return
+  planPostTimer = setTimeout(() => {
+    planPostTimer = undefined
+    const items = planPostQueue.splice(0, planPostQueue.length)
+    if (items.length === 0) return
+    try {
+      void fetch(apiUrl('/plan-log'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items }),
+        keepalive: true,
+      }).catch(() => undefined)
+    } catch { /* telemetry must never break delivery */ }
+  }, 300)
+}
 
 /** Gain telemetry: batched samples to the host JSONL log; never audio or transcript. */
 const volumeReporter = createVolumeReporter({
@@ -288,6 +318,8 @@ function reportSpeech(sessionId: string, speech: 'start' | 'end' | 'speaker', sp
 
 /** Whether the assistant's own mouth is open right now. */
 function reportPlayback(sessionId: string, playing: boolean): void {
+  // L1 records the phase, not the heartbeat: one line per change.
+  playbackRecorder.note(sessionId, playing ? 'playing' : 'idle', {})
   void fetch(apiUrl('/voice-state'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -384,17 +416,6 @@ async function postLatency(record: unknown): Promise<void> {
       keepalive: true,
     })
   } catch { /* logging is best-effort */ }
-}
-
-async function organizeSpeech(request: OrganizerRequest, signal: AbortSignal): Promise<unknown> {
-  const response = await fetch(apiUrl('/organize'), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(request),
-    signal,
-  })
-  if (!response.ok) throw await errorFrom(response, '并行组织失败')
-  return await response.json()
 }
 
 /** Slow planner layer: never awaited on the reply path. */
@@ -1619,6 +1640,14 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     if (!identity || !identity.label) return identity ?? null
     identityCacheRef.current.set(laneForIdentity(identity), identity)
     lastIdentityLaneRef.current = laneForIdentity(identity)
+    // L1: a voiceprint label is a record of its own, not a field of a transcript.
+    voiceRecordStream.append('voiceprint', {
+      label: identity.label,
+      speaker: laneForIdentity(identity),
+      confidence: identity.similarity,
+      owner: identity.owner,
+      enrolled: identity.enrolled,
+    })
     return identity
   }
   const identifySpeakerForLane = async (
@@ -1890,6 +1919,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     separated = false,
     timing: UtteranceTiming = {},
     fastPath = false,
+    pieces?: Promise<readonly UtteranceCoalescerPiece[]>,
   ): void => {
     const prefs = getPreferences()
     const arrivalOrder = organizerOrderRef.current++
@@ -1923,11 +1953,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       scheduler.enqueue(lane, canonical, work, { order: arrivalOrder })
       return
     }
-    let organizer = organizerRef.current
-    if (!organizer) {
-      organizer = new SpeechOrganizer((request, signal) => organizeSpeech(request, signal), { timeoutMs: 1400 })
-      organizerRef.current = organizer
-    }
+    // L3 (plan.ts) decided the branch already; the page only executes it.
     const enqueue = (text: string, priority?: number) => {
       const entry = scheduler.enqueue(lane, canonical, Promise.resolve(text), {
         order: arrivalOrder,
@@ -1950,8 +1976,37 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       const spoken = text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, '')
       // L1 records the raw line, L2 cuts the raw corpus into chunks, L3 plans.
       voiceRecordStream.append('transcript', { text: spoken, lane, canonical: canonical || lane })
-      const rawChunks = chunkRawSegments([{ text: spoken, at: Date.now(), lane, canonical }])
-      const chunk = { text: rawChunks[0]?.text ?? spoken }
+      const arrivedAt = Date.now()
+      // Prefer the real corpus: the coalescer's deduped pieces, one per entry,
+      // so the boundary is decided on the raw sequence and not on one ASR line.
+      const rawPieces = pieces ? await pieces.catch(() => []) : []
+      const rawSegments = rawPieces.length > 0
+        ? rawPieces.map((piece) => ({
+          lane: piece.lane,
+          canonical: piece.canonical,
+          at: piece.at,
+          text: piece.text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, ''),
+        }))
+        : [{ text: spoken, at: arrivedAt, lane, canonical }]
+      const rawChunks = chunkRawSegments(rawSegments, {
+        pauseMs: UTTERANCE_COALESCE_WINDOW_MS,
+        maxChars: prefs.chunkMaxChars,
+      })
+      // One chunk is the normal case and keeps the coalescer's deduped text
+      // byte-identical. More than one means the raw corpus passed the declared
+      // cap: the head is planned, the tail is queued as its own deliveries.
+      const chunk = { text: rawChunks.length === 1 ? spoken : (rawChunks[0]?.text ?? spoken) }
+      if (rawChunks.length > 1) {
+        voiceRecordStream.append('custom', {
+          kind: 'chunk-cut', chunks: rawChunks.length, cap: prefs.chunkMaxChars,
+        })
+        for (const tail of rawChunks.slice(1)) {
+          const tailEntry = scheduler.enqueue(lane, canonical, Promise.resolve(tail.text), {
+            order: arrivalOrder,
+          })
+          tailEntry.setMode('queue')
+        }
+      }
       // Cheap gates before the 860 ms organizer request: guest noise and the
       // microphone hearing its own playback. Both are conservative and leave
       // anything a person would consider a sentence alone.
@@ -1972,7 +2027,6 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         return
       }
       const status = scheduler.status()
-      const imperative = /打断|停下|停一下|别说|闭嘴|不用念|先停|换一个|换个话题/u.test(spoken)
       const schedulePlan = (allowInterrupt: boolean): void => {
         const pending = sharedPlayer.pendingFrames()
         // Fewer than two unread blocks means there is no order to change: the
@@ -2001,7 +2055,10 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           // is discarded whole: it may only correct, never revive.
           if (!shouldApplyPlan(plan, { playing: sharedPlayer.busy(), queued: ids.length, ids })) return
           if (!planLedgerRef.current.tryClaim(plan)) return
-          if (plan.queuePlan && plan.queuePlan.length > 0) scheduler.applyQueuePlan(plan.queuePlan)
+          // The queue itself is no longer corrected here: input mode and order
+          // are decided once, in plan.ts (L3). What remains is the ASSISTANT's
+          // pending blocks — inside one answer, which L3 cannot see — so that
+          // arrangement still runs.
           if (plan.dropSentences !== undefined || plan.reorder !== undefined) {
             try { sharedPlayer.restructure(pending, plan) } catch { /* keep original order */ }
           }
@@ -2029,9 +2086,14 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           queued: status.queued,
           ...(previousOwnerLine ? { previousText: previousOwnerLine } : {}),
         })[0]
-        voicePlanStream.append('plan', {
+        const planEvent = voicePlanStream.append('plan', {
           kind: action.kind, lane: action.lane, priority: action.priority ?? 0,
           reason: action.reason, source: action.source, text: action.text ?? '',
+        })
+        queuePlanPost(sessionId, {
+          seq: planEvent.seq, at: planEvent.at, replyId: '',
+          kind: action.kind, lane: action.lane, priority: action.priority ?? 0,
+          delayMs: 0, text: action.text ?? '', reason: action.reason, source: action.source,
         })
         if (action.kind === 'ignore') {
           release()
@@ -2090,41 +2152,24 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         guestMode,
       })[0]
       const guestSteer = guestAction.kind === 'reply' && guestAction.lane === 'fast'
-      voicePlanStream.append('plan', {
+      const guestPlanEvent = voicePlanStream.append('plan', {
         kind: guestAction.kind, lane: guestAction.lane, priority: guestAction.priority ?? 0,
         reason: guestAction.reason, source: guestAction.source, text: guestAction.text ?? '',
+      })
+      queuePlanPost(sessionId, {
+        seq: guestPlanEvent.seq, at: guestPlanEvent.at, replyId: '',
+        kind: guestAction.kind, lane: guestAction.lane, priority: guestAction.priority ?? 0,
+        delayMs: 0, text: guestAction.text ?? '', reason: guestAction.reason, source: guestAction.source,
       })
       // A guest speaking pauses the owner's answer for a moment; it resumes as
       // soon as the guest is routed, because guest speech only queues.
       release()
       const entry = enqueue(text, guestSteer ? -1 : undefined)
       entry.setMode(guestSteer ? 'steer' : 'queue')
-      if (shouldCallGate({ playing: sharedPlayer.busy(), queued: status.queued }, imperative)) {
-        let current = organizerRef.current
-        if (!current) {
-          current = new SpeechOrganizer((request, signal) => organizeSpeech(request, signal), { timeoutMs: 1400 })
-          organizerRef.current = current
-        }
-        const selected = current
-        void selected.plan({
-          sessionId,
-          text: spoken,
-          lane,
-          playing: true,
-          queued: status.queued,
-          ownerWeight: 0.3,
-        }).then((plan) => {
-          if (!plan || !selected.isCurrent(plan)) return
-          if (!entry.started() && (plan.action === 'drop' || plan.action === 'ignore')) {
-            entry.drop()
-            return
-          }
-          if (guestSteer && plan.action === 'interrupt') {
-            sharedPlayer.cutNow()
-            entry.setMode('steer')
-          }
-        }).catch(() => undefined)
-      }
+      // A second, model-based classification of the guest line used to run here
+      // and could drop or promote an entry after the fact. L3 already decided
+      // mode and priority from the guest policy, so a slow round trip could only
+      // contradict the plan and add latency; it is retired.
       markUtteranceStage(trace, 'enqueue')
       finish({ organizerAction: guestSteer ? 'guest-steer-fastpath' : 'guest-queue-fastpath' })
       schedulePlan(guestSteer)
@@ -2641,6 +2686,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
             true,
             first.meta.timing,
             first.meta.fastPath,
+            batch.pieces,
           )
         },
       })

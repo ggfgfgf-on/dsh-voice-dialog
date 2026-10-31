@@ -27,6 +27,7 @@ import {
 } from './expression.ts'
 import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
 import { planAck, type PlanItem } from './plan.ts'
+import { PLAN_LOG_ROUTES } from './plan-log.ts'
 import { createRecordStream } from './record-stream.ts'
 import { RHYTHM_DEFAULTS, RHYTHM_LIMITS, splitInnerPause } from './rhythm.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
@@ -1616,7 +1617,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
     ['/latency', latencyHandler],
   ]
   for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
-    for (const [route, handler] of [...voiceprintRoutes, ...separationRoutes, ...organizerRoutes, ...VOLUME_LOG_ROUTES]) {
+    for (const [route, handler] of [...voiceprintRoutes, ...separationRoutes, ...organizerRoutes, ...VOLUME_LOG_ROUTES, ...PLAN_LOG_ROUTES]) {
       ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: prefix + route, handler }))
     }
   }

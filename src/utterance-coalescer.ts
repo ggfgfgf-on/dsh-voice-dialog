@@ -14,11 +14,26 @@ export interface UtteranceCoalescerEntry<Meta = unknown> {
   at?: number
 }
 
+/** One deduped raw piece: the corpus the chunk layer (L2) cuts, not the merged line. */
+export interface UtteranceCoalescerPiece {
+  lane: CoalescerLane
+  canonical: string
+  /** Arrival time of the entry this piece came from. */
+  at: number
+  /** Fresh (deduped) text of one entry. */
+  text: string
+}
+
 export interface UtteranceCoalescerBatch<Meta = unknown> {
   lane: CoalescerLane
   canonical: string
   /** Deduped transcript assembled in append order. */
   text: Promise<string>
+  /**
+   * The same text, unjoined: one piece per entry, in append order. Chunking on
+   * these pieces is what makes L2 cut the raw corpus instead of one ASR line.
+   */
+  pieces: Promise<readonly UtteranceCoalescerPiece[]>
   entries: ReadonlyArray<UtteranceCoalescerEntry<Meta>>
 }
 
@@ -89,6 +104,7 @@ export function createUtteranceCoalescer<Meta = unknown>(
     const key = keyOf(current.lane, current.canonical)
     const entries = current.entries.slice()
     const previousWork = dedupeChainByKey.get(key) ?? Promise.resolve()
+    const pieces: UtteranceCoalescerPiece[] = []
     const text = previousWork.then(async () => {
       let previous = lastTextByKey.get(key) ?? ''
       let combined = ''
@@ -103,7 +119,15 @@ export function createUtteranceCoalescer<Meta = unknown>(
         }
         const fresh = options.dedupeTranscript(previous, next)
         previous = next
-        if (fresh) combined += fresh
+        if (fresh) {
+          combined += fresh
+          pieces.push({
+            lane: current.lane,
+            canonical: current.canonical,
+            at: entry.at ?? current.lastAt,
+            text: fresh,
+          })
+        }
       }
       lastTextByKey.set(key, previous)
       return combined
@@ -114,6 +138,8 @@ export function createUtteranceCoalescer<Meta = unknown>(
       lane: current.lane,
       canonical: current.canonical,
       text,
+      // Same promise: resolving it releases the pieces already collected.
+      pieces: text.then(() => pieces.slice(), () => []),
       entries,
     }
   }
