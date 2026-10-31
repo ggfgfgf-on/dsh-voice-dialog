@@ -1,11 +1,5 @@
 /** Strict FIFO delivery for concurrent multi-speaker transcripts. */
 import { parseQueueControl, type QueueControl } from './queue-control.js'
-import type { QueuePlanItem } from './organizer.js'
-
-export interface QueuePlanOutcome {
-  applied: QueuePlanItem[]
-  ignored: Array<{ id: number; reason: string }>
-}
 
 export type SpeakerLane = 'owner' | 'guest'
 export type GuestMode = 'queue' | 'steer' | 'ignore'
@@ -213,45 +207,6 @@ export class SpeechScheduler {
       text: entry.text ?? '',
       ready: entry.ready,
     }))
-  }
-
-  /**
-   * Apply a planner's queue adjudication. Only entries still waiting are
-   * addressable: a started utterance can no longer be dropped here, it can only
-   * be faded out by an interrupt. Unknown/duplicate ids are ignored, never
-   * guessed, so a stale plan can only ever be a no-op.
-   */
-  applyQueuePlan(plan: readonly QueuePlanItem[]): QueuePlanOutcome {
-    const applied: QueuePlanItem[] = []
-    const ignored: Array<{ id: number; reason: string }> = []
-    const seen = new Set<number>()
-    for (const item of plan.slice(0, 16)) {
-      const id = Math.trunc(Number(item.id))
-      if (!Number.isInteger(id) || id < 0) { ignored.push({ id, reason: 'invalid-id' }); continue }
-      if (seen.has(id)) { ignored.push({ id, reason: 'duplicate' }); continue }
-      seen.add(id)
-      const entry = this.entries.find((candidate) => candidate.order === id)
-      if (!entry) { ignored.push({ id, reason: 'unknown-id' }); continue }
-      if (entry.delivered) { ignored.push({ id, reason: 'started' }); continue }
-      if (item.action === 'keep') { applied.push({ id, action: 'keep' }); continue }
-      if (item.action === 'drop') {
-        this.drop(entry)
-        applied.push({ id, action: 'drop' })
-        continue
-      }
-      if (item.action === 'raise') {
-        const priority = Number(item.priority)
-        if (!Number.isFinite(priority)) { ignored.push({ id, reason: 'invalid-priority' }); continue }
-        entry.priority = Math.max(-1, Math.min(1_000_000, Math.trunc(priority)))
-        applied.push({ id, action: 'raise', priority: entry.priority })
-        continue
-      }
-      ignored.push({ id, reason: 'invalid-action' })
-    }
-    this.orderEntries()
-    this.emit()
-    this.drain()
-    return { applied, ignored }
   }
 
   private setMode(entry: Entry, mode: PromptMode): void {

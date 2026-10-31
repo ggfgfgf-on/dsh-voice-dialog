@@ -28,6 +28,7 @@ import {
 import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
 import { planAck, type PlanItem } from './plan.ts'
 import { PLAN_LOG_ROUTES } from './plan-log.ts'
+import { RECORD_LOG_ROUTES } from './record-log.ts'
 import { createRecordStream } from './record-stream.ts'
 import { RHYTHM_DEFAULTS, RHYTHM_LIMITS, splitInnerPause } from './rhythm.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
@@ -35,13 +36,9 @@ import { decodeAudioFrames } from './audio-transport.ts'
 import { encodeWavBase64, SeparationService } from './separation.ts'
 import { parseOrganizerResponse, type OrganizerPendingBlock } from './organizer.ts'
 import {
-  buildGatePrompt, GATE_MAX_TOKENS, GATE_SYSTEM_PROMPT, GATE_TIMEOUT_MS,
-} from './gate-prompt.ts'
-import {
   buildPlannerPrompt, PLANNER_MAX_TOKENS, PLANNER_SYSTEM_PROMPT, PLANNER_TIMEOUT_MS,
 } from './planner.ts'
 import { arrangementChanged, planChunkOutputOrder } from './arrange.ts'
-import { ORGANIZER_SYSTEM_PROMPT_COMPACT, buildCompactOrganizerPrompt } from './organizer-compact.ts'
 import { sanitizeLatencyRecord } from './latency.ts'
 import { VOLUME_LOG_ROUTES } from './volume-log.ts'
 import {
@@ -1254,124 +1251,6 @@ const SAME_SPEAKER_SIMILARITY = 0.62
     } catch { /* a malformed sample is dropped, never surfaced */ }
     writeJson(res, 200, { ok: true })
   }
-  const organizerHandler = async (req: unknown, res: ServerResponse): Promise<void> => {
-    let timedOut = false
-    try {
-      const body = await readJson(req as IncomingMessage)
-      const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
-      const text = typeof body.text === 'string' ? body.text.trim().slice(0, 2000) : ''
-      const lane = body.lane === 'guest' ? 'guest' : 'owner'
-      const playing = body.playing === true
-      const queued = typeof body.queued === 'number' && Number.isFinite(body.queued)
-        ? Math.max(0, Math.round(body.queued)) : 0
-      const queue: Array<{ lane: string; text: string }> = Array.isArray(body.queue)
-        ? body.queue.slice(0, 8).flatMap((item: unknown) => {
-            if (!item || typeof item !== 'object') return []
-            const record = item as { lane?: unknown; text?: unknown }
-            if (typeof record.text !== 'string' || !record.text.trim()) return []
-            return [{ lane: record.lane === 'guest' ? 'guest' : 'owner', text: record.text.trim().slice(0, 120) }]
-          })
-        : []
-      const ownerWeight = typeof body.ownerWeight === 'number' && Number.isFinite(body.ownerWeight)
-        ? Math.max(0, Math.min(1, body.ownerWeight)) : 1
-      // Read-aloud blocks the assistant still owes. Index 0 is playing now.
-      // Bounded here as well as in the client: this is untrusted input.
-      const assistantPending: OrganizerPendingBlock[] = Array.isArray(body.assistantPending)
-        ? boundedOrganizerBlocks(body.assistantPending as unknown[])
-        : []
-      // What the listener is hearing right now. Without it the gate can only
-      // classify words; with it the model reads the intent behind them.
-      const playingText = typeof body.playingText === 'string' ? body.playingText.trim().slice(0, 200) : ''
-      const previousText = typeof body.previousText === 'string' ? body.previousText.trim().slice(0, 200) : ''
-      if (!sessionId || !text) {
-        writeJson(res, 200, { action: 'queue', reason: 'bad-input' })
-        return
-      }
-      const target = lastModelTarget.get(sessionId)
-      if (!target) {
-        writeJson(res, 200, { action: 'queue', reason: 'no-model-target' })
-        return
-      }
-      const controller = new AbortController()
-      const gateStartedAt = Date.now()
-      const timer = setTimeout(() => { timedOut = true; controller.abort() }, GATE_TIMEOUT_MS)
-      let raw = ''
-      let reasoning = ''
-      // The gate answers one question — does this line want the floor now —
-      // but it answers from meaning, so the model sees the sentence being read,
-      // what is still owed, what is waiting, and the owner's previous line.
-      const gatePrompt = buildGatePrompt({
-        text,
-        playing,
-        queued,
-        ...(playingText ? { playingText } : {}),
-        ...(previousText ? { previousText } : {}),
-        ...(queue.length > 0 ? { queue: queue.map((item) => item.text) } : {}),
-        ...(assistantPending.length > 0
-          ? { pending: assistantPending.map((block) => block.text) } : {}),
-      })
-      // GenerateOptions.purpose is a closed union in dsh-llm. The gate is
-      // another auxiliary call: adapters only forward the purpose as metadata,
-      // and shouldSpeak() filters anything with a purpose out of TTS.
-      try {
-        const llm = (ctx as unknown as {
-          llm: { stream(options: GenerateOptions): AsyncIterable<StreamChunk> }
-        }).llm
-        const stream = llm.stream({
-          provider: target.provider,
-          model: target.model,
-          system: GATE_SYSTEM_PROMPT,
-          messages: [{
-            role: 'user',
-            content: [{ type: 'text', text: gatePrompt }],
-          }],
-          maxTokens: GATE_MAX_TOKENS,
-          temperature: 0,
-          // A classifier must not spend its whole budget thinking: reasoning deltas
-          // used to arrive instead of text, leaving the visible buffer empty.
-          reasoningEffort: 'off' as unknown as GenerateOptions['reasoningEffort'],
-          signal: controller.signal,
-          sessionId: sessionId as GenerateOptions['sessionId'],
-          purpose: 'voice-organizer',
-        } as GenerateOptions)
-        for await (const chunk of stream) {
-          if (chunk.type === 'text-delta') raw += chunk.text
-          else if (chunk.type === 'reasoning-delta') reasoning += (chunk as { text?: string }).text ?? ''
-        }
-      } finally {
-        clearTimeout(timer)
-      }
-      if (timedOut) {
-        appendOrganizerLog({
-          layer: 'gate', action: 'timeout', reason: 'timeout', playing: playing ? 1 : 0,
-          promptChars: GATE_SYSTEM_PROMPT.length + gatePrompt.length, maxTokens: GATE_MAX_TOKENS,
-          elapsedMs: Date.now() - gateStartedAt, changed: 0, text,
-        })
-        writeJson(res, 200, { action: 'queue', reason: 'timeout' })
-        return
-      }
-      const parsed = parseOrganizerResponse(raw) ?? parseOrganizerResponse(reasoning)
-      const seen = (raw || reasoning).replace(/\s+/gu, ' ').trim().slice(0, 48)
-      const decision = parsed
-        ? {
-            action: parsed.action,
-            ...(parsed.priority === undefined ? {} : { priority: parsed.priority }),
-            reason: parsed.reason || 'model',
-          }
-        : { action: 'queue' as const, reason: seen ? 'invalid-model-output:' + seen : 'empty-model-output' }
-      appendOrganizerLog({
-        layer: 'gate', action: decision.action, reason: decision.reason, playing: playing ? 1 : 0,
-        promptChars: GATE_SYSTEM_PROMPT.length + gatePrompt.length, maxTokens: GATE_MAX_TOKENS,
-        elapsedMs: Date.now() - gateStartedAt,
-        // Only an actual interruption changed what the listener heard.
-        changed: decision.action === 'interrupt' ? 1 : 0, text,
-      })
-      writeJson(res, 200, decision)
-    } catch (error) {
-      const reason = timedOut ? 'timeout' : (error instanceof Error ? error.message : String(error)).slice(0, 80)
-      writeJson(res, 200, { action: 'queue', reason })
-    }
-  }
   /**
    * Slow planner layer. Its answer never blocks the reply path: by the time it
    * arrives the line is already queued, so it may only correct what has not
@@ -1613,12 +1492,11 @@ const SAME_SPEAKER_SIMILARITY = 0.62
     return text
   }
   const organizerRoutes: Array<[string, (req: unknown, res: ServerResponse) => void | Promise<void>]> = [
-    ['/organize', organizerHandler],
     ['/plan', plannerHandler],
     ['/latency', latencyHandler],
   ]
   for (const prefix of new Set([base, BOOTSTRAP_BASE])) {
-    for (const [route, handler] of [...voiceprintRoutes, ...separationRoutes, ...organizerRoutes, ...VOLUME_LOG_ROUTES, ...PLAN_LOG_ROUTES]) {
+    for (const [route, handler] of [...voiceprintRoutes, ...separationRoutes, ...organizerRoutes, ...VOLUME_LOG_ROUTES, ...PLAN_LOG_ROUTES, ...RECORD_LOG_ROUTES]) {
       ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: prefix + route, handler }))
     }
   }

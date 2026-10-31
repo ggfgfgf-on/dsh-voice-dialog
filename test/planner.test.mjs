@@ -11,24 +11,20 @@ const request = {
 
 test('a plan is applied at most once per turn and version', () => {
   const ledger = new PlanLedger()
-  const plan = { version: 1, turnId: 'turn-1', reason: 'x', interrupt: false, queuePlan: [{ id: 3, action: 'drop' }] }
+  const plan = { version: 1, turnId: 'turn-1', reason: 'x', interrupt: false }
   assert.equal(ledger.tryClaim(plan), true)
   assert.equal(ledger.tryClaim({ ...plan }), false)
   assert.equal(ledger.tryClaim({ ...plan, version: 2 }), true)
 })
 
 test('a plan whose turn already ended is discarded whole', () => {
-  const plan = { version: 1, turnId: 't', reason: '', interrupt: false, queuePlan: [{ id: 1, action: 'drop' }] }
+  const plan = { version: 1, turnId: 't', reason: '', interrupt: false, dropSentences: [1] }
   // Turn over: nothing playing and nothing queued, so nothing may be revived.
-  assert.equal(shouldApplyPlan(plan, { playing: false, queued: 0, ids: [] }), false)
-  // Still playing, but the addressed entry is already gone.
-  assert.equal(shouldApplyPlan(plan, { playing: true, queued: 0, ids: [] }), false)
-  assert.equal(shouldApplyPlan(plan, { playing: false, queued: 1, ids: [1] }), true)
-  assert.equal(shouldApplyPlan(plan, { playing: false, queued: 1, ids: [9] }), false)
-  // A plan that only touches pending sentences applies while anything plays.
-  const pendingOnly = { version: 2, turnId: 't', reason: '', interrupt: false, dropSentences: [1] }
-  assert.equal(shouldApplyPlan(pendingOnly, { playing: true, queued: 0, ids: [] }), true)
-  assert.equal(shouldApplyPlan(null, { playing: true, queued: 1, ids: [1] }), false)
+  assert.equal(shouldApplyPlan(plan, { playing: false, queued: 0 }), false)
+  // Anything left to correct keeps the plan alive.
+  assert.equal(shouldApplyPlan(plan, { playing: true, queued: 0 }), true)
+  assert.equal(shouldApplyPlan(plan, { playing: false, queued: 1 }), true)
+  assert.equal(shouldApplyPlan(null, { playing: true, queued: 1 }), false)
 })
 
 test('a hung planner returns null at the deadline instead of hanging the caller', async () => {
@@ -44,13 +40,5 @@ test('a plan with no actionable field is ignored', async () => {
   assert.equal(await planner.plan(request), null)
 })
 
-test('a queue plan is parsed, bounded and kept when it changes something', async () => {
-  const planner = new SpeechPlanner(async () => ({
-    queuePlan: [{ id: 3, action: 'drop' }, { id: 'junk', action: 'drop' }, { id: 4, action: 'raise', priority: 10 }],
-    reason: '过时了',
-  }), { timeoutMs: 200 })
-  const plan = await planner.plan(request)
-  assert.equal(plan.queuePlan.length, 2)
-  assert.deepEqual(plan.queuePlan[0], { id: 3, action: 'drop' })
-  assert.deepEqual(plan.queuePlan[1], { id: 4, action: 'raise', priority: 10 })
-})
+// The queuePlan cases are gone with the field: the plan only drops or reorders
+// pending sentences now, and no layer applies a queue adjudication.

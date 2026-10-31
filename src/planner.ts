@@ -5,8 +5,8 @@
  * delete sentences that have not started yet. It never authors new text.
  */
 import {
-  normalizeQueuePlan, normalizeSentenceIndices, parseOrganizerResponse,
-  type OrganizerPendingLine, type QueuePlanItem,
+  normalizeSentenceIndices, parseOrganizerResponse,
+  type OrganizerPendingLine,
 } from './organizer.js'
 import { boundedOrganizerBlocks } from './organizer-history.js'
 
@@ -27,7 +27,6 @@ export interface PlannerPlan {
   turnId: string
   reason: string
   interrupt: boolean
-  queuePlan?: QueuePlanItem[]
   dropSentences?: number[]
   reorder?: number[]
 }
@@ -37,12 +36,6 @@ export type PlannerFn = (request: PlannerRequest, signal: AbortSignal) => Promis
 export interface PlannerOptions {
   /** Hard deadline for one plan. Long on purpose: nothing waits on it. */
   timeoutMs?: number
-}
-
-function readQueuePlan(value: unknown): QueuePlanItem[] {
-  if (!value || typeof value !== 'object') return []
-  const record = value as { queuePlan?: unknown; queue_plan?: unknown }
-  return normalizeQueuePlan(record.queuePlan ?? record.queue_plan)
 }
 
 function readIndices(value: unknown): number[] {
@@ -85,18 +78,16 @@ export class SpeechPlanner {
       const value = typeof raw === 'string' ? parseOrganizerResponse(raw) : raw
       if (!value || typeof value !== 'object') return null
       const record = value as Record<string, unknown> & { reason?: unknown }
-      const queuePlan = readQueuePlan(record)
       const drops = readIndices({ dropSentences: record.dropSentences })
       const reorder = readIndices({ reorder: record.reorder })
       const action = typeof record.action === 'string' ? record.action : ''
       const interrupt = action === 'interrupt'
-      if (!interrupt && queuePlan.length === 0 && drops.length === 0 && reorder.length === 0) return null
+      if (!interrupt && drops.length === 0 && reorder.length === 0) return null
       return {
         version,
         turnId: request.turnId,
         reason: typeof record.reason === 'string' ? record.reason.slice(0, 80) : '',
         interrupt,
-        ...(queuePlan.length === 0 ? {} : { queuePlan }),
         ...(drops.length === 0 ? {} : { dropSentences: drops }),
         ...(reorder.length === 0 ? {} : { reorder }),
       }
@@ -138,8 +129,6 @@ export class PlanLedger {
 export interface PlanState {
   playing: boolean
   queued: number
-  /** Arrival ids still waiting in the scheduler. */
-  ids: readonly number[]
 }
 
 /**
@@ -150,12 +139,9 @@ export interface PlanState {
 export function shouldApplyPlan(plan: PlannerPlan | null | undefined, state: PlanState): boolean {
   if (!plan) return false
   if (state.queued === 0 && !state.playing) return false
-  const addresses = [
-    ...(plan.queuePlan ?? []).map((item) => item.id),
-  ]
-  if (addresses.length === 0) return true
-  const alive = new Set(state.ids)
-  return addresses.some((id) => alive.has(id))
+  // The plan only drops or reorders pending sentences; it never addresses the
+  // utterance queue, so an unfinished turn is the only thing left to check.
+  return true
 }
 export interface PlannerNeed {
   /** Read-aloud blocks of the current reply that have not been spoken yet. */
@@ -190,11 +176,11 @@ export const PLANNER_SYSTEM_PROMPT =
   '你是语音输出编排器（慢判层）。你的本职是组织"我还没说出口的话"，不是拦用户输入。'
   + '输入：待说朗读块（带编号，可能标注同一句）、已排队条目、用户新话。'
   + '你可以：reorder 调整朗读块顺序（结论/答案提前）、dropSentences 删除一个或多个朗读块'
-  + '（仅限重复、背景铺垫、与最新话冲突）、queuePlan 裁决已排队条目（keep/drop/raise+priority）。'
+  + '（仅限重复、背景铺垫、与最新话冲突）。'
   + '同一句内的块必须保持原相对顺序；可以整句前移/后移，也可以丢掉单个块。'
   + '禁止：新增内容、改写文字、编造数字、动正在播或已播的块。'
   + '用户说"先说结论/别讲背景"时：结论块排最前，背景块进 dropSentences，未点名的块不删。'
-  + '输出一行JSON：{"reorder":[1,0],"dropSentences":[2],"queuePlan":[],"interrupt":false,"reason":"≤10字"}；'
+  + '输出一行JSON：{"reorder":[1,0],"dropSentences":[2],"interrupt":false,"reason":"≤10字"}；'
   + '没有更合适的顺序就输出 {"reason":"不变"}。'
 
 export interface PlannerPromptInput {

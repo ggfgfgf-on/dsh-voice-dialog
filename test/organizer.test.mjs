@@ -113,26 +113,6 @@ test('queue override leaves the existing policy alone', async () => {
   assert.deepEqual(deliveries, [{ text: '普通一句', mode: 'queue' }])
 })
 
-test('a queue plan survives the organizer plan wrapper', async () => {
-  const organizer = new SpeechOrganizer(async () => ({
-    action: 'queue',
-    queuePlan: [
-      { id: 3, action: 'drop' },
-      { id: 4, action: 'raise', priority: 2 },
-      { id: 'junk', action: 'drop' },
-    ],
-    reason: '整理队列',
-  }), { timeoutMs: 200 })
-  const plan = await organizer.plan({ ...request, queued: 2, queue: [
-    { lane: 'owner', text: '旧的一句' },
-    { lane: 'guest', text: '客人的一句' },
-  ] })
-  assert.deepEqual(plan.queuePlan, [
-    { id: 3, action: 'drop' },
-    { id: 4, action: 'raise', priority: 2 },
-  ])
-})
-
 test('ignore drops only that entry', async () => {
   const deliveries = []
   const hold = deferred()

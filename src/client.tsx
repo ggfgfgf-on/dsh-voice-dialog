@@ -65,7 +65,37 @@ import {
  * L1 记录层：麦克风/ASR 的每一段转写、声纹标签和客户端事件都从这里追加。
  * Nothing here judges or drops anything: the plan layer does that.
  */
-const voiceRecordStream = createRecordStream({ capacity: 256 })
+/** Session whose records are being persisted; set when the page mounts. */
+let recordSessionId = ''
+
+/**
+ * L1 persistence: the record stream drains to the host every 300 ms. A failed
+ * post is dropped silently — a side channel never blocks the microphone.
+ */
+function postRecordBatch(lines: readonly string[]): void {
+  const items: unknown[] = []
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line) as unknown
+      if (parsed && typeof parsed === 'object') items.push(parsed)
+    } catch { /* one malformed line must not drop the batch */ }
+  }
+  if (items.length === 0) return
+  try {
+    void fetch(apiUrl('/record-log'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: recordSessionId, items }),
+      keepalive: true,
+    }).catch(() => undefined)
+  } catch { /* the record stream is a side channel */ }
+}
+
+const voiceRecordStream = createRecordStream({
+  capacity: 256,
+  flushMs: 300,
+  sink: postRecordBatch,
+})
 
 /**
  * L3 计划流：decidePlan 的每一条输出都写在这里，与原始流同一个实现，
@@ -1449,6 +1479,8 @@ function displaySpeaker(sessionId: string, label: string): string {
 
 function useAutoRead(sessionId: string): void {
   useEffect(() => {
+    // L1 writes carry the live session id from here on.
+    recordSessionId = sessionId
     let closed = false
     let source: EventSource | null = null
     const unlock = (): void => { void sharedPlayer.enable() }
@@ -2077,7 +2109,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           const ids = scheduler.snapshot().map((item) => item.id)
           // A plan for a turn that already ended (queue empty, nothing playing)
           // is discarded whole: it may only correct, never revive.
-          if (!shouldApplyPlan(plan, { playing: sharedPlayer.busy(), queued: ids.length, ids })) return
+          if (!shouldApplyPlan(plan, { playing: sharedPlayer.busy(), queued: ids.length })) return
           if (!planLedgerRef.current.tryClaim(plan)) return
           // The queue itself is no longer corrected here: input mode and order
           // are decided once, in plan.ts (L3). What remains is the ASSISTANT's

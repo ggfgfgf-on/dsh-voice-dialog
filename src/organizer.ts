@@ -43,20 +43,7 @@ export interface OrganizerReorganizeFields {
   reorder?: number[]
 }
 
-export type QueuePlanAction = 'keep' | 'drop' | 'raise'
-
-/** One adjudication of an already-queued utterance, addressed by arrival id. */
-export interface QueuePlanItem {
-  id: number
-  action: QueuePlanAction
-  priority?: number
-}
-
-export interface QueuePlanFields {
-  queuePlan?: QueuePlanItem[]
-}
-
-export interface OrganizerPlan extends OrganizerReorganizeFields, QueuePlanFields {
+export interface OrganizerPlan extends OrganizerReorganizeFields {
   /** Monotonic version of this organizer instance. */
   version: number
   action: OrganizerAction
@@ -65,7 +52,7 @@ export interface OrganizerPlan extends OrganizerReorganizeFields, QueuePlanField
   reason: string
 }
 
-export interface ParsedOrganizer extends OrganizerReorganizeFields, QueuePlanFields {
+export interface ParsedOrganizer extends OrganizerReorganizeFields {
   action: OrganizerAction
   priority?: number
   reason: string
@@ -125,49 +112,15 @@ export function normalizeSentenceIndices(value: unknown): number[] {
   return out.slice(0, ORGANIZER_PENDING_LIMIT * 4)
 }
 
-const QUEUE_PLAN_LIMIT = 8
-
-/** Coerce an untrusted queue plan: known ids, known actions, one entry per id. */
-export function normalizeQueuePlan(value: unknown): QueuePlanItem[] {
-  const source = Array.isArray(value)
-    ? value
-    : (value && typeof value === 'object' && Array.isArray((value as { items?: unknown }).items)
-      ? (value as { items: unknown[] }).items : [])
-  const out: QueuePlanItem[] = []
-  const seen = new Set<number>()
-  for (const raw of source) {
-    if (!raw || typeof raw !== 'object') continue
-    const record = raw as { id?: unknown; action?: unknown; priority?: unknown }
-    const id = typeof record.id === 'number'
-      ? record.id
-      : (typeof record.id === 'string' && /^\d+$/u.test(record.id.trim()) ? Number(record.id.trim()) : NaN)
-    if (!Number.isInteger(id) || id < 0 || id > 1_000_000) continue
-    if (seen.has(id)) continue
-    const action = typeof record.action === 'string' ? record.action.trim().toLowerCase() : ''
-    if (action !== 'keep' && action !== 'drop' && action !== 'raise') continue
-    seen.add(id)
-    const priority = action === 'raise' ? normalizeOrganizerPriority(record.priority) : undefined
-    if (action === 'raise' && priority === undefined) {
-      out.push({ id, action: 'keep' })
-      continue
-    }
-    out.push({ id, action, ...(priority === undefined ? {} : { priority }) })
-    if (out.length >= QUEUE_PLAN_LIMIT) break
-  }
-  return out
-}
-
 /** Tolerance: reorg fields may be null, a string, or missing entirely. */
 function readReorganizeFields(value: unknown): OrganizerReorganizeFields {
   if (!value || typeof value !== 'object') return {}
   const record = value as Record<string, unknown>
   const drops = normalizeSentenceIndices(record.dropSentences ?? record.drop_sentences)
   const order = normalizeSentenceIndices(record.reorder ?? record.order)
-  const queuePlan = normalizeQueuePlan(record.queuePlan ?? record.queue_plan)
   return {
     ...(drops.length === 0 ? {} : { dropSentences: drops }),
     ...(order.length === 0 ? {} : { reorder: order }),
-    ...(queuePlan.length === 0 ? {} : { queuePlan }),
   }
 }
 
@@ -351,7 +304,6 @@ export class SpeechOrganizer {
         ...(parsed.priority === undefined ? {} : { priority: parsed.priority }),
         ...(parsed.dropSentences === undefined ? {} : { dropSentences: parsed.dropSentences }),
         ...(parsed.reorder === undefined ? {} : { reorder: parsed.reorder }),
-        ...(parsed.queuePlan === undefined ? {} : { queuePlan: parsed.queuePlan }),
         reason: parsed.reason,
       }
       this.latest = plan
