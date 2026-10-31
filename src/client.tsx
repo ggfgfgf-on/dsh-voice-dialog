@@ -1657,6 +1657,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const separatorRef = useRef<ContinuousSeparation | null>(null)
   const plannerRef = useRef<SpeechPlanner | null>(null)
   const earlyRef = useRef<EarlyStart | null>(null)
+  /** The session-wide seam speaks through whichever utterance is current. */
+  const earlySpeakRef = useRef<((line: string) => void) | null>(null)
   const planLedgerRef = useRef(new PlanLedger())
   const organizerOrderRef = useRef(0)
   const lastLaneTextRef = useRef<Map<string, string>>(new Map())
@@ -1775,6 +1777,24 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     window.addEventListener('pagehide', onPageHide)
     return () => { window.removeEventListener('pagehide', onPageHide) }
   }, [sessionId])
+
+  useEffect(() => {
+    // Perception exists from the moment the session mounts, not from the first
+    // closed utterance: unfinished speech is recorded and planned all along.
+    const early = createEarlyStart({
+      speak: (line) => { earlySpeakRef.current?.(line) },
+      record: (text, meta) => { voiceRecordStream.append('partial', { text, final: false, ...meta }) },
+      recordPlan: (item) => voicePlanStream.append('plan', {
+        kind: item.kind, lane: item.lane, priority: item.priority ?? 0,
+        reason: item.reason, source: item.source, provisional: true,
+      }).seq,
+    })
+    earlyRef.current = early
+    return () => {
+      early.dispose()
+      if (earlyRef.current === early) earlyRef.current = null
+    }
+  }, [])
 
   /** Backpressure counters: proves that a slow model never builds a backlog. */
   const reportSeparationPressure = (separator: ContinuousSeparation): void => {
@@ -2025,6 +2045,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       entry.setMode(priority === -1 ? 'steer' : 'queue')
       return entry
     }
+    // The session-wide seam speaks through the utterance that is current now.
+    earlySpeakRef.current = (line) => { const entry = enqueue(line, -1); entry.setMode('steer') }
     void work.then(async (text) => {
       if (!text) { release(); return }
       // Explicit "打断" / stop commands are hard commands, not model input.
@@ -2074,17 +2096,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         return
       }
       if (earlyStartOn && rawSegments.length > 1) {
-        earlyRef.current = earlyRef.current ?? createEarlyStart({
-          speak: (line) => { const entry = enqueue(line, -1); entry.setMode('steer') },
-          record: (text, meta) => {
-            voiceRecordStream.append('partial', { text, final: false, ...meta })
-          },
-          recordPlan: (item) => voicePlanStream.append('plan', {
-            kind: item.kind, lane: item.lane, priority: item.priority ?? 0,
-            reason: item.reason, source: item.source, provisional: true,
-          }).seq,
-        })
-        earlyRef.current.partial(
+        earlyRef.current?.partial(
           rawSegments.slice(0, -1).map((piece) => piece.text),
           { lane, canonical, playing: sharedPlayer.busy(), queued: scheduler.status().queued },
         )
