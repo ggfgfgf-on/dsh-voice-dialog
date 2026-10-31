@@ -26,9 +26,9 @@ export interface SpeechProfile {
   rhythm?: RhythmMode
   /** Opt-in silence inside one long line (adds one request); 0 keeps one request per block. */
   innerPauseMs?: number
-  /** Word said once when the listener waits with nothing to hear yet; 'none' never. */
-  backchannel?: BackchannelWord
-  /** How long the listener may wait before the backchannel word is said. */
+  /** One short line YOU write, said once if the listener is still waiting; empty = never. */
+  backchannel?: string
+  /** How long before that line is said; 0 leaves the moment to the wait itself. */
   backchannelAfterMs?: number
   /** Open a reply by picking up the listener's half sentence before new content. */
   warmOpen?: boolean
@@ -41,8 +41,11 @@ export interface SpeechProfile {
 /** Pace modes. Natural is the default: variance, not a fixed interval. */
 export type RhythmMode = 'natural' | 'off'
 
-/** The only backchannel words; a phrase would be new content, not a placeholder. */
-export type BackchannelWord = 'none' | '嗯' | '在' | '好'
+/**
+ * Longest placeholder line. The wording is the model's own: this file only
+ * bounds the SHAPE (one short acknowledgement), it never supplies vocabulary.
+ */
+export const BACKCHANNEL_MAX_CHARS = 24
 
 /** Today's live behaviour. A declaration only overrides these. */
 export const DEFAULT_SPEECH_PROFILE: Required<SpeechProfile> = {
@@ -55,8 +58,8 @@ export const DEFAULT_SPEECH_PROFILE: Required<SpeechProfile> = {
   separationSilenceMs: 1600,
   rhythm: 'natural',
   innerPauseMs: 0,
-  backchannel: 'none',
-  backchannelAfterMs: 900,
+  backchannel: '',
+  backchannelAfterMs: 0,
   warmOpen: false,
   firstBlockChars: 8,
   firstBlockDeadlineMs: 0,
@@ -73,13 +76,12 @@ const NUMERIC_RANGES: ReadonlyArray<readonly [keyof SpeechProfile, number, numbe
   ['micSilenceMs', 400, 4000],
   ['separationSilenceMs', 400, 4000],
   ['innerPauseMs', 0, 400],
-  ['backchannelAfterMs', 200, 3000],
+  ['backchannelAfterMs', 0, 5000],
   ['firstBlockChars', 4, 12],
   ['firstBlockDeadlineMs', 0, 2000],
 ]
 
 const RHYTHM_MODES: readonly string[] = ['natural', 'off']
-const BACKCHANNEL_WORDS: readonly string[] = ['none', '嗯', '在', '好']
 
 function clampInteger(value: unknown, low: number, high: number): number | undefined {
   const number = typeof value === 'number' ? value : Number.NaN
@@ -101,8 +103,11 @@ export function normalizeSpeechProfile(input: unknown): SpeechProfile {
     profile.rhythm = rhythm as RhythmMode
   }
   const backchannel = record.backchannel
-  if (typeof backchannel === 'string' && BACKCHANNEL_WORDS.includes(backchannel)) {
-    profile.backchannel = backchannel as BackchannelWord
+  if (typeof backchannel === 'string') {
+    const line = backchannel.replace(/\s+/g, ' ').trim().slice(0, BACKCHANNEL_MAX_CHARS)
+    // 'none' stays accepted as "say nothing" so a fallback can be switched off.
+    if (line === 'none') profile.backchannel = ''
+    else if (line.length > 0) profile.backchannel = line
   }
   if (typeof record.warmOpen === 'boolean') profile.warmOpen = record.warmOpen
   for (const [key, low, high] of NUMERIC_RANGES) {

@@ -348,8 +348,8 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             separationSilenceMs: { type: 'number', minimum: 400, maximum: 4000, description: 'Tail silence for a separated speaker stream.' },
             rhythm: { type: 'string', enum: ['natural', 'off'], description: 'Pace between blocks. natural (default) leaves a longer gap after a sentence than after a comma, and varies each one; off makes it metronomic, which is only useful for a test.' },
             innerPauseMs: { type: 'number', minimum: 0, maximum: 400, description: 'Silence INSIDE one long line, e.g. 120. Use it when a single block is too long to say in one breath. It splits the line and costs one extra synthesis request, so leave it at 0 unless that line really needs to breathe.' },
-            backchannel: { type: 'string', enum: ['none', '嗯', '在', '好'], description: 'One placeholder word said when your answer has not started yet and the listener would otherwise sit in silence, e.g. "嗯". Default none. Use it for a long think right after a direct question, never as a greeting.' },
-            backchannelAfterMs: { type: 'number', minimum: 200, maximum: 3000, description: 'How long the listener may wait before that placeholder word; 900 by default.' },
+            backchannel: { type: 'string', maxLength: 24, description: 'A short line YOU write (not picked from a list), said once if the listener is still waiting with nothing to hear. Keep it to an acknowledgement, not new content: e.g. "嗯，我想一下" or "对，我在听". Empty or "none" means never. Use it when a direct question needs a long think, never as a greeting.' },
+            backchannelAfterMs: { type: 'number', minimum: 0, maximum: 5000, description: 'Optional. Leave it out (0) and the moment is not fixed: the line is said once the wait has actually got that long. Give milliseconds only when you want it at a specific point.' },
             warmOpen: { type: 'boolean', description: 'true opens the reply by picking the listener half sentence up ("对,你刚说那个") before new content. Use it right after you were interrupted, not for a fresh question.' },
             firstBlockChars: { type: 'number', minimum: 4, maximum: 12, description: 'How few characters the FIRST block may speak on (default 8). Lower starts the voice sooner; 5 is a good value when your reply opens with a long clause.' },
             firstBlockDeadlineMs: { type: 'number', minimum: 0, maximum: 2000, description: 'If the opening words are still unpunctuated after this long, speak what has arrived, e.g. 700. 0 is off. Use 700-900 when your first sentence tends to be long.' },
@@ -2037,7 +2037,7 @@ async function* tapStream(
       ? {
         text: backchannel,
         afterMs: typeof declaredSpeechProfile.backchannelAfterMs === 'number'
-          ? declaredSpeechProfile.backchannelAfterMs : 900,
+          ? declaredSpeechProfile.backchannelAfterMs : 0,
       }
       : undefined
     servo = new FastLaneServo({

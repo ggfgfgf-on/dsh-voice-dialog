@@ -59,8 +59,8 @@ test('rhythm: inner pause is opt-in and splits at the middle comma', () => {
 test('speech profile: the new knobs default to today\'s behaviour', () => {
   assert.equal(DEFAULT_SPEECH_PROFILE.rhythm, 'natural')
   assert.equal(DEFAULT_SPEECH_PROFILE.innerPauseMs, 0)
-  assert.equal(DEFAULT_SPEECH_PROFILE.backchannel, 'none')
-  assert.equal(DEFAULT_SPEECH_PROFILE.backchannelAfterMs, 900)
+  assert.equal(DEFAULT_SPEECH_PROFILE.backchannel, '')
+  assert.equal(DEFAULT_SPEECH_PROFILE.backchannelAfterMs, 0)
   assert.equal(DEFAULT_SPEECH_PROFILE.warmOpen, false)
   assert.equal(DEFAULT_SPEECH_PROFILE.firstBlockChars, 8)
   assert.equal(DEFAULT_SPEECH_PROFILE.firstBlockDeadlineMs, 0)
@@ -71,20 +71,25 @@ test('speech profile: the new knobs default to today\'s behaviour', () => {
 
 test('speech profile: new knobs are validated and clamped', () => {
   const declared = normalizeSpeechProfile({
-    rhythm: 'off', innerPauseMs: 900, backchannel: '嗯', backchannelAfterMs: 10,
+    rhythm: 'off', innerPauseMs: 900, backchannel: '嗯', backchannelAfterMs: 9000,
     warmOpen: true, firstBlockChars: 1, firstBlockDeadlineMs: 9000,
   })
   assert.equal(declared.rhythm, 'off')
   assert.equal(declared.innerPauseMs, 400)
   assert.equal(declared.backchannel, '嗯')
-  assert.equal(declared.backchannelAfterMs, 200)
+  assert.equal(declared.backchannelAfterMs, 5000)
   assert.equal(declared.warmOpen, true)
   assert.equal(declared.firstBlockChars, 4)
   assert.equal(declared.firstBlockDeadlineMs, 2000)
   const garbage = normalizeSpeechProfile({
-    rhythm: 'fast', backchannel: '嗯嗯嗯', warmOpen: 'yes', firstBlockChars: 'x',
+    rhythm: 'fast', backchannel: 42, warmOpen: 'yes', firstBlockChars: 'x',
   })
   assert.deepEqual(garbage, {})
+  // The wording is the model's: any short line survives, nothing is preselected.
+  assert.equal(normalizeSpeechProfile({ backchannel: '  对 我 在 听  ' }).backchannel, '对 我 在 听')
+  assert.equal(normalizeSpeechProfile({ backchannel: '嗯' }).backchannel, '嗯')
+  assert.equal(normalizeSpeechProfile({ backchannel: '长'.repeat(40) }).backchannel.length, 24)
+  assert.equal(normalizeSpeechProfile({ backchannel: 'none' }).backchannel, '')
 })
 
 test('segmenter: forcePartial releases early without punctuation', () => {
@@ -132,6 +137,18 @@ test('servo placeholder: said once, only when declared', async () => {
   await wait(20)
   quiet.stop('test')
   assert.deepEqual(silent, [])
+
+  // No declared time: nothing is fixed, the servo's own first opening decides.
+  const floating = []
+  const open = new FastLaneServo({
+    say: (line) => floating.push(line),
+    now: () => 0,
+    startAt: 0,
+    placeholder: { text: '我在想' },
+  })
+  await wait(20)
+  open.stop('test')
+  assert.deepEqual(floating, [], 'it must not jump the queue before the wait is real')
 })
 
 test('servo placeholder: a stop before the delay keeps it quiet', async () => {

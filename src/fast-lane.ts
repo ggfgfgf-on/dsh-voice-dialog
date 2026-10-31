@@ -167,8 +167,12 @@ export interface ServoOptions {
   timeoutMs?: number
   /** Clock origin: when this reply started. */
   startAt?: number
-  /** Said once if no line is ready by then; omitted means never say it. */
-  placeholder?: { text: string; afterMs: number }
+  /**
+   * Said once if nothing else is speaking yet; omitted means never say it.
+   * afterMs is optional: without it the line lands at the servo's own first
+   * opening, so how long the wait actually is decides when it is said.
+   */
+  placeholder?: { text: string; afterMs?: number }
 }
 
 /**
@@ -198,7 +202,9 @@ export class FastLaneServo {
     const placeholder = options.placeholder
     const text = typeof placeholder?.text === 'string' ? placeholder.text.trim() : ''
     if (placeholder && text.length > 0) {
-      const at = (options.startAt ?? now) + Math.max(0, placeholder.afterMs)
+      const declared = Number(placeholder.afterMs)
+      const delay = Number.isFinite(declared) && declared > 0 ? declared : SERVO_FIRST_DELAY_MS
+      const at = (options.startAt ?? now) + delay
       this.placeholderTimer = setTimeout(() => {
         this.placeholderTimer = undefined
         if (this.stopped || this.spoken > 0) return
