@@ -366,6 +366,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             warmOpen: { type: 'boolean', description: 'true opens the reply by picking the listener half sentence up ("对,你刚说那个") before new content. Use it right after you were interrupted, not for a fresh question.' },
             firstBlockChars: { type: 'number', minimum: 4, maximum: 12, description: 'How few characters the FIRST block may speak on (default 8). Lower starts the voice sooner; 5 is a good value when your reply opens with a long clause.' },
             firstBlockDeadlineMs: { type: 'number', minimum: 0, maximum: 2000, description: 'If the opening words are still unpunctuated after this long, speak what has arrived, e.g. 700. 0 is off. Use 700-900 when your first sentence tends to be long.' },
+            earlyStart: { type: 'string', enum: ['off', 'partial'], description: 'off (default) plans only after the listener stops. partial lets unfinished speech produce a provisional plan that can be withdrawn when the sentence closes, so a short reaction may start before the listener is done. Anything already spoken is never taken back.' },
           },
         },
         sequence: {

@@ -235,6 +235,12 @@ export interface PlanItem {
   text?: string
   reason: string
   source: PlanSource
+  /** Plan-stream sequence number, so L4 can retract exactly this item. */
+  seq?: number
+  /** Planned from speech the listener has not finished; L4 may withdraw it. */
+  provisional?: boolean
+  /** Plan-stream seq of the provisional item this one replaces. */
+  supersedes?: number
 }
 
 export interface PlanState {
@@ -322,6 +328,60 @@ export function decideChunks(
     previous = text
   }
   return out
+}
+
+/**
+ * Provisional plan: the same rules applied while the listener is still talking.
+ * Every item is marked provisional so L4 knows it may withdraw it, and nothing
+ * here invents content: a provisional item is a shape, not a sentence.
+ */
+export function decidePartial(chunks: readonly string[], state: PlanState): PlanItem[] {
+  return decideChunks(chunks, state).map(({ item }) => ({ ...item, provisional: true }))
+}
+
+export type ConfirmReason =
+  | 'no-provisional'
+  | 'rejected'
+  | 'topic-shift'
+  | 'shape-changed'
+  | 'confirmed'
+
+export interface ConfirmResult {
+  /** True when the provisional plan still holds and may be kept. */
+  confirmed: boolean
+  /** The plan to run now: the confirmed provisional items, or the replacement. */
+  items: PlanItem[]
+  reason: ConfirmReason
+}
+
+/**
+ * The corpus closed. Either the provisional plan still says what the final
+ * text says (keep it) or it must be withdrawn and replaced: noise/duplicate,
+ * a topic that moved, or an action that changed shape since the partial.
+ */
+export function confirmPlan(
+  provisional: readonly PlanItem[],
+  finalText: string,
+  state: PlanState,
+  partialText = '',
+): ConfirmResult {
+  const fresh = decidePlan({ text: finalText }, state)
+  const head = provisional.find((item) => item && typeof item === 'object')
+  if (!head) return { confirmed: false, items: fresh, reason: 'no-provisional' }
+  // Noise or a duplicate: the partial plan dies with the corpus.
+  if (fresh[0].kind === 'ignore') return { confirmed: false, items: fresh, reason: 'rejected' }
+  if (partialText) {
+    const before = squash(partialText)
+    const after = squash(finalText)
+    if (before.length >= 2 && after.length >= 2 && similarity(before, after) < 0.5) {
+      return { confirmed: false, items: fresh, reason: 'topic-shift' }
+    }
+  }
+  if (fresh[0].kind !== head.kind || fresh[0].lane !== head.lane) {
+    return { confirmed: false, items: fresh, reason: 'shape-changed' }
+  }
+  const items = provisional.map(({ provisional: _provisional, ...rest }) => rest as PlanItem)
+  return { confirmed: true, items, reason: 'confirmed' }
 }
 
 /** Turn a late model verdict into the same plan vocabulary. */

@@ -13,6 +13,8 @@
 
 export type RecordKind =
   | 'transcript'
+  /** Speech the listener has not finished yet; recorded, never acted on by L1. */
+  | 'partial'
   | 'voiceprint'
   | 'barge-in'
   | 'playback'

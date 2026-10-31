@@ -19,6 +19,7 @@ const DEFAULT_PROFILE = {
   warmOpen: false,
   firstBlockChars: 8,
   firstBlockDeadlineMs: 0,
+  earlyStart: 'off',
 }
 
 test('no declaration resolves to exactly today\'s behaviour', () => {

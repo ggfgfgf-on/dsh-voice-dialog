@@ -22,6 +22,7 @@ export const RECORD_LABEL_LIMIT = 24
 
 export type RecordLogKind =
   | 'transcript'
+  | 'partial'
   | 'voiceprint'
   | 'barge-in'
   | 'playback'
@@ -30,7 +31,7 @@ export type RecordLogKind =
   | 'custom'
 
 const KINDS: readonly string[] = [
-  'transcript', 'voiceprint', 'barge-in', 'playback', 'reply', 'plan', 'custom',
+  'transcript', 'partial', 'voiceprint', 'barge-in', 'playback', 'reply', 'plan', 'custom',
 ]
 const LANES: readonly string[] = ['owner', 'guest', 'fast', 'slow', '']
 

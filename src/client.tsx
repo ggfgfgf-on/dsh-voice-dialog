@@ -43,6 +43,7 @@ import {
 } from './barge-in.ts'
 import { inputGateTraceFields, type InputGateDecision } from './input-gate.ts'
 import { decideChunks, decidePlan } from './plan.ts'
+import { createEarlyStart, earlyStartEnabled, type EarlyStart } from './early-start.ts'
 import { chunkRawSegments } from './chunker.ts'
 import { createRecordStream } from './record-stream.ts'
 import { createPlaybackRecorder } from './playback-record.ts'
@@ -1649,6 +1650,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const separationRetryAtRef = useRef(0)
   const separatorRef = useRef<ContinuousSeparation | null>(null)
   const plannerRef = useRef<SpeechPlanner | null>(null)
+  const earlyRef = useRef<EarlyStart | null>(null)
   const planLedgerRef = useRef(new PlanLedger())
   const organizerOrderRef = useRef(0)
   const lastLaneTextRef = useRef<Map<string, string>>(new Map())
@@ -2024,6 +2026,27 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           text: piece.text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, ''),
         }))
         : [{ text: spoken, at: arrivedAt, lane, canonical }]
+      // Early start is the only path that plans BEFORE the utterance closes, and
+      // it runs only when the model declared it: a declaration-free session is
+      // byte-identical to before. Provisional items reach the fast lane only;
+      // the slow queue is untouched until the corpus closes.
+      const earlyStartOn = earlyStartEnabled(sharedPlayer.declaredSpeechSettings())
+      if (earlyStartOn && rawSegments.length > 1) {
+        earlyRef.current = earlyRef.current ?? createEarlyStart({
+          speak: (line) => { const entry = enqueue(line, -1); entry.setMode('steer') },
+          record: (text, meta) => {
+            voiceRecordStream.append('partial', { text, final: false, ...meta })
+          },
+          recordPlan: (item) => voicePlanStream.append('plan', {
+            kind: item.kind, lane: item.lane, priority: item.priority ?? 0,
+            reason: item.reason, source: item.source, provisional: true,
+          }).seq,
+        })
+        earlyRef.current.partial(
+          rawSegments.slice(0, -1).map((piece) => piece.text),
+          { lane, canonical, playing: sharedPlayer.busy(), queued: scheduler.status().queued },
+        )
+      }
       // The cap is the model's to declare: a declaration wins over the page
       // setting, so how a long utterance is cut belongs to the speech interface.
       const declaredCut = sharedPlayer.declaredSpeechSettings().chunkMaxChars
@@ -2037,6 +2060,16 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       // every piece is planned, so a split tail cannot skip the organization
       // layer and arrive with a mode nobody decided.
       const chunk = { text: rawChunks.length === 1 ? spoken : (rawChunks[0]?.text ?? spoken) }
+      if (earlyStartOn) {
+        // The corpus closed: keep the provisional plan or withdraw what has not
+        // started speaking yet. A confirmed plan repeats nothing.
+        const settled = earlyRef.current?.settle(chunk.text, { lane, canonical })
+        if (settled && !settled.confirmed) {
+          voiceRecordStream.append('custom', {
+            kind: 'early-start-withdrawn', reason: settled.reason, withdrawn: settled.withdrawn,
+          })
+        }
+      }
       if (rawChunks.length > 1) {
         voiceRecordStream.append('custom', {
           kind: 'chunk-cut', chunks: rawChunks.length, cap: chunkCap,

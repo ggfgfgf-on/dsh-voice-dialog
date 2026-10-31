@@ -7,6 +7,9 @@
  */
 export type InterruptionMode = 'sentence' | 'immediate' | 'never'
 
+/** Whether unfinished speech may drive a provisional plan. Off by default. */
+export type EarlyStartMode = 'off' | 'partial'
+
 export interface SpeechProfile {
   /** How the assistant's own speech may be interrupted by the listener. */
   interruption?: InterruptionMode
@@ -38,6 +41,12 @@ export interface SpeechProfile {
   firstBlockChars?: number
   /** Release the first block this long after the first token even without punctuation; 0 off. */
   firstBlockDeadlineMs?: number
+  /**
+   * 'off' (default) waits for the utterance to close before planning anything.
+   * 'partial' lets unfinished speech produce a PROVISIONAL plan that may be
+   * withdrawn when the corpus closes; anything already spoken stays spoken.
+   */
+  earlyStart?: EarlyStartMode
 }
 
 /** Pace modes. Natural is the default: variance, not a fixed interval. */
@@ -66,6 +75,7 @@ export const DEFAULT_SPEECH_PROFILE: Required<SpeechProfile> = {
   warmOpen: false,
   firstBlockChars: 8,
   firstBlockDeadlineMs: 0,
+  earlyStart: 'off',
 }
 
 const INTERRUPTION_MODES: readonly string[] = ['sentence', 'immediate', 'never']
@@ -86,6 +96,7 @@ const NUMERIC_RANGES: ReadonlyArray<readonly [keyof SpeechProfile, number, numbe
 ]
 
 const RHYTHM_MODES: readonly string[] = ['natural', 'off']
+const EARLY_START_MODES: readonly string[] = ['off', 'partial']
 
 function clampInteger(value: unknown, low: number, high: number): number | undefined {
   const number = typeof value === 'number' ? value : Number.NaN
@@ -112,6 +123,10 @@ export function normalizeSpeechProfile(input: unknown): SpeechProfile {
     // 'none' stays accepted as "say nothing" so a fallback can be switched off.
     if (line === 'none') profile.backchannel = ''
     else if (line.length > 0) profile.backchannel = line
+  }
+  const earlyStart = record.earlyStart
+  if (typeof earlyStart === 'string' && EARLY_START_MODES.includes(earlyStart)) {
+    profile.earlyStart = earlyStart as EarlyStartMode
   }
   if (typeof record.warmOpen === 'boolean') profile.warmOpen = record.warmOpen
   for (const [key, low, high] of NUMERIC_RANGES) {

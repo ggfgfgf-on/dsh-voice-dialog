@@ -30,6 +30,7 @@ const TEST_SURFACES = [
   'barge-in',
   'chunker',
   'continuous-separation',
+  'early-start',
   'expression',
   'fast-lane',
   'frame-order',
