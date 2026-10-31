@@ -35,7 +35,7 @@ import { createVolumeReporter } from './volume-report.ts'
 import { SpeechScheduler, type GuestMode } from './scheduler.ts'
 import {
   applyReorganization, ORGANIZER_PENDING_ITEM_CHARS, ORGANIZER_PENDING_LIMIT,
-  ORGANIZER_PENDING_TOTAL_CHARS, SpeechOrganizer,
+  ORGANIZER_PENDING_TOTAL_CHARS,
 } from './organizer.ts'
 import { parseQueueControl } from './queue-control.ts'
 import {
@@ -1648,7 +1648,6 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   const separationReadyRef = useRef(false)
   const separationRetryAtRef = useRef(0)
   const separatorRef = useRef<ContinuousSeparation | null>(null)
-  const organizerRef = useRef<SpeechOrganizer | null>(null)
   const plannerRef = useRef<SpeechPlanner | null>(null)
   const planLedgerRef = useRef(new PlanLedger())
   const organizerOrderRef = useRef(0)
@@ -1751,7 +1750,10 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   }, [])
 
   useEffect(() => {
-    const onPageHide = (): void => { reportVoiceState(sessionId, false, true) }
+    const onPageHide = (): void => {
+      try { voiceRecordStream.flush() } catch { /* best effort on unload */ }
+      reportVoiceState(sessionId, false, true)
+    }
     window.addEventListener('pagehide', onPageHide)
     return () => { window.removeEventListener('pagehide', onPageHide) }
   }, [sessionId])
@@ -1803,8 +1805,6 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     lastIdentityLaneRef.current = null
     // An explicit later command must not be overridden by a plan still in
     // flight. Pending holds are released by the organizer's finally block.
-    organizerRef.current?.cancel()
-    organizerRef.current = null
     // Keep already captured segments: stopping the microphone must not lose
     // the last sentence the user just spoke. The scheduler flushes guest lines
     // that are already waiting, then refuses new work.

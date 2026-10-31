@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  SpeechOrganizer,
   parseOrganizerResponse,
   normalizeOrganizerAction,
 } from '../lib/organizer.js'
@@ -35,44 +34,6 @@ test('parses the documented actions, fences, and rejects junk', () => {
   })
   assert.equal(parseOrganizerResponse('{"action":"steer"}'), null)
   assert.equal(parseOrganizerResponse('not json'), null)
-})
-
-test('a stale plan cannot resolve after a newer plan starts', async () => {
-  const first = deferred()
-  let calls = 0
-  const organizer = new SpeechOrganizer(async () => {
-    calls += 1
-    return calls === 1 ? first.promise : { action: 'queue', reason: 'newer' }
-  }, { timeoutMs: 200 })
-  const older = organizer.plan(request)
-  const newer = await organizer.plan(request)
-  first.resolve('{"action":"interrupt"}')
-  assert.equal(await older, null)
-  assert.equal(newer.action, 'queue')
-  assert.equal(newer.version, 2)
-})
-
-test('a timeout falls back to queue and aborts the planner', async () => {
-  let aborted = false
-  const organizer = new SpeechOrganizer((_request, signal) => new Promise((_resolve, reject) => {
-    signal.addEventListener('abort', () => {
-      aborted = true
-      reject(new Error('aborted'))
-    })
-  }), { timeoutMs: 20 })
-  const plan = await organizer.plan(request)
-  assert.equal(plan.action, 'queue')
-  assert.equal(plan.reason, 'timeout')
-  assert.equal(aborted, true)
-})
-
-test('cancel makes an in-flight plan stale', async () => {
-  const pending = deferred()
-  const organizer = new SpeechOrganizer(async () => pending.promise, { timeoutMs: 200 })
-  const plan = organizer.plan(request)
-  organizer.cancel()
-  pending.resolve('{"action":"interrupt"}')
-  assert.equal(await plan, null)
 })
 
 test('interrupt mode override is honored without reordering FIFO', async () => {

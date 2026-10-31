@@ -1348,17 +1348,15 @@ const SAME_SPEAKER_SIMILARITY = 0.62
         return
       }
       const parsed = parseOrganizerResponse(raw) ?? parseOrganizerResponse(reasoning)
-      // Bound every index against exactly what the prompt showed.
-      const shownIds = new Set(queue.map((item) => item.id))
-      const queuePlan = (parsed?.queuePlan ?? []).filter((item) => shownIds.has(item.id))
+      // The queue itself is ordered by plan.ts; this route only corrects the
+      // assistant's pending blocks, so every index is bounded by the prompt.
       const dropSentences = (parsed?.dropSentences ?? []).filter((index) => index >= 0 && index < pendingView.length)
       const reorder = (parsed?.reorder ?? []).filter((index) => index >= 0 && index < pendingView.length)
       const interrupt = parsed?.action === 'interrupt'
-      const changed = interrupt || queuePlan.length > 0 || dropSentences.length > 0 || reorder.length > 0
+      const changed = interrupt || dropSentences.length > 0 || reorder.length > 0
       const usedRule = !changed && ruleDecision !== null
       const decision = {
         ...(interrupt ? { interrupt: true } : {}),
-        ...(queuePlan.length === 0 ? {} : { queuePlan }),
         ...(changed || ruleDecision?.dropSentences === undefined ? {} : { dropSentences: ruleDecision.dropSentences }),
         ...(changed || ruleDecision?.reorder === undefined ? {} : { reorder: ruleDecision.reorder }),
         reason: usedRule ? 'rule' : (parsed?.reason || (changed ? 'model' : 'unchanged')),

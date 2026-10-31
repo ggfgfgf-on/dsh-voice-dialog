@@ -58,12 +58,6 @@ export interface ParsedOrganizer extends OrganizerReorganizeFields {
   reason: string
 }
 
-export type OrganizerPlanner = (request: OrganizerRequest, signal: AbortSignal) => Promise<unknown>
-
-export interface SpeechOrganizerOptions {
-  /** Hard deadline for one decision. */
-  timeoutMs?: number
-}
 
 /** Accept only the documented actions. */
 export function normalizeOrganizerAction(value: unknown): OrganizerAction | null {
@@ -262,81 +256,5 @@ function parsePlannerValue(value: unknown): ParsedOrganizer | null {
     ...(priority === undefined ? {} : { priority }),
     ...readReorganizeFields(record),
     reason: typeof record.reason === 'string' ? record.reason.slice(0, 80) : '',
-  }
-}
-
-/**
- * One organizer per microphone session. Every call bumps the version and
- * aborts the previous model request; a slow old answer can never cut a newer
- * reply. Timeouts and malformed output fall back to the safe "queue" action.
- */
-export class SpeechOrganizer {
-  private version = 0
-  private controller: AbortController | null = null
-  private latest: OrganizerPlan | null = null
-  private readonly timeoutMs: number
-
-  constructor(private readonly planner: OrganizerPlanner, options: SpeechOrganizerOptions = {}) {
-    this.timeoutMs = Math.max(1, Math.round(options.timeoutMs ?? 1200))
-  }
-
-  async plan(request: OrganizerRequest): Promise<OrganizerPlan | null> {
-    const version = ++this.version
-    this.controller?.abort()
-    const controller = new AbortController()
-    this.controller = controller
-    let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      controller.abort()
-    }, this.timeoutMs)
-
-    try {
-      const raw = await this.planner(request, controller.signal)
-      // A newer utterance started while this request was in flight.
-      if (version !== this.version) return null
-      if (timedOut) return this.fallback(version, 'timeout')
-      const parsed = parsePlannerValue(raw)
-      if (!parsed) return this.fallback(version, 'invalid')
-      const plan: OrganizerPlan = {
-        version,
-        action: parsed.action,
-        ...(parsed.priority === undefined ? {} : { priority: parsed.priority }),
-        ...(parsed.dropSentences === undefined ? {} : { dropSentences: parsed.dropSentences }),
-        ...(parsed.reorder === undefined ? {} : { reorder: parsed.reorder }),
-        reason: parsed.reason,
-      }
-      this.latest = plan
-      return plan
-    } catch {
-      if (version !== this.version) return null
-      return this.fallback(version, timedOut ? 'timeout' : 'error')
-    } finally {
-      clearTimeout(timer)
-      if (this.controller === controller) this.controller = null
-    }
-  }
-
-  /** The only legal gate for applying or cutting: this plan is still newest. */
-  isCurrent(plan: OrganizerPlan | null | undefined): boolean {
-    return plan !== null && plan !== undefined && plan.version === this.version
-  }
-
-  /** An explicit "打断" command wins over any organizer request in flight. */
-  cancel(): void {
-    this.version += 1
-    this.controller?.abort()
-    this.controller = null
-    this.latest = null
-  }
-
-  last(): OrganizerPlan | null {
-    return this.latest
-  }
-
-  private fallback(version: number, reason: string): OrganizerPlan {
-    const plan: OrganizerPlan = { version, action: 'queue', reason }
-    this.latest = plan
-    return plan
   }
 }

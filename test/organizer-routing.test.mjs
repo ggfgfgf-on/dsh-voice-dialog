@@ -4,7 +4,6 @@ import {
   normalizeOrganizerPriority,
   parseOrganizerResponse,
   shouldDeliverOrganizerAction,
-  SpeechOrganizer,
 } from '../lib/organizer.js'
 import { SpeechScheduler } from '../lib/scheduler.js'
 
@@ -14,14 +13,6 @@ function deferred() {
   let resolve
   const promise = new Promise((done) => { resolve = done })
   return { promise, resolve }
-}
-
-const request = {
-  sessionId: 'session-test',
-  text: '等一下先说这个',
-  lane: 'owner',
-  playing: true,
-  queued: 1,
 }
 
 test('parses drop and integer priority, keeping old responses compatible', () => {
@@ -39,16 +30,11 @@ test('parses drop and integer priority, keeping old responses compatible', () =>
   assert.equal(normalizeOrganizerPriority('4'), 4)
 })
 
-test('drop is the only kind of explicit discard accepted by routing', async () => {
+test('drop is the only kind of explicit discard accepted by routing', () => {
   assert.equal(shouldDeliverOrganizerAction('drop'), false)
   assert.equal(shouldDeliverOrganizerAction('ignore'), false)
   assert.equal(shouldDeliverOrganizerAction('queue'), true)
   assert.equal(shouldDeliverOrganizerAction('interrupt'), true)
-
-  const organizer = new SpeechOrganizer(async () => '{"action":"drop","reason":"碎片"}')
-  const plan = await organizer.plan(request)
-  assert.equal(plan.action, 'drop')
-  assert.equal(shouldDeliverOrganizerAction(plan.action), false)
 })
 
 test('priority sorting is stable and lower numbers speak first', async () => {
@@ -85,25 +71,17 @@ test('omitted priority falls back to arrival order', async () => {
   assert.deepEqual(deliveries, ['第一到达', '第二到达', '第三到达'])
 })
 
-test('a timeout falls back to queue and never drops the line', async () => {
-  const organizer = new SpeechOrganizer((_request, signal) => new Promise((_resolve, reject) => {
-    signal.addEventListener('abort', () => reject(new Error('aborted')))
-  }), { timeoutMs: 20 })
-  const plan = await organizer.plan(request)
-  assert.equal(plan.action, 'queue')
-  assert.equal(plan.priority, undefined)
-  assert.equal(shouldDeliverOrganizerAction(plan.action), true)
-
+test('a line without a priority still gets delivered in arrival order', async () => {
   const deliveries = []
   const scheduler = new SpeechScheduler({
     deliver: async (text) => { deliveries.push(text) },
     ownerMode: () => 'queue',
     guestMode: () => 'queue',
   })
-  scheduler.enqueue('owner', '我', Promise.resolve('超时也不能丢'), {
-    priority: plan.priority,
+  scheduler.enqueue('owner', '我', Promise.resolve('没有优先级也不能丢'), {
+    priority: undefined,
     order: 1,
   })
   await tick(40)
-  assert.deepEqual(deliveries, ['超时也不能丢'])
+  assert.deepEqual(deliveries, ['没有优先级也不能丢'])
 })
