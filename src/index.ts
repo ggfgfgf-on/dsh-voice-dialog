@@ -26,6 +26,7 @@ import {
   STYLE_TOKENS, VOCABULARY, type VoiceUnit,
 } from './expression.ts'
 import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
+import { RHYTHM_DEFAULTS, RHYTHM_LIMITS, splitInnerPause } from './rhythm.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
 import { decodeAudioFrames } from './audio-transport.ts'
 import { encodeWavBase64, SeparationService } from './separation.ts'
@@ -313,6 +314,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
       + 'never keeps playing to the end. Declare it before or during a long answer when the listener is likely to talk over you. '
       + 'The owner cannot be renamed or ignored. Do not call this for ordinary questions. The microphone stays on after stop. '
       + 'Action speech declares how your own answer is split, paced and interrupted: every field is optional and only overrides the built-in default, e.g. {"interruption":"sentence","mergeMaxChars":80,"betweenBlocksMs":150}. '
+      + 'Pace is already natural by default: the page leaves a longer silence after a sentence than after a comma, and varies each one (action capabilities publishes the ranges). Declare {"innerPauseMs":120} only when one long line must breathe inside itself (costs one extra request); {"firstBlockChars":5} starts the voice on a shorter opening clause; {"firstBlockDeadlineMs":700} speaks the opening words even if no comma arrived; {"backchannel":"嗯"} says one placeholder word when the listener would otherwise wait in silence; {"warmOpen":true} opens by picking the listener half sentence up after an interruption. '
       + 'Action express is an OPTIONAL assist for delivery detail: it speaks an ordered sequence of steps, each either a speak step (say plus optional tone, pace, stress, breath, lengthen, rate, pitch, volume) or a pause step. ' + 'The optional numbers are per-step adjustments on top of the plugin base and shape THAT step only; they never replace the base. '
       + 'Without it nothing changes and a normal answer keeps today\'s delivery. It shapes how YOUR OWN speech sounds, not a settings panel; you express intent and the plugin owns the acoustics. '
       + 'Tone choice goes coarse to fine: a style word when one overall colour says it (preferred), a tone token plus pace for a single step, and a per-character curve ONLY when the contour itself matters (getting quieter, a lift at the end, a fall after the stress); the curve is fitted into one request, so it never adds a seam. '
@@ -344,6 +346,13 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             betweenBlocksMs: { type: 'number', minimum: 0, maximum: 2000, description: 'Silence inserted between spoken blocks; 0 starts the next block at once.' },
             micSilenceMs: { type: 'number', minimum: 400, maximum: 4000, description: 'Silence that closes the listener utterance before recognition.' },
             separationSilenceMs: { type: 'number', minimum: 400, maximum: 4000, description: 'Tail silence for a separated speaker stream.' },
+            rhythm: { type: 'string', enum: ['natural', 'off'], description: 'Pace between blocks. natural (default) leaves a longer gap after a sentence than after a comma, and varies each one; off makes it metronomic, which is only useful for a test.' },
+            innerPauseMs: { type: 'number', minimum: 0, maximum: 400, description: 'Silence INSIDE one long line, e.g. 120. Use it when a single block is too long to say in one breath. It splits the line and costs one extra synthesis request, so leave it at 0 unless that line really needs to breathe.' },
+            backchannel: { type: 'string', enum: ['none', '嗯', '在', '好'], description: 'One placeholder word said when your answer has not started yet and the listener would otherwise sit in silence, e.g. "嗯". Default none. Use it for a long think right after a direct question, never as a greeting.' },
+            backchannelAfterMs: { type: 'number', minimum: 200, maximum: 3000, description: 'How long the listener may wait before that placeholder word; 900 by default.' },
+            warmOpen: { type: 'boolean', description: 'true opens the reply by picking the listener half sentence up ("对,你刚说那个") before new content. Use it right after you were interrupted, not for a fresh question.' },
+            firstBlockChars: { type: 'number', minimum: 4, maximum: 12, description: 'How few characters the FIRST block may speak on (default 8). Lower starts the voice sooner; 5 is a good value when your reply opens with a long clause.' },
+            firstBlockDeadlineMs: { type: 'number', minimum: 0, maximum: 2000, description: 'If the opening words are still unpunctuated after this long, speak what has arrived, e.g. 700. 0 is off. Use 700-900 when your first sentence tends to be long.' },
           },
         },
         sequence: {
@@ -448,6 +457,11 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             constructs: CONSTRUCTS,
             mark: MARK_LIMITS,
             curve: CURVE_LIMITS,
+            rhythm: {
+              defaults: RHYTHM_DEFAULTS,
+              limits: RHYTHM_LIMITS,
+              meaning: '块与块之间的停顿由页面播放，不合成，所以默认就是自然的：句末比逗号长，每一次都有小幅变化。innerPauseMs 是唯一会多要一次合成的旋钮，默认 0。',
+            },
             granularity: {
               smooth: '默认：只在标点处断句，一句话不会被从中间劈开。',
               fine: '允许在任意两个字之间断开，能逐字改音高，代价是接缝听起来像被切开。',
@@ -1832,7 +1846,18 @@ async function* tapStream(
   // Clause-sized blocks reach TTS as soon as a comma clause is complete,
   // which is earlier than the old whole-sentence tap. Metadata lets the client
   // organizer reorder across sentences without scrambling a sentence itself.
-  const segmenter = new SentenceSegmenter({ firstClauseChars: 8 })
+  // The first block may speak earlier than the historical 8 characters, and a
+  // deadline may release it before punctuation arrives. Both are declarations;
+  // with none the segmenter behaves exactly as before.
+  const firstBlockChars = typeof declaredSpeechProfile.firstBlockChars === 'number'
+    ? declaredSpeechProfile.firstBlockChars : 8
+  const segmenter = new SentenceSegmenter({ firstClauseChars: firstBlockChars })
+  const firstBlockDeadlineMs = declaredSpeechProfile.firstBlockDeadlineMs ?? 0
+  let firstBlockSpoken = false
+  let firstBlockTimer: ReturnType<typeof setTimeout> | null = null
+  const clearFirstBlockTimer = (): void => {
+    if (firstBlockTimer !== null) { clearTimeout(firstBlockTimer); firstBlockTimer = null }
+  }
   const protocol = new VoiceProtocol()
   let directed = false
   let firstTokenLogged = false
@@ -1847,6 +1872,26 @@ async function* tapStream(
   // When the last line actually reached the queue, for the fast lane's floor.
   let lastSpeakAt = 0
   const noteSpeech = (): void => { lastSpeakAt = Date.now() }
+  // One door into the queue. A declared inner pause splits a long line into two
+  // blocks with a real silence between them; with no declaration the text goes
+  // out exactly as before, one request per block. The opening line is never
+  // split: the first sound must stay one request.
+  type EnqueueMeta = Parameters<TtsQueue['enqueue']>[4]
+  const enqueueBlock = (text: string, meta: EnqueueMeta, split: boolean): void => {
+    const innerPauseMs = declaredSpeechProfile.innerPauseMs ?? 0
+    const seam = split && innerPauseMs > 0
+      ? splitInnerPause(text, { innerMs: innerPauseMs })
+      : undefined
+    if (seam === undefined) {
+      queue.enqueue(sessionId, text, replyId, round, meta)
+    } else {
+      queue.enqueue(sessionId, seam.head, replyId, round, { ...meta, gapAfterMs: seam.gapMs })
+      queue.enqueue(sessionId, seam.tail, replyId, round, meta)
+    }
+    firstBlockSpoken = true
+    clearFirstBlockTimer()
+    noteSpeech()
+  }
   // Everything the rewriter already handed to TTS, in order. Drafts are
   // cumulative, so a later draft repeats what the listener has heard; only
   // the unheard tail may reach the queue.
@@ -1878,8 +1923,7 @@ async function* tapStream(
     logSpoken(full, repeated ? 'repeat' : 'rewrite')
     publishedLines.push(full)
     if (!delta || repeated) return
-    queue.enqueue(sessionId, delta, replyId, round, {})
-    noteSpeech()
+    enqueueBlock(delta, {}, true)
   }
   // Speaking layer: after the opener plays verbatim, the rest of the reply is
   // composed as speech from its meaning instead of being polished line by line.
@@ -1934,7 +1978,8 @@ async function* tapStream(
       }
       if (settled) return
       const answer = await model(
-        sessionId, buildSpeakerPrompt(text, publishedLines, question, plan), undefined)
+        sessionId, buildSpeakerPrompt(text, publishedLines, question, plan,
+          { warmOpen: declaredSpeechProfile.warmOpen === true }), undefined)
       finish(parseSpeakerLines(answer))
     })().catch(() => { finish([]) })
   }
@@ -1957,8 +2002,7 @@ async function* tapStream(
       ? {}
       : { sentenceId: block.sentenceId, chunkIndex: block.chunkIndex }
     if (!rewriteEnabled) {
-      queue.enqueue(sessionId, clean, replyId, round, meta)
-      noteSpeech()
+      enqueueBlock(clean, meta, true)
       return
     }
     if (staged === undefined) {
@@ -1966,8 +2010,7 @@ async function* tapStream(
       logSpoken(clean, 'opener')
       publishedLines.push(clean)
       publishedKeys.add(speechKey(clean))
-      queue.enqueue(sessionId, clean, replyId, round, meta)
-      noteSpeech()
+      enqueueBlock(clean, meta, false)
       staged = new StagedRewriter({
         call: (prompt, signal) => (rewriteModel ? rewriteModel(sessionId, prompt, signal) : Promise.resolve('')),
         onPublish: (result) => { for (const line of result.lines) publishRewrite(line) },
@@ -1986,6 +2029,17 @@ async function* tapStream(
   // has already settled. It hands over to the answer the moment real text
   // speaks, and every line it says goes through the same dedupe as the answer.
   if (fastLaneEnabled) {
+    // Optional placeholder word: only a declaration turns it on, and it is said
+    // at most once, before the answer takes the floor.
+    const declaredBackchannel = declaredSpeechProfile.backchannel
+    const backchannel = typeof declaredBackchannel === 'string' ? declaredBackchannel.trim() : ''
+    const placeholder = backchannel && backchannel !== 'none'
+      ? {
+        text: backchannel,
+        afterMs: typeof declaredSpeechProfile.backchannelAfterMs === 'number'
+          ? declaredSpeechProfile.backchannelAfterMs : 900,
+      }
+      : undefined
     servo = new FastLaneServo({
       call: (prompt, signal) => (fastLaneModel ? fastLaneModel(sessionId, prompt, signal) : Promise.resolve('')),
       say: (line) => {
@@ -1993,6 +2047,7 @@ async function* tapStream(
         try { speak(line) } finally { servoSpeaking = false }
       },
       startAt: Date.now(),
+      ...(placeholder === undefined ? {} : { placeholder }),
     })
   }
   const applyVoice = (command: VoiceCommand): void => {
@@ -2065,6 +2120,18 @@ async function* tapStream(
         assistantVisible += visible
         if (!directed) {
           for (const block of segmenter.feedBlocks(visible)) speak(block)
+          // Deadline fallback: the opening words are released even if the model
+          // has not typed the comma yet. The plan and the rewrite still decide
+          // what follows; only the first sound is allowed to be early.
+          if (!firstBlockSpoken && firstBlockDeadlineMs > 0 && firstBlockTimer === null) {
+            firstBlockTimer = setTimeout(() => {
+              firstBlockTimer = null
+              if (firstBlockSpoken) return
+              try {
+                for (const released of segmenter.forcePartial(4)) speak(released)
+              } catch { /* the deadline is best-effort, never fatal */ }
+            }, firstBlockDeadlineMs)
+          }
         }
         outbound = { ...chunk, text: visible }
       }
@@ -2074,6 +2141,7 @@ async function* tapStream(
     }
     completed = true
   } finally {
+    clearFirstBlockTimer()
     servo?.stop('stream-end')
     // Do not speak a fragment from an aborted or failed stream.
     const aborted = finishReason !== null && typeof finishReason === 'object'

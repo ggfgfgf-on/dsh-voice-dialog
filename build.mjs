@@ -43,6 +43,7 @@ const TEST_SURFACES = [
   'planner',
   'queue-control',
   'rewriter',
+  'rhythm',
   'routing',
   'scheduler',
   'segmenter',

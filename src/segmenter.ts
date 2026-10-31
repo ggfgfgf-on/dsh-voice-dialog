@@ -479,6 +479,21 @@ export class SentenceSegmenter {
     return this.flushBlocks().map((block) => block.text)
   }
 
+  /**
+   * Release the buffered prefix although no punctuation has arrived yet. The
+   * first-block deadline uses it: a listener waiting for the opening words
+   * should not wait for the model to type a comma. Nothing is released while
+   * the buffer is still too short to be speech.
+   */
+  forcePartial(minChars = 4): SpeechBlock[] {
+    const out: SpeechBlock[] = []
+    const text = this.buffer.trim()
+    if (visibleChars(text) < Math.max(1, minChars)) return out
+    if (this.buffer.trim().length === 0) return out
+    this.take(out, this.buffer.length, false)
+    return out
+  }
+
   private cleanIncoming(chunk: string): string {
     let raw = this.directiveCarry + chunk
     this.directiveCarry = ''

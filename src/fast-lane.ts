@@ -167,6 +167,8 @@ export interface ServoOptions {
   timeoutMs?: number
   /** Clock origin: when this reply started. */
   startAt?: number
+  /** Said once if no line is ready by then; omitted means never say it. */
+  placeholder?: { text: string; afterMs: number }
 }
 
 /**
@@ -181,6 +183,7 @@ export class FastLaneServo {
   private inFlight = false
   private stopped = false
   private timer: ReturnType<typeof setTimeout> | undefined
+  private placeholderTimer: ReturnType<typeof setTimeout> | undefined
   private lineEndsAt: number
   /** The first line may not start before this instant, however early the top-up says. */
   private readonly notBefore: number
@@ -189,6 +192,21 @@ export class FastLaneServo {
     const now = this.now()
     this.notBefore = (options.startAt ?? now) + SERVO_FIRST_DELAY_MS
     this.lineEndsAt = this.notBefore
+    // Optional placeholder: the listener should not sit in silence while the
+    // reasoning turns into words. Off unless the model declared a word, and it
+    // is said at most once, never after the answer has taken over.
+    const placeholder = options.placeholder
+    const text = typeof placeholder?.text === 'string' ? placeholder.text.trim() : ''
+    if (placeholder && text.length > 0) {
+      const at = (options.startAt ?? now) + Math.max(0, placeholder.afterMs)
+      this.placeholderTimer = setTimeout(() => {
+        this.placeholderTimer = undefined
+        if (this.stopped || this.spoken > 0) return
+        this.spoken += 1
+        this.lineEndsAt = this.now() + spokenMs(text)
+        try { this.options.say(text) } catch { /* one lost word must not stop the answer */ }
+      }, Math.max(0, at - this.now()))
+    }
   }
 
   private now(): number {
@@ -210,6 +228,10 @@ export class FastLaneServo {
     if (this.timer !== undefined) {
       clearTimeout(this.timer)
       this.timer = undefined
+    }
+    if (this.placeholderTimer !== undefined) {
+      clearTimeout(this.placeholderTimer)
+      this.placeholderTimer = undefined
     }
   }
 

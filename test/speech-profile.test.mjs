@@ -11,6 +11,13 @@ const DEFAULT_PROFILE = {
   betweenBlocksMs: 0,
   micSilenceMs: 900,
   separationSilenceMs: 1600,
+  rhythm: 'natural',
+  innerPauseMs: 0,
+  backchannel: 'none',
+  backchannelAfterMs: 900,
+  warmOpen: false,
+  firstBlockChars: 8,
+  firstBlockDeadlineMs: 0,
 }
 
 test('no declaration resolves to exactly today\'s behaviour', () => {

@@ -28,6 +28,7 @@ import {
   getPreferences, setPreferences, subscribePreferences,
   SPEAKER_THRESHOLD_MAX, SPEAKER_THRESHOLD_MIN, type VoiceDialogPreferences,
 } from './preferences.ts'
+import { rhythmGapMs } from './rhythm.ts'
 import { VolumeRig } from './volume-gain.ts'
 import { createVolumeReporter } from './volume-report.ts'
 import { SpeechScheduler, type GuestMode } from './scheduler.ts'
@@ -1327,8 +1328,17 @@ class TtsPlayer {
     if (this.onPlay) { try { this.onPlay(frame) } catch { /* logging only */ } }
     this.audio.onended = () => {
       this.cleanupUrl()
-      // A per-block gap wins over the profile gap; nothing is inserted otherwise.
-      const gapMs = typeof frame.gapAfterMs === 'number' ? frame.gapAfterMs : this.speechProfile.betweenBlocksMs
+      // A per-block gap wins; otherwise the natural rhythm decides: a sentence
+      // ends with a longer silence than a comma, and each gap varies a little.
+      // The gap is playback-only, so it never changes the synthesized bytes.
+      const gapMs = typeof frame.gapAfterMs === 'number'
+        ? frame.gapAfterMs
+        : this.speechProfile.rhythm === 'off'
+          ? this.speechProfile.betweenBlocksMs
+          : Math.max(
+            this.speechProfile.betweenBlocksMs,
+            rhythmGapMs(frame.text, {}, (frame.sentenceId ?? 0) * 31 + (frame.chunkIndex ?? 0)),
+          )
       if (gapMs > 0 && this.queue.length > 0) {
         this.gapTimer = setTimeout(() => {
           this.gapTimer = null

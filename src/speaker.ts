@@ -20,12 +20,19 @@ export interface SpeakerAttentionInput {
   budget: number
 }
 
+/** How the composer should open; only declared intent changes the prompt. */
+export interface SpeakerOpenStyle {
+  /** The listener interrupted: pick his half sentence up before anything new. */
+  warmOpen?: boolean
+}
+
 /** One compose request: the written reply, what was already heard, and the attention plan. */
 export function buildSpeakerPrompt(
   text: string,
   heard: readonly string[],
   question?: string,
   attention?: SpeakerAttentionInput,
+  style?: SpeakerOpenStyle,
 ): string {
   const body = text.trim().slice(0, 900)
   const already = heard
@@ -36,6 +43,9 @@ export function buildSpeakerPrompt(
   const rows = [
     question ? '对方刚说的: ' + question.trim().slice(0, 120) : '',
     already ? '已经说过的: ' + already : '',
+    style?.warmOpen
+      ? '接话方式: 他刚打断你。先用半句把他说的接住(比如"对,你刚说那个"),再说新内容,不要从头重讲。'
+      : '',
   ].filter(Boolean)
   // With an attention plan the composer speaks from the attended text only:
   // lower-scored blocks are already gone, and the line budget is explicit.
