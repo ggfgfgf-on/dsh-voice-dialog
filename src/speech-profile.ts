@@ -18,6 +18,8 @@ export interface SpeechProfile {
   mergeRunMaxItems?: number
   /** Silence inserted between consecutive spoken blocks; 0 = start at once. */
   betweenBlocksMs?: number
+  /** Longest raw-corpus chunk in characters before it is split; 0 = the pauses decide. */
+  chunkMaxChars?: number
   /** Mic silence that closes an utterance; undefined keeps the user's setting. */
   micSilenceMs?: number
   /** Per-source tail silence in continuous separation; undefined keeps the user's setting. */
@@ -54,6 +56,7 @@ export const DEFAULT_SPEECH_PROFILE: Required<SpeechProfile> = {
   mergeRunMaxChars: 160,
   mergeRunMaxItems: 6,
   betweenBlocksMs: 0,
+  chunkMaxChars: 0,
   micSilenceMs: 900,
   separationSilenceMs: 1600,
   rhythm: 'natural',
@@ -73,6 +76,7 @@ const NUMERIC_RANGES: ReadonlyArray<readonly [keyof SpeechProfile, number, numbe
   ['mergeRunMaxChars', 8, 1200],
   ['mergeRunMaxItems', 1, 32],
   ['betweenBlocksMs', 0, 2000],
+  ['chunkMaxChars', 0, 400],
   ['micSilenceMs', 400, 4000],
   ['separationSilenceMs', 400, 4000],
   ['innerPauseMs', 0, 400],

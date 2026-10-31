@@ -42,7 +42,7 @@ import {
   decideBargeIn, isSameSentence, orderBargeInFrames, splitAtSentenceBoundary,
 } from './barge-in.ts'
 import { inputGateTraceFields, type InputGateDecision } from './input-gate.ts'
-import { decidePlan } from './plan.ts'
+import { decideChunks, decidePlan } from './plan.ts'
 import { chunkRawSegments } from './chunker.ts'
 import { createRecordStream } from './record-stream.ts'
 import { createPlaybackRecorder } from './playback-record.ts'
@@ -1992,23 +1992,43 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           text: piece.text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, ''),
         }))
         : [{ text: spoken, at: arrivedAt, lane, canonical }]
+      // The cap is the model's to declare: a declaration wins over the page
+      // setting, so how a long utterance is cut belongs to the speech interface.
+      const declaredCut = sharedPlayer.declaredSpeechSettings().chunkMaxChars
+      const chunkCap = typeof declaredCut === 'number' ? declaredCut : prefs.chunkMaxChars
       const rawChunks = chunkRawSegments(rawSegments, {
         pauseMs: UTTERANCE_COALESCE_WINDOW_MS,
-        maxChars: prefs.chunkMaxChars,
+        maxChars: chunkCap,
       })
       // One chunk is the normal case and keeps the coalescer's deduped text
-      // byte-identical. More than one means the raw corpus passed the declared
-      // cap: the head is planned, the tail is queued as its own deliveries.
+      // byte-identical. More than one means the raw corpus passed the cap:
+      // every piece is planned, so a split tail cannot skip the organization
+      // layer and arrive with a mode nobody decided.
       const chunk = { text: rawChunks.length === 1 ? spoken : (rawChunks[0]?.text ?? spoken) }
       if (rawChunks.length > 1) {
         voiceRecordStream.append('custom', {
-          kind: 'chunk-cut', chunks: rawChunks.length, cap: prefs.chunkMaxChars,
+          kind: 'chunk-cut', chunks: rawChunks.length, cap: chunkCap,
         })
-        for (const tail of rawChunks.slice(1)) {
+        const tailPlan = decideChunks(
+          rawChunks.slice(1).map((piece) => piece.text),
+          { lane, canonical, playing: sharedPlayer.busy(), queued: scheduler.status().queued },
+        )
+        for (const tail of tailPlan) {
+          if (tail.item.kind === 'ignore') continue
           const tailEntry = scheduler.enqueue(lane, canonical, Promise.resolve(tail.text), {
             order: arrivalOrder,
+            ...(tail.item.priority === undefined ? {} : { priority: tail.item.priority }),
           })
-          tailEntry.setMode('queue')
+          tailEntry.setMode(tail.item.priority === -1 ? 'steer' : 'queue')
+          const tailEvent = voicePlanStream.append('plan', {
+            kind: tail.item.kind, lane: tail.item.lane, priority: tail.item.priority ?? 0,
+            reason: tail.item.reason, source: tail.item.source, text: tail.text.slice(0, 40),
+          })
+          queuePlanPost(sessionId, {
+            seq: tailEvent.seq, at: tailEvent.at, replyId: sharedPlayer.playingReplyId ?? '',
+            kind: tail.item.kind, lane: tail.item.lane, priority: tail.item.priority ?? 0,
+            delayMs: 0, text: tail.text, reason: tail.item.reason, source: tail.item.source,
+          })
         }
       }
       // Cheap gates before the 860 ms organizer request: guest noise and the

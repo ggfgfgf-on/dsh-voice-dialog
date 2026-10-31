@@ -62,6 +62,7 @@ test('speech profile: the new knobs default to today\'s behaviour', () => {
   assert.equal(DEFAULT_SPEECH_PROFILE.backchannel, '')
   assert.equal(DEFAULT_SPEECH_PROFILE.backchannelAfterMs, 0)
   assert.equal(DEFAULT_SPEECH_PROFILE.warmOpen, false)
+  assert.equal(DEFAULT_SPEECH_PROFILE.chunkMaxChars, 0)
   assert.equal(DEFAULT_SPEECH_PROFILE.firstBlockChars, 8)
   assert.equal(DEFAULT_SPEECH_PROFILE.firstBlockDeadlineMs, 0)
   // Nothing declared: the resolved profile is byte-for-byte the default.

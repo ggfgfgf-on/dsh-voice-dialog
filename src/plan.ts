@@ -305,6 +305,25 @@ export function decidePlan(chunk: PlanChunk, state: PlanState): PlanItem[] {
   return [{ kind: 'reply', lane: 'slow', reason: 'owner-floor', source: 'rule' }]
 }
 
+/**
+ * Plan every chunk of one raw utterance. A split tail must not skip the
+ * organization layer: it goes through the same decision, with the duplicate
+ * rule carried from one chunk to the next.
+ */
+export function decideChunks(
+  chunks: readonly string[],
+  state: PlanState,
+): { text: string; item: PlanItem }[] {
+  const out: { text: string; item: PlanItem }[] = []
+  let previous = state.previousText
+  for (const text of chunks) {
+    const item = decidePlan({ text }, { ...state, previousText: previous })[0]
+    out.push({ text, item })
+    previous = text
+  }
+  return out
+}
+
 /** Turn a late model verdict into the same plan vocabulary. */
 export function planFromVerdict(verdict: InputVerdict, reason = 'model'): PlanItem {
   if (verdict === 'steer') {

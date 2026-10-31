@@ -9,6 +9,7 @@ const DEFAULT_PROFILE = {
   mergeRunMaxChars: 160,
   mergeRunMaxItems: 6,
   betweenBlocksMs: 0,
+  chunkMaxChars: 0,
   micSilenceMs: 900,
   separationSilenceMs: 1600,
   rhythm: 'natural',

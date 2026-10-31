@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { decidePlan, planAck, planFromVerdict } from '../lib/plan.js'
+import { decideChunks, decidePlan, planAck, planFromVerdict } from '../lib/plan.js'
 
 const owner = { lane: 'owner', canonical: '我' }
 
@@ -44,6 +44,19 @@ test('plan: the guest policy is applied here, so the lane never guesses', () => 
   const queue = decidePlan({ text: '老板在哪里' }, { ...guest, guestMode: 'queue' })[0]
   assert.equal(queue.kind, 'reply')
   assert.equal(queue.lane, 'slow')
+})
+
+test('plan: a split corpus plans every chunk, the tail included', () => {
+  const planned = decideChunks(['帮我把报告打开', '然后翻到第三页'], owner)
+  assert.equal(planned.length, 2)
+  assert.equal(planned[0].item.kind, 'reply')
+  // A continuation tail is planned as a hold by the rule engine, not skipped.
+  assert.equal(planned[1].item.kind, 'hold')
+  assert.equal(planned[1].item.source, 'rule')
+  // The duplicate rule carries across chunks: a repeated tail is ignored, not replayed.
+  const repeated = decideChunks(['打开报告', '打开报告'], owner)
+  assert.equal(repeated[1].item.kind, 'ignore')
+  assert.equal(repeated[1].item.reason, 'duplicate-previous')
 })
 
 test('plan: a late model verdict maps into the same vocabulary', () => {
