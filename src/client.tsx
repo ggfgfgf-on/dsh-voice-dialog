@@ -317,9 +317,11 @@ function reportSpeech(sessionId: string, speech: 'start' | 'end' | 'speaker', sp
 }
 
 /** Whether the assistant's own mouth is open right now. */
-function reportPlayback(sessionId: string, playing: boolean): void {
+function reportPlayback(sessionId: string, playing: boolean, replyId?: string): void {
   // L1 records the phase, not the heartbeat: one line per change.
-  playbackRecorder.note(sessionId, playing ? 'playing' : 'idle', {})
+  playbackRecorder.note(sessionId, playing ? 'playing' : 'idle', {
+    replyId: typeof replyId === 'string' ? replyId : '',
+  })
   void fetch(apiUrl('/voice-state'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -661,6 +663,8 @@ class TtsPlayer {
   /** Host-side cleanup when part or all of the spoken queue is discarded. */
   onCancelTts: ((sessionId: string, replyId?: string) => void) | undefined
   private lastReplyId: string | undefined
+  /** Reply the mouth is currently on; the L1 events carry it. */
+  get playingReplyId(): string | undefined { return this.lastReplyId }
   /** Reply id of the most recently queued frame, to detect a superseded answer. */
   private lastQueuedReplyId: string | undefined
   private lastTexts: string[] = []
@@ -1704,7 +1708,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       })
     }
     sharedPlayer.onPlayback = (playing, sessionId) => {
-      if (sessionId) reportPlayback(sessionId, playing)
+      if (sessionId) reportPlayback(sessionId, playing, sharedPlayer.playingReplyId)
     }
     sharedPlayer.onCancelTts = (sessionId, replyId) => cancelHostTts(sessionId, replyId)
     return () => {
@@ -2091,7 +2095,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           reason: action.reason, source: action.source, text: action.text ?? '',
         })
         queuePlanPost(sessionId, {
-          seq: planEvent.seq, at: planEvent.at, replyId: '',
+          seq: planEvent.seq, at: planEvent.at, replyId: sharedPlayer.playingReplyId ?? '',
           kind: action.kind, lane: action.lane, priority: action.priority ?? 0,
           delayMs: 0, text: action.text ?? '', reason: action.reason, source: action.source,
         })
@@ -2157,7 +2161,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         reason: guestAction.reason, source: guestAction.source, text: guestAction.text ?? '',
       })
       queuePlanPost(sessionId, {
-        seq: guestPlanEvent.seq, at: guestPlanEvent.at, replyId: '',
+        seq: guestPlanEvent.seq, at: guestPlanEvent.at, replyId: sharedPlayer.playingReplyId ?? '',
         kind: guestAction.kind, lane: guestAction.lane, priority: guestAction.priority ?? 0,
         delayMs: 0, text: guestAction.text ?? '', reason: guestAction.reason, source: guestAction.source,
       })
