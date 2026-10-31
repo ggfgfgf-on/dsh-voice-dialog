@@ -26,6 +26,8 @@ import {
   STYLE_TOKENS, VOCABULARY, type VoiceUnit,
 } from './expression.ts'
 import { normalizeSpeechProfile, type SpeechProfile } from './speech-profile.ts'
+import { planAck, type PlanItem } from './plan.ts'
+import { createRecordStream } from './record-stream.ts'
 import { RHYTHM_DEFAULTS, RHYTHM_LIMITS, splitInnerPause } from './rhythm.ts'
 import { decodeWavBase64, VoiceprintService } from './voiceprint.ts'
 import { decodeAudioFrames } from './audio-transport.ts'
@@ -137,6 +139,18 @@ function storedRate(fallback: number): number {
 }
 
 /** Apply the read-aloud stream and its transport. */
+/**
+ * L1 on the host side: what the reply path actually sends is recorded, not
+ * judged. Persistence is a side channel, batched, and can never reach the
+ * live path.
+ */
+const hostRecord = createRecordStream({
+  capacity: 256,
+  sink: (lines) => {
+    appendFileSync(join(tmpdir(), 'dsh-voice-record.jsonl'), lines.join('\n') + '\n')
+  },
+})
+
 export function apply(ctx: Context, config: Config): void {
   const base = config.basePath.replace(/\/+$/, '') || BOOTSTRAP_BASE
 /** Two "separated" streams this similar are one voice split in half. */
@@ -1877,7 +1891,12 @@ async function* tapStream(
   // out exactly as before, one request per block. The opening line is never
   // split: the first sound must stay one request.
   type EnqueueMeta = Parameters<TtsQueue['enqueue']>[4]
-  const enqueueBlock = (text: string, meta: EnqueueMeta, split: boolean): void => {
+  const enqueueBlock = (item: PlanItem, meta: EnqueueMeta, split: boolean): void => {
+    // L5 only materializes: the text, the order and the priority are already
+    // decided in plan.ts, so nothing here may re-rank or re-time the line.
+    const text = typeof item.text === 'string' ? item.text : ''
+    if (text.length === 0) return
+    hostRecord.append('reply', { text, reason: item.reason, priority: item.priority ?? 0 })
     const innerPauseMs = declaredSpeechProfile.innerPauseMs ?? 0
     const seam = split && innerPauseMs > 0
       ? splitInnerPause(text, { innerMs: innerPauseMs })
@@ -1923,7 +1942,7 @@ async function* tapStream(
     logSpoken(full, repeated ? 'repeat' : 'rewrite')
     publishedLines.push(full)
     if (!delta || repeated) return
-    enqueueBlock(delta, {}, true)
+    enqueueBlock({ kind: 'reply', lane: 'slow', reason: 'rewrite', source: 'model', text: delta }, {}, true)
   }
   // Speaking layer: after the opener plays verbatim, the rest of the reply is
   // composed as speech from its meaning instead of being polished line by line.
@@ -2002,7 +2021,7 @@ async function* tapStream(
       ? {}
       : { sentenceId: block.sentenceId, chunkIndex: block.chunkIndex }
     if (!rewriteEnabled) {
-      enqueueBlock(clean, meta, true)
+      enqueueBlock({ kind: 'reply', lane: 'slow', reason: 'answer-direct', source: 'model', text: clean }, meta, true)
       return
     }
     if (staged === undefined) {
@@ -2010,7 +2029,7 @@ async function* tapStream(
       logSpoken(clean, 'opener')
       publishedLines.push(clean)
       publishedKeys.add(speechKey(clean))
-      enqueueBlock(clean, meta, false)
+      enqueueBlock({ kind: 'reply', lane: 'slow', reason: 'answer-opener', source: 'model', text: clean }, meta, false)
       staged = new StagedRewriter({
         call: (prompt, signal) => (rewriteModel ? rewriteModel(sessionId, prompt, signal) : Promise.resolve('')),
         onPublish: (result) => { for (const line of result.lines) publishRewrite(line) },
@@ -2031,14 +2050,21 @@ async function* tapStream(
   if (fastLaneEnabled) {
     // Optional placeholder word: only a declaration turns it on, and it is said
     // at most once, before the answer takes the floor.
-    const declaredBackchannel = declaredSpeechProfile.backchannel
-    const backchannel = typeof declaredBackchannel === 'string' ? declaredBackchannel.trim() : ''
-    const placeholder = backchannel && backchannel !== 'none'
-      ? {
-        text: backchannel,
-        afterMs: typeof declaredSpeechProfile.backchannelAfterMs === 'number'
-          ? declaredSpeechProfile.backchannelAfterMs : 0,
-      }
+    // The acknowledgement is a plan item (L3): planAck carries the model's own
+    // wording, and the fast lane (L4) decides only how to put it out.
+    const ackItem = planAck(
+      String(declaredSpeechProfile.backchannel ?? ''),
+      typeof declaredSpeechProfile.backchannelAfterMs === 'number' ? declaredSpeechProfile.backchannelAfterMs : 0,
+    )
+    if (ackItem) {
+      hostRecord.append('plan', {
+        kind: ackItem.kind, lane: ackItem.lane, reason: ackItem.reason,
+        delayMs: ackItem.delayMs ?? 0,
+      })
+    }
+    const ackText = ackItem && typeof ackItem.text === 'string' ? ackItem.text : ''
+    const placeholder = ackItem && ackText.length > 0
+      ? { text: ackText, afterMs: typeof ackItem.delayMs === 'number' ? ackItem.delayMs : 0 }
       : undefined
     servo = new FastLaneServo({
       call: (prompt, signal) => (fastLaneModel ? fastLaneModel(sessionId, prompt, signal) : Promise.resolve('')),

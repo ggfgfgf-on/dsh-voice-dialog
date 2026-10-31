@@ -41,7 +41,10 @@ import { parseQueueControl } from './queue-control.ts'
 import {
   decideBargeIn, isSameSentence, orderBargeInFrames, splitAtSentenceBoundary,
 } from './barge-in.ts'
-import { decideInput, inputGateTraceFields, ruleInputDecision, type InputGateDecision } from './input-gate.ts'
+import { inputGateTraceFields, type InputGateDecision } from './input-gate.ts'
+import { decidePlan } from './plan.ts'
+import { chunkRawSegments } from './chunker.ts'
+import { createRecordStream } from './record-stream.ts'
 import { resumeDelayForUtterance, YIELD_RESUME_AFTER_SPEECH_MS } from './yield.ts'
 import { echoGate, noiseGate, type SpokenSample } from './gates.ts'
 import { FrameWindow, orderOf, playBlockReason, shouldPlayFrame } from './frame-order.ts'
@@ -56,6 +59,18 @@ import {
 import {
   canReuseSpeculativeAsr, firstDelivery, shouldCallGate,
 } from './routing.ts'
+
+/**
+ * L1 记录层：麦克风/ASR 的每一段转写、声纹标签和客户端事件都从这里追加。
+ * Nothing here judges or drops anything: the plan layer does that.
+ */
+const voiceRecordStream = createRecordStream({ capacity: 256 })
+
+/**
+ * L3 计划流：decidePlan 的每一条输出都写在这里，与原始流同一个实现，
+ * so a delivery can be replayed instead of guessed at.
+ */
+const voicePlanStream = createRecordStream({ capacity: 128 })
 
 /** Gain telemetry: batched samples to the host JSONL log; never audio or transcript. */
 const volumeReporter = createVolumeReporter({
@@ -1933,6 +1948,10 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         return
       }
       const spoken = text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, '')
+      // L1 records the raw line, L2 cuts the raw corpus into chunks, L3 plans.
+      voiceRecordStream.append('transcript', { text: spoken, lane, canonical: canonical || lane })
+      const rawChunks = chunkRawSegments([{ text: spoken, at: Date.now(), lane, canonical }])
+      const chunk = { text: rawChunks[0]?.text ?? spoken }
       // Cheap gates before the 860 ms organizer request: guest noise and the
       // microphone hearing its own playback. Both are conservative and leave
       // anything a person would consider a sentence alone.
@@ -2003,23 +2022,31 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         // should take the floor. Its verdict only ever corrects an entry that
         // has not started, so a slow or failed judgment costs nothing.
         const previousOwnerLine = lastOwnerInputRef.current
-        const gateInput = {
-          text: spoken,
+        const action = decidePlan(chunk, {
           lane,
+          canonical,
           playing: sharedPlayer.busy(),
           queued: status.queued,
           ...(previousOwnerLine ? { previousText: previousOwnerLine } : {}),
-        }
-        const ruled = ruleInputDecision(gateInput)
-        if (ruled?.verdict === 'drop') {
+        })[0]
+        voicePlanStream.append('plan', {
+          kind: action.kind, lane: action.lane, priority: action.priority ?? 0,
+          reason: action.reason, source: action.source, text: action.text ?? '',
+        })
+        if (action.kind === 'ignore') {
           release()
           markUtteranceStage(trace, 'enqueue')
-          finish({ organizerAction: 'input-gate:drop:' + ruled.reason }, ruled)
+          finish({ organizerAction: 'plan:ignore:' + action.reason }, {
+            verdict: 'drop',
+            source: action.source === 'model' ? 'model' : 'rule',
+            verdictMs: 0,
+            reason: action.reason,
+          })
           return
         }
         lastOwnerInputRef.current = spoken
         let entry: ReturnType<typeof enqueue>
-        if (ruled?.verdict === 'steer') {
+        if (action.kind === 'reply' && action.lane === 'fast') {
           // A spoken stop still steers delivery, but the page does not cut:
           // the host/model sees the line and decides how to stop the mouth.
           organizerRef.current?.cancel()
@@ -2027,7 +2054,12 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
           entry = enqueue(text, -1)
           entry.setMode('steer')
           markUtteranceStage(trace, 'enqueue')
-          finish({ organizerAction: 'input-gate:steer:' + ruled.source }, ruled)
+          finish({ organizerAction: 'plan:steer:' + action.reason }, {
+            verdict: 'steer',
+            source: action.source === 'model' ? 'model' : 'rule',
+            verdictMs: 0,
+            reason: action.reason,
+          })
           schedulePlan(true)
           return
         }
@@ -2037,6 +2069,7 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         // second model scoring it can only add latency and get it wrong.
         // Only the deterministic rules above may reject a line outright.
         const bargeIn = decideBargeIn({ lane: 'owner', playing: sharedPlayer.busy() })
+        voiceRecordStream.append('barge-in', { action: bargeIn.action, reason: bargeIn.reason })
         // Report-only: queue the owner's words; keep the current audio playing.
         entry = enqueue(text)
         entry.setMode('queue')
@@ -2049,11 +2082,23 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       // default and a guest verdict can never cut the owner's playback unless
       // that speaker was explicitly switched to steer.
       const guestMode = effectiveGuestMode(sessionId, canonical)
+      const guestAction = decidePlan({ text: spoken }, {
+        lane,
+        canonical,
+        playing: sharedPlayer.busy(),
+        queued: status.queued,
+        guestMode,
+      })[0]
+      const guestSteer = guestAction.kind === 'reply' && guestAction.lane === 'fast'
+      voicePlanStream.append('plan', {
+        kind: guestAction.kind, lane: guestAction.lane, priority: guestAction.priority ?? 0,
+        reason: guestAction.reason, source: guestAction.source, text: guestAction.text ?? '',
+      })
       // A guest speaking pauses the owner's answer for a moment; it resumes as
       // soon as the guest is routed, because guest speech only queues.
       release()
-      const entry = enqueue(text, guestMode === 'steer' ? -1 : undefined)
-      entry.setMode(guestMode === 'steer' ? 'steer' : 'queue')
+      const entry = enqueue(text, guestSteer ? -1 : undefined)
+      entry.setMode(guestSteer ? 'steer' : 'queue')
       if (shouldCallGate({ playing: sharedPlayer.busy(), queued: status.queued }, imperative)) {
         let current = organizerRef.current
         if (!current) {
@@ -2074,15 +2119,15 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
             entry.drop()
             return
           }
-          if (guestMode === 'steer' && plan.action === 'interrupt') {
+          if (guestSteer && plan.action === 'interrupt') {
             sharedPlayer.cutNow()
             entry.setMode('steer')
           }
         }).catch(() => undefined)
       }
       markUtteranceStage(trace, 'enqueue')
-      finish({ organizerAction: guestMode === 'steer' ? 'guest-steer-fastpath' : 'guest-queue-fastpath' })
-      schedulePlan(guestMode === 'steer')
+      finish({ organizerAction: guestSteer ? 'guest-steer-fastpath' : 'guest-queue-fastpath' })
+      schedulePlan(guestSteer)
     }).catch((failure: unknown) => {
       release()
       console.warn('[dsh-voice-dialog] organizer routing failed', failure)
