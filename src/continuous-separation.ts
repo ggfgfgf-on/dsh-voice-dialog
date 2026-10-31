@@ -152,6 +152,17 @@ export function dedupeTranscript(previous: string, next: string): string {
   return after
 }
 
+/** One in-flight prewarm job, keyed by the exact audio window it was started for. */
+interface PrewarmJob {
+  received: number
+  lastActivity: number
+  windowStart: number
+  available: number
+  result?: ContinuousWindowResult
+  timing?: SeparationWindowTiming
+  failed?: boolean
+}
+
 /**
  * Consume a continuous 16 kHz microphone stream.
  *
@@ -188,15 +199,7 @@ export class ContinuousSeparation {
    * the speaker is still finishing the sentence, so the 374 ms inference is
    * not paid again after the VAD decides the utterance ended.
    */
-  private prewarmJob: {
-    received: number
-    lastActivity: number
-    windowStart: number
-    available: number
-    result?: ContinuousWindowResult
-    timing?: SeparationWindowTiming
-    failed?: boolean
-  } | null = null
+  private prewarmJob: PrewarmJob | null = null
   private prewarmPromise: Promise<void> | null = null
   private prewarmToken = 0
   /**
@@ -303,7 +306,7 @@ export class ContinuousSeparation {
     const window = new Float32Array(this.windowSamples)
     window.set(this.buffer.subarray(offset, offset + available), 0)
     const token = ++this.prewarmToken
-    const job = {
+    const job: PrewarmJob = {
       received: this.received,
       lastActivity: this.lastActivitySample,
       windowStart,

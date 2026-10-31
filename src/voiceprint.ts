@@ -209,7 +209,7 @@ function download(url: string, dest: string, redirects = 0): Promise<void> {
   return new Promise((resolve, reject) => {
     if (redirects > 6) { reject(new Error('声纹模型下载重定向过多')); return }
     const proxy = proxyUrl()
-    const Agent = (httpsProxyAgent as unknown as { HttpsProxyAgent: new (url: string) => object }).HttpsProxyAgent
+    const Agent = (httpsProxyAgent as unknown as { HttpsProxyAgent: new (url: string) => import('node:http').Agent }).HttpsProxyAgent
     const agent = proxy ? new Agent(proxy) : undefined
     const req = httpsRequest(url, { agent, headers: { 'user-agent': 'dsh-voice-dialog' } }, (res) => {
       const status = res.statusCode ?? 0
@@ -636,7 +636,7 @@ export class VoiceprintService {
       label: identity.label,
       owner: identity.owner,
       similarity: Number(identity.similarity.toFixed(4)),
-      ...this.lastDecision,
+      ...(this.lastDecision ?? {}),
     })
     return identity
   }

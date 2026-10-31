@@ -103,7 +103,7 @@ const MERGE_JOINER = '，'
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 /** Parse an SSML percent ('+10%', 'default') back into a number. */
-function parsePercent(value: string | undefined): number {
+function parsePercent(value: string | number | undefined): number {
   if (typeof value !== 'string') return 0
   const trimmed = value.trim()
   if (trimmed === '' || trimmed === 'default') return 0
@@ -170,7 +170,7 @@ export function createEdgeTts(): MsEdgeTTS {
   const proxy = resolveProxyUrl()
   const useProxy = proxy !== undefined && !bypassProxy(EDGE_TTS_HOST)
   const agent = useProxy
-    ? new (httpsProxyAgent as unknown as { HttpsProxyAgent: new (url: string) => object }).HttpsProxyAgent(proxy)
+    ? new (httpsProxyAgent as unknown as { HttpsProxyAgent: new (url: string) => import('node:http').Agent }).HttpsProxyAgent(proxy)
     : undefined
   if (agent && !proxyNoticePrinted) {
     proxyNoticePrinted = true
@@ -194,6 +194,8 @@ interface QueuedSentence {
   chunkIndex?: number
   prosody?: ProsodyOptions
   gapAfterMs?: number
+  /** Pre-built SSML for a marked step; takes the raw path instead of text. */
+  ssml?: string
 }
 
 /**
