@@ -73,6 +73,10 @@ export interface UtteranceTiming {
   asrInferMs?: number
   /** Measured split of the separation wait, when available. */
   separation?: SeparationLatencyDetail
+  /** Partial recognition calls spent during the silence wait (0 = off). */
+  partialAsrCalls?: number
+  /** Wall time those partial calls cost, in milliseconds. */
+  partialAsrMs?: number
 }
 
 export interface UtteranceRecord {
@@ -122,6 +126,10 @@ export interface UtteranceRecord {
   decomposedMs?: number
   /** enqueue (or asr_done) minus decomposedMs; near zero means the split explains the total. */
   residualMs?: number
+  /** Partial recognition calls made while this utterance was still open. */
+  partialAsrCalls?: number
+  /** Total wall time those partial calls took, in milliseconds. */
+  partialAsrMs?: number
 }
 
 export interface TraceInput {
@@ -149,7 +157,7 @@ export function sanitizeLatencyRecord(value: unknown): Record<string, unknown> |
     'endpointWaitMs', 'separationWaitMs', 'asrQueueMs', 'asrWallMs', 'asrTransportMs', 'asrInferMs',
     'decomposedMs', 'residualMs', 'separationQueueMs', 'separationModelMs', 'separationWallMs',
     'separationPrewarmWaitMs', 'separationWindowMs', 'separationModelCalls',
-    'separationSelfSimilarity', 'separationOwnerSimilarity'] as const) {
+    'separationSelfSimilarity', 'separationOwnerSimilarity', 'partialAsrCalls', 'partialAsrMs'] as const) {
     const field = record[key]
     if (typeof field === 'number' && Number.isFinite(field)) out[key] = field
     else if (typeof field === 'boolean') out[key] = field
@@ -333,6 +341,10 @@ export function buildUtteranceRecord(
     ...(options.retracted === undefined ? {} : { retracted: options.retracted }),
     ...(options.prewarm === undefined ? {} : { prewarm: options.prewarm }),
     ...separationFields,
+    ...(typeof timing.partialAsrCalls === 'number' && Number.isFinite(timing.partialAsrCalls)
+      ? { partialAsrCalls: Math.max(0, Math.round(timing.partialAsrCalls)) } : {}),
+    ...(typeof timing.partialAsrMs === 'number' && Number.isFinite(timing.partialAsrMs)
+      ? { partialAsrMs: Math.max(0, Math.round(timing.partialAsrMs)) } : {}),
     ...(clamped ? { clamped: true } : {}),
     ...Object.fromEntries(Object.entries(derived).filter(([, value]) => value !== undefined)),
   }

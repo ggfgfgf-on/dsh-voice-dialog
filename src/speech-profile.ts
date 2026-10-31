@@ -87,7 +87,7 @@ const NUMERIC_RANGES: ReadonlyArray<readonly [keyof SpeechProfile, number, numbe
   ['mergeRunMaxItems', 1, 32],
   ['betweenBlocksMs', 0, 2000],
   ['chunkMaxChars', 0, 400],
-  ['micSilenceMs', 400, 4000],
+  ['micSilenceMs', 0, 4000],
   ['separationSilenceMs', 400, 4000],
   ['innerPauseMs', 0, 400],
   ['backchannelAfterMs', 0, 5000],

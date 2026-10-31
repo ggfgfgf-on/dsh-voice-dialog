@@ -42,9 +42,11 @@ const TEST_SURFACES = [
   'organizer',
   'organizer-compact',
   'organizer-history',
+  'partial-asr',
   'plan',
   'plan-log',
   'planner',
+  'preferences',
   'playback-record',
   'queue-control',
   'record-log',
@@ -88,6 +90,12 @@ const SPECIAL_SURFACES = [
   },
   {
     entry: 'continuous-separation',
+    options: { bundle: true, logLevel: 'silent' },
+  },
+  {
+    // Imports barge-in/partial-asr with .ts specifiers (client-bundled modules),
+    // so the test copy is bundled rather than transpiled in place.
+    entry: 'mic',
     options: { bundle: true, logLevel: 'silent' },
   },
   {

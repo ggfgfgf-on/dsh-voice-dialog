@@ -44,6 +44,7 @@ import {
 import { inputGateTraceFields, type InputGateDecision } from './input-gate.ts'
 import { decideChunks, decidePlan } from './plan.ts'
 import { createEarlyStart, earlyStartEnabled, type EarlyStart } from './early-start.ts'
+import { dedupePartial, partialIntervalFor, shouldFirePartial } from './partial-asr.ts'
 import { chunkRawSegments } from './chunker.ts'
 import { createRecordStream } from './record-stream.ts'
 import { createPlaybackRecorder } from './playback-record.ts'
@@ -156,6 +157,7 @@ const BUNDLE_ID = 'dsh-voice-dialog'
 /** Ducking, cut fades and volume live in volume-gain.ts: one writer, one target. */
 /** Tail-silence presets; any other value may be typed into the custom field. */
 const PAUSE_PRESETS: ReadonlyArray<readonly [number, string]> = [
+  [0, '即时（一边说一边识别，说完立刻接句）'],
   [600, '0.6 秒（极快，容易截话）'],
   [900, '0.9 秒（默认）'],
   [1200, '1.2 秒（快）'],
@@ -1659,6 +1661,13 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
   /** Successful identities are remembered per lane only for this capture. */
   const identityCacheRef = useRef<Map<SpeakerLane, SpeakerIdentity>>(new Map())
   const lastIdentityLaneRef = useRef<SpeakerLane | null>(null)
+  /**
+   * Partial recognition bookkeeping for the utterance being spoken. Counters are
+   * carried into that utterance's latency record and reset when it is built.
+   */
+  const partialRef = useRef({ text: '', inFlight: false, finalizing: false, calls: 0, ms: 0 })
+  /** In-flight partial request, so closing the utterance can cancel it. */
+  const partialAbortRef = useRef<AbortController | null>(null)
   /** Last accepted owner transcript, for the input gate's duplicate rule. */
   const lastOwnerInputRef = useRef('')
   /** Mixed tail kept from the moment speech ended, for a single-speaker ASR. */
@@ -1722,6 +1731,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     micRef.current?.tune({
       silenceMs: value.pauseMs,
       threshold: value.micThreshold > 0 ? value.micThreshold : null,
+      // "即时" is one switch: changing the wait also changes whether speech is
+      // recognized while it is still being spoken.
+      partialMs: partialIntervalFor(value.pauseMs, value.partialAsrMs),
     })
   }), [])
 
@@ -1895,13 +1907,13 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     inferMs?: number
   }
 
-  const transcribeTimed = async (audioBase64Value: string): Promise<TimedTranscript> => {
+  const transcribeTimed = async (audioBase64Value: string, signal?: AbortSignal): Promise<TimedTranscript> => {
     const startedAt = Date.now()
     const selection = await speechSelection()
     const result = await ctx.remote.speech.transcribe({
       audioBase64: audioBase64Value,
       ...selection,
-    }, new AbortController().signal)
+    }, signal ?? new AbortController().signal)
     if (!result.ok) {
       speechSelectionRef.current = null
       throw new Error(result.error?.message ?? '识别失败')
@@ -1979,7 +1991,16 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
       gateDecision?: InputGateDecision,
     ): void => {
       if (!trace) return
-      const record = buildUtteranceRecord(trace, { fastPath, ...options, timing })
+      // Partial recognition is charged to the utterance it was spent on; the
+      // closing recognition keeps its own numbers untouched.
+      const partial = partialRef.current
+      const timingWithPartial: UtteranceTiming = partial.calls > 0
+        ? { ...timing, partialAsrCalls: partial.calls, partialAsrMs: partial.ms }
+        : timing
+      partial.calls = 0
+      partial.ms = 0
+      partial.text = ''
+      const record = buildUtteranceRecord(trace, { fastPath, ...options, timing: timingWithPartial })
       if (gateDecision) Object.assign(record, inputGateTraceFields(gateDecision))
       void postLatency(record)
     }
@@ -2829,6 +2850,54 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         })
         separatorRef.current = separator
       }
+      /**
+       * Partial recognition during the silence wait. One call at a time, only
+       * while the utterance is open, and dropped the moment the closing
+       * recognition starts: it may never delay the real transcript.
+       */
+      const handlePartial = (samples: Float32Array, info: { speechMs: number; at: number }): void => {
+        const state = partialRef.current
+        // Derived, not a second switch: "即时" is what makes partial recognition run.
+        const interval = partialIntervalFor(micSilenceMs, getPreferences().partialAsrMs)
+        const lane = lastIdentityLaneRef.current ?? 'owner'
+        if (!shouldFirePartial({
+          enabled: interval > 0,
+          intervalMs: interval,
+          // The microphone already waited the interval; this keeps the guard honest.
+          sinceLastMs: interval,
+          inFlight: state.inFlight,
+          finalizing: state.finalizing,
+          speechMs: info.speechMs,
+        })) return
+        state.inFlight = true
+        const startedAt = Date.now()
+        const controller = new AbortController()
+        partialAbortRef.current = controller
+        void transcribeTimed(audioBase64(encodeWave(samples)), controller.signal)
+          .then((call) => {
+            // The closing recognition owns the utterance now: drop this result.
+            if (state.finalizing) return
+            const text = call.text.replace(/^\s*\[声纹：[^\]]*\]\s*/u, '').trim()
+            const fresh = dedupePartial(state.text, text)
+            if (!fresh) return
+            state.text = fresh
+            voiceRecordStream.append('partial', {
+              text: fresh, lane, final: false,
+              startedAt: Math.max(0, info.at - info.speechMs), endedAt: info.at,
+            })
+            if (!earlyStartEnabled(sharedPlayer.declaredSpeechSettings())) return
+            earlyRef.current?.partial([fresh], {
+              lane, canonical: lane, playing: sharedPlayer.busy(), queued: scheduler.status().queued,
+            })
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            if (partialAbortRef.current === controller) partialAbortRef.current = null
+            state.inFlight = false
+            state.calls += 1
+            state.ms += Date.now() - startedAt
+          })
+      }
       const mic = new MicrophoneLoop({
         deviceId: getPreferences().deviceId,
         silenceMs: micSilenceMs,
@@ -2836,10 +2905,16 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         threshold: getPreferences().micThreshold > 0 ? getPreferences().micThreshold : undefined,
         continuous,
         onFrame: continuous && !fastPath ? (samples) => { separator?.push(samples) } : undefined,
+        // One switch: a zero wait turns recognition into the speech itself.
+        partialMs: partialIntervalFor(micSilenceMs, prefs.partialAsrMs),
+        onPartial: (samples, info) => { handlePartial(samples, info) },
         onLevel: (value) => setLevel(value),
         playbackState: () => sharedPlayer.playbackState(),
         onSpeechStart: (onset) => {
           speechOnsetAt = onset.startedAt
+          // A new utterance owns its own partial text and counters.
+          partialRef.current.text = ''
+          partialRef.current.finalizing = false
           reportSpeech(sessionId, 'start')
           // Sound alone is not an interruption: the volume ducks, the sentence
           // plays on. Only the host/model decides whether to hold or stop.
@@ -2857,6 +2932,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         // with the endpoint wait. The fast path deliberately runs no model.
         onSpeechTail: () => { separator?.prewarm() },
         onSpeechEnd: () => {
+          // The closing recognition starts now; no partial may compete with it.
+          partialRef.current.finalizing = true
+          partialAbortRef.current?.abort()
           const spokeMs = speechOnsetAt > 0 ? Date.now() - speechOnsetAt : 0
           speechOnsetAt = 0
           reportSpeech(sessionId, 'end')
@@ -3384,12 +3462,15 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
         </select>
       </label>
       {(customPause || !PAUSE_PRESETS.some(([ms]) => ms === prefs.pauseMs)) && <label>自定义毫秒数
-        <input type="number" min={400} max={4000} step={50} value={pauseDraft} disabled={busy}
+        <input type="number" min={0} max={4000} step={50} value={pauseDraft} disabled={busy}
           aria-label="自定义停顿毫秒"
           onChange={(event) => setPauseDraft(event.target.value)}
           onBlur={(event) => commitPause(event.target.value)}
           onKeyDown={(event) => { if (event.key === 'Enter') commitPause((event.target as HTMLInputElement).value) }} />
       </label>}
+      {prefs.pauseMs === 0 && <p className="dsh-vd-muted">
+        即时 = 一边说一边识别，说完立刻接上。代价是本机识别次数变多，不上传。
+      </p>}
       {selection && <label>识别服务<select value={selection.providerId} disabled={busy}
         onChange={(event) => { void invoke(() => requireSpeech(ctx).configure({ providerId: event.target.value })) }}>
         {catalog.providers.map((item: any) => <option key={item.id} value={item.id}>{item.name}</option>)}

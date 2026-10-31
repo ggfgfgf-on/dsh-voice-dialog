@@ -356,7 +356,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             mergeRunMaxChars: { type: 'number', minimum: 8, maximum: 1200, description: 'Hard cap for one merged synthesis request.' },
             mergeRunMaxItems: { type: 'number', minimum: 1, maximum: 32, description: 'How many lines may share one synthesis request.' },
             betweenBlocksMs: { type: 'number', minimum: 0, maximum: 2000, description: 'Silence inserted between spoken blocks; 0 starts the next block at once.' },
-            micSilenceMs: { type: 'number', minimum: 400, maximum: 4000, description: 'Silence that closes the listener utterance before recognition.' },
+            micSilenceMs: { type: 'number', minimum: 0, maximum: 4000, description: 'Silence that closes the listener utterance. 0 = immediate: the utterance closes on the first unvoiced frame, and recognition runs while you are still speaking, so the sentence is picked up the moment you stop. Any real wait keeps today behaviour.' },
             chunkMaxChars: { type: 'number', minimum: 0, maximum: 400, description: 'Longest raw-corpus chunk in characters before it is split for delivery. 0 (default) leaves every boundary to the pauses; a value like 120 delivers a long unbroken utterance in pieces.' },
             separationSilenceMs: { type: 'number', minimum: 400, maximum: 4000, description: 'Tail silence for a separated speaker stream.' },
             rhythm: { type: 'string', enum: ['natural', 'off'], description: 'Pace between blocks. natural (default) leaves a longer gap after a sentence than after a comma, and varies each one; off makes it metronomic, which is only useful for a test.' },

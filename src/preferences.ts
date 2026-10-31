@@ -33,6 +33,12 @@ export interface VoiceDialogPreferences {
   guestMode: GuestMode
   /** Allow several utterances to be transcribed at the same time. */
   parallelAsr: boolean
+  /**
+   * Run one recognition on the audio already spoken this many milliseconds
+   * after the previous partial call, during the silence wait. 0 (default) is
+   * off, so a default install makes no extra recognition requests.
+   */
+  partialAsrMs: number
   /** Split overlapping speakers into two streams before recognition. */
   separateSpeakers: boolean
   /**
@@ -56,6 +62,18 @@ export const SPEAKER_THRESHOLD_MIN = 0.35
 export const SPEAKER_THRESHOLD_MAX = 1
 export const SPEAKER_THRESHOLD_DEFAULT = 0.5
 
+/** Partial recognition bounds: 0 is off, 2000 ms is longer than any useful wait. */
+export const PARTIAL_ASR_MIN_MS = 0
+export const PARTIAL_ASR_MAX_MS = 2000
+
+/** 0 = off; anything above 2000 would fire less often than the wait itself. */
+export function clampPartialAsr(value: unknown, fallback: number): number {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number)
+    ? Math.min(PARTIAL_ASR_MAX_MS, Math.max(PARTIAL_ASR_MIN_MS, Math.round(number)))
+    : fallback
+}
+
 const DEFAULTS: VoiceDialogPreferences = {
   autoRead: true,
   volume: 0.9,
@@ -71,15 +89,19 @@ const DEFAULTS: VoiceDialogPreferences = {
   ownerMode: 'queue',
   guestMode: 'queue',
   parallelAsr: true,
+  partialAsrMs: 0,
   separateSpeakers: true,
   separationFastPath: true,
   organizerEnabled: true,
   chunkMaxChars: 0,
 }
 
-function clampPause(value: unknown, fallback: number): number {
+/** The silence wait, exposed so its 0 (immediate) floor is testable. */
+export function clampPause(value: unknown, fallback: number): number {
   const number = typeof value === 'number' ? value : Number(value)
-  return Number.isFinite(number) ? Math.min(4000, Math.max(400, Math.round(number))) : fallback
+  // 0 = immediate: close the utterance on the first unvoiced frame. The VAD's
+  // own minSpeechMs still refuses clicks, so this cannot cut half a syllable.
+  return Number.isFinite(number) ? Math.min(4000, Math.max(0, Math.round(number))) : fallback
 }
 
 function clampThreshold(value: unknown, fallback: number): number {
@@ -153,6 +175,7 @@ function parse(raw: string | null): VoiceDialogPreferences {
       ownerMode: parseOwnerMode(value.ownerMode, DEFAULTS.ownerMode),
       guestMode: parseGuestMode(value.guestMode, DEFAULTS.guestMode),
       parallelAsr: typeof value.parallelAsr === 'boolean' ? value.parallelAsr : DEFAULTS.parallelAsr,
+      partialAsrMs: clampPartialAsr(value.partialAsrMs, DEFAULTS.partialAsrMs),
       separateSpeakers: typeof value.separateSpeakers === 'boolean' ? value.separateSpeakers : DEFAULTS.separateSpeakers,
       separationFastPath: typeof value.separationFastPath === 'boolean' ? value.separationFastPath : DEFAULTS.separationFastPath,
       organizerEnabled: typeof value.organizerEnabled === 'boolean' ? value.organizerEnabled : DEFAULTS.organizerEnabled,
@@ -185,6 +208,7 @@ export function setPreferences(patch: Partial<VoiceDialogPreferences>): VoiceDia
   next.ownerMode = parseOwnerMode(next.ownerMode, DEFAULTS.ownerMode)
   next.guestMode = parseGuestMode(next.guestMode, DEFAULTS.guestMode)
   next.parallelAsr = typeof next.parallelAsr === 'boolean' ? next.parallelAsr : DEFAULTS.parallelAsr
+  next.partialAsrMs = clampPartialAsr(next.partialAsrMs, DEFAULTS.partialAsrMs)
   next.separateSpeakers = typeof next.separateSpeakers === 'boolean' ? next.separateSpeakers : DEFAULTS.separateSpeakers
   next.separationFastPath = typeof next.separationFastPath === 'boolean' ? next.separationFastPath : DEFAULTS.separationFastPath
   next.organizerEnabled = typeof next.organizerEnabled === 'boolean' ? next.organizerEnabled : DEFAULTS.organizerEnabled

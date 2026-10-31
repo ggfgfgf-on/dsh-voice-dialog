@@ -5,6 +5,7 @@ import {
   PLAYBACK_ECHO_GUARD_MS, PLAYBACK_MIN_VOICED_MS,
   decideSpeechOnset, shouldFallbackCut,
 } from './barge-in.ts'
+import { PARTIAL_MIN_SPEECH_MS, PARTIAL_WINDOW_MS, clampPartialMs, trimPartialWindow } from './partial-asr.ts'
 
 /** Live player state used for echo suppression. */
 export interface MicPlaybackSnapshot {
@@ -23,6 +24,15 @@ export interface MicSpeechOnset {
   /** Contiguous voiced duration when reported. */
   voicedMs: number
   reportedAt: number
+}
+
+export interface MicPartialInfo {
+  /** Length of the audio handed over, in seconds. */
+  seconds: number
+  /** Voiced milliseconds accumulated in the utterance so far. */
+  speechMs: number
+  /** Wall clock when the partial was requested. */
+  at: number
 }
 
 export interface MicOptions {
@@ -66,6 +76,15 @@ export interface MicOptions {
    * is not paid after the endpoint decision.
    */
   onSpeechTail?: () => void
+  /**
+   * Run one partial recognition every this many milliseconds while the
+   * utterance is still open. 0 or absent (the default) makes no partial calls.
+   */
+  partialMs?: number
+  /** Audio one partial call carries; older syllables are dropped first. */
+  partialWindowMs?: number
+  /** Fires while the utterance is still open, carrying the audio spoken so far. */
+  onPartial?: (samples: Float32Array, info: MicPartialInfo) => void
   onSegment?: (samples: Float32Array, seconds: number) => void
   onError?: (error: unknown) => void
 }
@@ -182,6 +201,37 @@ export function resolveMicThresholds(
   return { onset, hold: onset * HOLD_THRESHOLD_RATIO }
 }
 
+export interface EndpointState {
+  /** Audio captured in this utterance so far. */
+  totalMs: number
+  /** Hard cap for one utterance. */
+  maxSegmentMs: number
+  /** Configured trailing silence that closes the utterance; 0 = immediate. */
+  silenceMs: number
+  /** Trailing unvoiced milliseconds on the current frame. */
+  silence: number
+  /** Voiced milliseconds accumulated in this utterance. */
+  speechMs: number
+  /** Speech shorter than this is never a segment. */
+  minSpeechMs: number
+}
+
+/**
+ * Whether the VAD may close the utterance on this frame. Pure, so the
+ * "immediate" case is testable without an AudioContext.
+ *
+ * silenceMs = 0 is not "close while someone is still talking": the voiced
+ * branch resets the silence counter, so a strictly positive requirement is
+ * what keeps the utterance alive. 0 therefore means "close on the first
+ * unvoiced frame", and minSpeechMs still refuses clicks and half syllables.
+ */
+export function endpointReached(state: EndpointState): boolean {
+  if (!(state.speechMs >= state.minSpeechMs)) return false
+  if (state.totalMs >= state.maxSegmentMs) return true
+  const required = state.silenceMs > 0 ? state.silenceMs : 1
+  return state.silence >= required
+}
+
 /** Flatten captured chunks into one buffer. */
 function flatten(chunks: readonly Float32Array[]): Float32Array {
   const length = chunks.reduce((n, chunk) => n + chunk.length, 0)
@@ -287,10 +337,14 @@ export class MicrophoneLoop {
    * threshold switches this instance to manual onset control; omitting the
    * field leaves the current mode (adaptive or manual) unchanged.
    */
-  tune(patch: { silenceMs?: number; threshold?: number | null }): void {
+  tune(patch: { silenceMs?: number; threshold?: number | null; partialMs?: number }): void {
     if (patch.silenceMs !== undefined) {
       const ms = Number(patch.silenceMs)
-      if (Number.isFinite(ms)) this.options.silenceMs = Math.min(4000, Math.max(400, Math.round(ms)))
+      // 0 is a real setting now ("即时"), not a missing value.
+      if (Number.isFinite(ms)) this.options.silenceMs = Math.min(4000, Math.max(0, Math.round(ms)))
+    }
+    if (patch.partialMs !== undefined) {
+      this.options.partialMs = clampPartialMs(patch.partialMs)
     }
     if (patch.threshold !== undefined) {
       // null (or 0) hands control back to the adaptive noise floor.
@@ -321,6 +375,8 @@ export class MicrophoneLoop {
     let voicedRun = 0
     let echoBlocked = false
     let fallbackCutSent = false
+    /** Wall clock of the previous partial call; 0 means "since speech started". */
+    let lastPartialAt = 0
     const noiseFloor = new AdaptiveNoiseFloor()
 
     const reset = (): void => {
@@ -336,6 +392,7 @@ export class MicrophoneLoop {
       voicedRun = 0
       echoBlocked = false
       fallbackCutSent = false
+      lastPartialAt = 0
     }
 
     const playbackNow = (): MicPlaybackSnapshot =>
@@ -403,6 +460,32 @@ export class MicrophoneLoop {
       if (!enough || captured.length === 0) return
       const samples = resample(captured, context.sampleRate, TARGET_RATE)
       try { this.options.onSegment?.(samples, seconds) } catch (error) { this.options.onError?.(error) }
+    }
+
+    /**
+     * Optional partial recognition. Only fires while an utterance is open and
+     * announced, never for the echo guard's swallowed audio, and only on the
+     * requested interval: the closing recognition is never delayed or queued
+     * behind it.
+     */
+    const emitPartial = (): void => {
+      const interval = this.options.partialMs ?? 0
+      const sink = this.options.onPartial
+      if (!(interval > 0) || !sink) return
+      if (!announced || echoBlocked) return
+      if (speech < Math.max(this.options.minSpeechMs, PARTIAL_MIN_SPEECH_MS)) return
+      const now = Date.now()
+      const since = lastPartialAt > 0 ? now - lastPartialAt : now - voiceStartedAt
+      if (since < interval) return
+      const recent = trimPartialWindow(segment, context.sampleRate, this.options.partialWindowMs ?? PARTIAL_WINDOW_MS)
+      if (recent.length === 0) return
+      lastPartialAt = now
+      const samples = resample(flatten(recent), context.sampleRate, TARGET_RATE)
+      try {
+        sink(samples, { seconds: samples.length / TARGET_RATE, speechMs: speech, at: now })
+      } catch (error) {
+        this.options.onError?.(error)
+      }
     }
 
     processor.onaudioprocess = (event) => {
@@ -475,10 +558,11 @@ export class MicrophoneLoop {
             try { this.options.onSpeechTail?.() } catch (error) { this.options.onError?.(error) }
           }
         }
-        if (totalMs >= this.options.maxSegmentMs
-          || (silence >= this.options.silenceMs && speech >= this.options.minSpeechMs)) {
-          finalize()
-        }
+        emitPartial()
+        if (endpointReached({
+          totalMs, maxSegmentMs: this.options.maxSegmentMs, silenceMs: this.options.silenceMs,
+          silence, speechMs: speech, minSpeechMs: this.options.minSpeechMs,
+        })) finalize()
         return
       }
 
@@ -508,9 +592,11 @@ export class MicrophoneLoop {
         voicedRun = 0
         silence += chunkMs
       }
-      if (totalMs >= this.options.maxSegmentMs || (silence >= this.options.silenceMs && speech >= this.options.minSpeechMs)) {
-        finalize()
-      }
+      emitPartial()
+      if (endpointReached({
+        totalMs, maxSegmentMs: this.options.maxSegmentMs, silenceMs: this.options.silenceMs,
+        silence, speechMs: speech, minSpeechMs: this.options.minSpeechMs,
+      })) finalize()
     }
   }
 }
