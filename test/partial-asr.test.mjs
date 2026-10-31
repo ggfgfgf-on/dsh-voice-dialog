@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  IMMEDIATE_PARTIAL_MS, PARTIAL_MIN_SPEECH_MS, PARTIAL_WINDOW_MS,
-  clampPartialMs, dedupePartial, partialIntervalFor, shouldFirePartial, trimPartialWindow,
+  PARTIAL_ASR_DEFAULT_MS, PARTIAL_FEED_MAX_WAIT_MS, PARTIAL_MIN_SPEECH_MS, PARTIAL_WINDOW_MS,
+  clampPartialMs, dedupePartial, partialFeedEnabled, partialIntervalFor, shouldFirePartial,
+  trimPartialWindow,
 } from '../lib/partial-asr.js'
-import { PARTIAL_ASR_MAX_MS, clampPartialAsr, clampPause } from '../lib/preferences.js'
+import { DEFAULT_PREFERENCES, PARTIAL_ASR_MAX_MS, clampPartialAsr, clampPause } from '../lib/preferences.js'
+import { createRecordStream } from '../lib/record-stream.js'
 import { sanitizeLatencyRecord } from '../lib/latency.js'
 
 const ready = {
@@ -15,7 +17,7 @@ const ready = {
   speechMs: 900,
 }
 
-test('partial asr: off by default, and every reason to stay quiet wins', () => {
+test('partial asr: every reason to stay quiet wins', () => {
   assert.equal(shouldFirePartial(ready), true)
   assert.equal(shouldFirePartial({ ...ready, enabled: false }), false, '0 ms means no request at all')
   assert.equal(shouldFirePartial({ ...ready, intervalMs: 0 }), false)
@@ -57,17 +59,45 @@ test('settings: the wait may be zero, the clamp still bounds it', () => {
   assert.equal(clampPause('oops', 900), 900)
 })
 
-test('settings: "即时" is one switch that also turns partial recognition on', () => {
-  assert.equal(partialIntervalFor(0), IMMEDIATE_PARTIAL_MS, 'a zero wait derives the interval on its own')
-  assert.equal(partialIntervalFor(0, 250), 250, 'an internal value may refine it')
-  assert.equal(partialIntervalFor(900), 0, 'a real wait keeps partial recognition off')
-  assert.equal(partialIntervalFor(100), 0)
-  assert.equal(partialIntervalFor(-5), IMMEDIATE_PARTIAL_MS)
+test('partial asr: always on, whatever the wait is', () => {
+  // The interval no longer takes the wait at all: it is a property of the
+  // recording layer, not of a setting. Only an explicit 0 switches it off.
+  assert.equal(partialIntervalFor(), PARTIAL_ASR_DEFAULT_MS)
+  assert.equal(partialIntervalFor(400), 400)
+  assert.equal(partialIntervalFor(250), 250)
+  assert.equal(partialIntervalFor(0), 0, '0 is the explicit off switch, and nothing else')
   assert.equal(partialIntervalFor(Number.NaN), 0)
+  // A wait of 900 ms used to mean "off"; it is now only a wait.
+  assert.equal(partialIntervalFor(900), 900)
   assert.equal(clampPartialMs(400), 400)
   assert.equal(clampPartialMs(-1), 0)
   assert.equal(clampPartialMs(9999), 2000)
   assert.equal(clampPartialMs('x'), 0)
+})
+
+test('partial asr: the wait decides only how the text is used', () => {
+  assert.equal(PARTIAL_FEED_MAX_WAIT_MS, 400)
+  assert.equal(partialFeedEnabled(0), true, 'immediate: the partial may open the plan')
+  assert.equal(partialFeedEnabled(400), true, 'exactly at the boundary still feeds')
+  assert.equal(partialFeedEnabled(401), false, 'one millisecond over records only')
+  assert.equal(partialFeedEnabled(900), false)
+  assert.equal(partialFeedEnabled(-1), false)
+  assert.equal(partialFeedEnabled(Number.NaN), false)
+})
+
+test('partial asr: a long wait still records the partial, it just does not plan on it', () => {
+  const stream = createRecordStream({ flushMs: 10_000 })
+  const event = stream.append('partial', { text: '帮我把报告', final: false, lane: 'owner' })
+  assert.equal(event.kind, 'partial')
+  assert.equal(stream.tail().length, 1)
+  // 900 ms: recorded (the event above), but kept out of the plan.
+  assert.equal(partialFeedEnabled(900), false)
+  assert.equal(partialFeedEnabled(400), true)
+})
+
+test('settings: recognition defaults are the structural ones', () => {
+  assert.equal(DEFAULT_PREFERENCES.pauseMs, 900, 'the wait keeps its historical default')
+  assert.equal(DEFAULT_PREFERENCES.partialAsrMs, PARTIAL_ASR_DEFAULT_MS, 'partial recognition is on by default')
 })
 
 test('settings: partial recognition is off by default and bounded', () => {

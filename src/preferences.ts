@@ -34,9 +34,9 @@ export interface VoiceDialogPreferences {
   /** Allow several utterances to be transcribed at the same time. */
   parallelAsr: boolean
   /**
-   * Run one recognition on the audio already spoken this many milliseconds
-   * after the previous partial call, during the silence wait. 0 (default) is
-   * off, so a default install makes no extra recognition requests.
+   * Spacing between partial recognitions while someone is speaking. Always on
+   * by default (400 ms): the wait setting changes only how the partial text is
+   * used, never whether it is produced.
    */
   partialAsrMs: number
   /** Split overlapping speakers into two streams before recognition. */
@@ -74,6 +74,29 @@ export function clampPartialAsr(value: unknown, fallback: number): number {
     : fallback
 }
 
+/** Exposed so the defaults themselves are asserted, not just the clamps. */
+export const DEFAULT_PREFERENCES: Readonly<VoiceDialogPreferences> = {
+  autoRead: true,
+  volume: 0.9,
+  duckLevel: 0.85,
+  speechBoost: 1.8,
+  deviceId: '',
+  pauseMs: 900,
+  micThreshold: 0,
+  speakerPrefix: true,
+  speakerGate: false,
+  speakerThreshold: SPEAKER_THRESHOLD_DEFAULT,
+  ownerMargin: 0.12,
+  ownerMode: 'queue',
+  guestMode: 'queue',
+  parallelAsr: true,
+  partialAsrMs: 400,
+  separateSpeakers: true,
+  separationFastPath: true,
+  organizerEnabled: true,
+  chunkMaxChars: 0,
+}
+
 const DEFAULTS: VoiceDialogPreferences = {
   autoRead: true,
   volume: 0.9,
@@ -89,7 +112,7 @@ const DEFAULTS: VoiceDialogPreferences = {
   ownerMode: 'queue',
   guestMode: 'queue',
   parallelAsr: true,
-  partialAsrMs: 0,
+  partialAsrMs: 400,
   separateSpeakers: true,
   separationFastPath: true,
   organizerEnabled: true,
@@ -175,7 +198,11 @@ function parse(raw: string | null): VoiceDialogPreferences {
       ownerMode: parseOwnerMode(value.ownerMode, DEFAULTS.ownerMode),
       guestMode: parseGuestMode(value.guestMode, DEFAULTS.guestMode),
       parallelAsr: typeof value.parallelAsr === 'boolean' ? value.parallelAsr : DEFAULTS.parallelAsr,
-      partialAsrMs: clampPartialAsr(value.partialAsrMs, DEFAULTS.partialAsrMs),
+      // 0 used to mean "off". A stored 0 is an old profile, not a request for
+      // silence: partial recognition is part of the recording layer now.
+      partialAsrMs: clampPartialAsr(value.partialAsrMs, DEFAULTS.partialAsrMs) === 0
+        ? DEFAULTS.partialAsrMs
+        : clampPartialAsr(value.partialAsrMs, DEFAULTS.partialAsrMs),
       separateSpeakers: typeof value.separateSpeakers === 'boolean' ? value.separateSpeakers : DEFAULTS.separateSpeakers,
       separationFastPath: typeof value.separationFastPath === 'boolean' ? value.separationFastPath : DEFAULTS.separationFastPath,
       organizerEnabled: typeof value.organizerEnabled === 'boolean' ? value.organizerEnabled : DEFAULTS.organizerEnabled,

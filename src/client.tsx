@@ -44,7 +44,7 @@ import {
 import { inputGateTraceFields, type InputGateDecision } from './input-gate.ts'
 import { decideChunks, decidePlan } from './plan.ts'
 import { createEarlyStart, earlyStartEnabled, type EarlyStart } from './early-start.ts'
-import { dedupePartial, partialIntervalFor, shouldFirePartial } from './partial-asr.ts'
+import { dedupePartial, partialFeedEnabled, partialIntervalFor, shouldFirePartial } from './partial-asr.ts'
 import { chunkRawSegments } from './chunker.ts'
 import { createRecordStream } from './record-stream.ts'
 import { createPlaybackRecorder } from './playback-record.ts'
@@ -157,7 +157,7 @@ const BUNDLE_ID = 'dsh-voice-dialog'
 /** Ducking, cut fades and volume live in volume-gain.ts: one writer, one target. */
 /** Tail-silence presets; any other value may be typed into the custom field. */
 const PAUSE_PRESETS: ReadonlyArray<readonly [number, string]> = [
-  [0, '即时（一边说一边识别，说完立刻接句）'],
+  [0, '即时（说完立刻接句）'],
   [600, '0.6 秒（极快，容易截话）'],
   [900, '0.9 秒（默认）'],
   [1200, '1.2 秒（快）'],
@@ -1731,9 +1731,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
     micRef.current?.tune({
       silenceMs: value.pauseMs,
       threshold: value.micThreshold > 0 ? value.micThreshold : null,
-      // "即时" is one switch: changing the wait also changes whether speech is
-      // recognized while it is still being spoken.
-      partialMs: partialIntervalFor(value.pauseMs, value.partialAsrMs),
+      // Partial recognition does not depend on the wait: it always runs while
+      // someone speaks, and the wait only decides how its text is used.
+      partialMs: partialIntervalFor(value.partialAsrMs),
     })
   }), [])
 
@@ -2857,8 +2857,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
        */
       const handlePartial = (samples: Float32Array, info: { speechMs: number; at: number }): void => {
         const state = partialRef.current
-        // Derived, not a second switch: "即时" is what makes partial recognition run.
-        const interval = partialIntervalFor(micSilenceMs, getPreferences().partialAsrMs)
+        // Always on: the wait changes how the text is used, not whether it runs.
+        const interval = partialIntervalFor(getPreferences().partialAsrMs)
         const lane = lastIdentityLaneRef.current ?? 'owner'
         if (!shouldFirePartial({
           enabled: interval > 0,
@@ -2885,6 +2885,9 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
               text: fresh, lane, final: false,
               startedAt: Math.max(0, info.at - info.speechMs), endedAt: info.at,
             })
+            // A long wait keeps the partial out of the plan: the sentence is
+            // probably still being spoken, so half of it is not a plan yet.
+            if (!partialFeedEnabled(micSilenceMs)) return
             if (!earlyStartEnabled(sharedPlayer.declaredSpeechSettings())) return
             earlyRef.current?.partial([fresh], {
               lane, canonical: lane, playing: sharedPlayer.busy(), queued: scheduler.status().queued,
@@ -2905,8 +2908,8 @@ function VoiceMic({ ctx, sessionId, onActiveChange }: VoiceMicProps) {
         threshold: getPreferences().micThreshold > 0 ? getPreferences().micThreshold : undefined,
         continuous,
         onFrame: continuous && !fastPath ? (samples) => { separator?.push(samples) } : undefined,
-        // One switch: a zero wait turns recognition into the speech itself.
-        partialMs: partialIntervalFor(micSilenceMs, prefs.partialAsrMs),
+        // Independent of the wait: recognition runs while the speech does.
+        partialMs: partialIntervalFor(prefs.partialAsrMs),
         onPartial: (samples, info) => { handlePartial(samples, info) },
         onLevel: (value) => setLevel(value),
         playbackState: () => sharedPlayer.playbackState(),
@@ -3468,9 +3471,10 @@ function VoiceSettings({ ctx }: VoiceSettingsProps) {
           onBlur={(event) => commitPause(event.target.value)}
           onKeyDown={(event) => { if (event.key === 'Enter') commitPause((event.target as HTMLInputElement).value) }} />
       </label>}
-      {prefs.pauseMs === 0 && <p className="dsh-vd-muted">
-        即时 = 一边说一边识别，说完立刻接上。代价是本机识别次数变多，不上传。
-      </p>}
+      <p className="dsh-vd-muted">
+        边说边识别始终开着：说话的时候就在本机识别，音频不上传，代价是识别次数变多。
+        等待不超过 0.4 秒时，它直接参与接话；更长的等待只记录，不拿半句话做计划。
+      </p>
       {selection && <label>识别服务<select value={selection.providerId} disabled={busy}
         onChange={(event) => { void invoke(() => requireSpeech(ctx).configure({ providerId: event.target.value })) }}>
         {catalog.providers.map((item: any) => <option key={item.id} value={item.id}>{item.name}</option>)}

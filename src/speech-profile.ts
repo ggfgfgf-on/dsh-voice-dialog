@@ -23,7 +23,11 @@ export interface SpeechProfile {
   betweenBlocksMs?: number
   /** Longest raw-corpus chunk in characters before it is split; 0 = the pauses decide. */
   chunkMaxChars?: number
-  /** Mic silence that closes an utterance; undefined keeps the user's setting. */
+  /**
+   * Mic silence that closes an utterance; undefined keeps the user's setting.
+   * 0 = immediate; at most 400 lets partial text join the plan. Recognition
+   * itself always runs while the user speaks.
+   */
   micSilenceMs?: number
   /** Per-source tail silence in continuous separation; undefined keeps the user's setting. */
   separationSilenceMs?: number

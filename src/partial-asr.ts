@@ -6,16 +6,24 @@
  * Everything here is pure: the microphone owns the buffer, the caller owns the
  * recognizer, and the closing recognition is never delayed or crowded out.
  *
- * Off unless the page preference partialAsrMs is greater than 0, so a default
- * install makes exactly zero additional recognition calls.
+ * Always on: while an utterance is open the recognizer is asked for the text so
+ * far, so no layer has to wait for silence to learn what was said. The wait
+ * setting decides only how that text is USED, never whether it exists:
+ *
+ *   wait <= 400 ms -> the partial may join the plan (short wait: the half
+ *                     sentence is still what is being said)
+ *   wait >  400 ms -> the partial is recorded only (a long wait means the
+ *                     sentence is probably not finished yet)
  */
 
 /** Ceiling for the audio one partial call may carry, so a long utterance stays bounded. */
 export const PARTIAL_WINDOW_MS = 10_000
 /** A partial call on less speech than this cannot say anything useful. */
 export const PARTIAL_MIN_SPEECH_MS = 300
-/** Partial interval used by "即时" when nothing else is stored. */
-export const IMMEDIATE_PARTIAL_MS = 400
+/** Default spacing between partial recognitions while someone is speaking. */
+export const PARTIAL_ASR_DEFAULT_MS = 400
+/** At or below this wait, partial text may join the plan; above it, it is recorded only. */
+export const PARTIAL_FEED_MAX_WAIT_MS = 400
 
 /** Intervals derived from a setting are bounded the same way. */
 export function clampPartialMs(value: unknown): number {
@@ -24,16 +32,23 @@ export function clampPartialMs(value: unknown): number {
 }
 
 /**
- * "即时" is one setting, not two: a zero silence wait means the utterance closes
- * on the first unvoiced frame, so recognition must run during the speech or the
- * text arrives after the sentence is already cut. Any real wait keeps partial
- * recognition off, which is today's behaviour.
+ * The interval the microphone should use, independent of the silence wait.
+ * A stored setting refines it; 0 is the only way to switch the extra calls off.
  */
-export function partialIntervalFor(waitMs: number, storedMs = 0): number {
-  const wait = Number(waitMs)
-  if (!Number.isFinite(wait) || wait > 0) return 0
+export function partialIntervalFor(storedMs: number = PARTIAL_ASR_DEFAULT_MS): number {
   const stored = Number(storedMs)
-  return Number.isFinite(stored) && stored > 0 ? stored : IMMEDIATE_PARTIAL_MS
+  if (!Number.isFinite(stored)) return 0
+  return clampPartialMs(stored)
+}
+
+/**
+ * How the wait uses partial text. The capability is always present; this is the
+ * single place that says whether a half sentence may shape the plan. Pure, so
+ * the boundary is testable at 0 / 400 / 401 / 900.
+ */
+export function partialFeedEnabled(waitMs: number): boolean {
+  const wait = Number(waitMs)
+  return Number.isFinite(wait) && wait >= 0 && wait <= PARTIAL_FEED_MAX_WAIT_MS
 }
 
 export interface PartialGateInput {
