@@ -315,6 +315,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
       + 'Action speech declares how your own answer is split, paced and interrupted: every field is optional and only overrides the built-in default, e.g. {"interruption":"sentence","mergeMaxChars":80,"betweenBlocksMs":150}. '
       + 'Action express is an OPTIONAL assist for delivery detail: it speaks an ordered sequence of steps, each either a speak step (say plus optional tone, pace, stress, breath, lengthen, rate, pitch, volume) or a pause step. ' + 'The optional numbers are per-step adjustments on top of the plugin base and shape THAT step only; they never replace the base. '
       + 'Without it nothing changes and a normal answer keeps today\'s delivery. It shapes how YOUR OWN speech sounds, not a settings panel; you express intent and the plugin owns the acoustics. '
+      + 'Tone choice goes coarse to fine: a style word when one overall colour says it (preferred), a tone token plus pace for a single step, and a per-character curve ONLY when the contour itself matters (getting quieter, a lift at the end, a fall after the stress); the curve is fitted into one request, so it never adds a seam. '
       + 'Action capabilities publishes the authoritative token vocabulary (tone/pace/pause with a one-line meaning each) and the current read-only base; call it instead of guessing a token name.',
     parameters: {
       type: 'object',
@@ -390,7 +391,10 @@ const SAME_SPEAKER_SIMILARITY = 0.62
               curve: {
                 type: 'object',
                 additionalProperties: false,
-                description: CURVE_LIMITS.meaning + ' 默认的 smooth 只在标点处断句，逐字的差别会被折成平均值；要让每个字都听见，同时给 granularity fine。',
+                description: CURVE_LIMITS.meaning + ' ' + CURVE_LIMITS.when
+                  + ' 例：curve ' + JSON.stringify(CURVE_LIMITS.example.curve)
+                  + ' 的意思是' + CURVE_LIMITS.example.meaning
+                  + ' 默认的 smooth 只在标点处断句；要让每个字都按曲线走，同时给 granularity fine，代价是会多几次请求。',
                 properties: {
                   rate: { type: 'array', items: { type: 'number' }, maxItems: CURVE_LIMITS.max, description: '逐字语速，第 i 个数对应第 i 个字。' },
                   pitch: { type: 'array', items: { type: 'number' }, maxItems: CURVE_LIMITS.max, description: '逐字音高，第 i 个数对应第 i 个字。' },
