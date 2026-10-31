@@ -495,9 +495,9 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             }
             if (live === undefined) {
               return {
-                waitMs: null, mode: 'unknown', immediate: false,
-                userSpeaking: false, lastUtteranceClosed: false,
-                meaning: '当前没有语音会话。',
+                waitMs: null, speaker: null, userSpeaking: false,
+                lastUtteranceClosed: false, declared: declaredSpeechProfile.turnTaking ?? null,
+                meaning: '当前没有语音会话；状态为空，不做解释。',
               }
             }
             const waitMs = turnWait.get(live)
