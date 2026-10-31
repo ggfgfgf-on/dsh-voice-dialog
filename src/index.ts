@@ -21,7 +21,7 @@ import { isSpeakableChunk, shouldSpeak } from './speech-filter.ts'
 import { VisibleVoiceFilter } from './voice-marker.ts'
 import { createEdgeTts, rateToProsody, TtsQueue, type VoiceFrame } from './tts-queue.ts'
 import {
-  ADJUSTMENTS, applyExpression, BREATH_GAP_MS, breathSeam, CONSTRUCTS, EXPRESS_TOKENS, expressionProsody,
+  ADJUSTMENTS, applyExpression, BREATH_GAP_MS, breathSeam, CONSTRUCTS, CURVE_LIMITS, EXPRESS_TOKENS, expressionProsody,
   expressionSsmlChunks, MARK_LIMITS, normalizeVoiceUnits, pauseMsFor, splitStress, STEP_LIMITS, STYLES,
   STYLE_TOKENS, VOCABULARY, type VoiceUnit,
 } from './expression.ts'
@@ -387,6 +387,16 @@ const SAME_SPEAKER_SIMILARITY = 0.62
                   required: ['at'],
                 },
               },
+              curve: {
+                type: 'object',
+                additionalProperties: false,
+                description: CURVE_LIMITS.meaning + ' 默认的 smooth 只在标点处断句，逐字的差别会被折成平均值；要让每个字都听见，同时给 granularity fine。',
+                properties: {
+                  rate: { type: 'array', items: { type: 'number' }, maxItems: CURVE_LIMITS.max, description: '逐字语速，第 i 个数对应第 i 个字。' },
+                  pitch: { type: 'array', items: { type: 'number' }, maxItems: CURVE_LIMITS.max, description: '逐字音高，第 i 个数对应第 i 个字。' },
+                  volume: { type: 'array', items: { type: 'number' }, maxItems: CURVE_LIMITS.max, description: '逐字响度，第 i 个数对应第 i 个字。' },
+                },
+              },
               pause: { type: 'string', enum: [...EXPRESS_TOKENS.pause], description: 'A silence with no text.' },
             },
           },
@@ -433,6 +443,7 @@ const SAME_SPEAKER_SIMILARITY = 0.62
             adjustments: ADJUSTMENTS,
             constructs: CONSTRUCTS,
             mark: MARK_LIMITS,
+            curve: CURVE_LIMITS,
             granularity: {
               smooth: '默认：只在标点处断句，一句话不会被从中间劈开。',
               fine: '允许在任意两个字之间断开，能逐字改音高，代价是接缝听起来像被切开。',

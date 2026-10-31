@@ -37,6 +37,9 @@ export interface VoiceUnit {
   pause?: PauseToken
   /** Character-level marks: repaint the audio of a few characters inside `say`. */
   mark?: ProsodyMark[]
+  /** One number per character of `say`: the same curve the model would otherwise
+   * have to spell out as one mark per character. Expanded into marks here. */
+  curve?: VoiceCurve
   /** Where a marked line may be cut. smooth (default) only at punctuation. */
   granularity?: Granularity
 }
@@ -48,6 +51,28 @@ export interface VoiceUnit {
  * single character, at the cost of an audible seam.
  */
 export type Granularity = 'smooth' | 'fine'
+
+/**
+ * A per-character sequence: index i is the i-th character of `say`. Trailing
+ * missing entries are zero, values are clamped to the step limits, and every
+ * index becomes one character mark. This is the sequence form of `mark`, offered
+ * because spelling a 20-character contour as 20 mark rows is the model's job
+ * only if nothing better exists.
+ */
+export interface VoiceCurve {
+  rate?: number[]
+  pitch?: number[]
+  volume?: number[]
+}
+
+/** What the curve fields mean, written for the model. */
+export const CURVE_LIMITS = {
+  max: 200,
+  fields: ['rate', 'pitch', 'volume'],
+  meaning: '逐字曲线：每个字段是一个数组，第 i 个数对应这句话的第 i 个字（从 0 数），'
+    + '缺的按 0 算，数值与 mark 的 rate/pitch/volume 同一量纲。'
+    + '曲线和 mark 会叠加。每有一个相邻字取值不同，就多一次合成请求，接缝风险也随之增加。',
+} as const
 
 /**
  * One mark inside a unit. `at` is a 0-based character index; `to` is the
@@ -316,6 +341,132 @@ function normalizeMarks(input: unknown): ProsodyMark[] | undefined {
   return marks.length > 0 ? marks : undefined
 }
 
+/** Read a per-character curve; unusable values become zero, not an error. */
+function normalizeCurve(input: unknown): VoiceCurve | undefined {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return undefined
+  const row = input as Record<string, unknown>
+  const curve: VoiceCurve = {}
+  let painted = false
+  for (const key of CURVE_LIMITS.fields) {
+    const values = row[key]
+    if (!Array.isArray(values)) continue
+    const min = key === 'volume' ? STEP_LIMITS.volume.min : key === 'rate' ? STEP_LIMITS.rate.min : STEP_LIMITS.pitch.min
+    const max = key === 'volume' ? STEP_LIMITS.volume.max : key === 'rate' ? STEP_LIMITS.rate.max : STEP_LIMITS.pitch.max
+    const lane: number[] = []
+    for (const value of values.slice(0, CURVE_LIMITS.max)) {
+      const number = toNumber(value, min, max)
+      lane.push(number ?? 0)
+      if (number !== undefined && number !== 0) painted = true
+    }
+    // Trailing zeros carry no information; dropping them keeps the mark budget free.
+    while (lane.length > 0 && lane[lane.length - 1] === 0) lane.pop()
+    if (lane.length > 0) curve[key] = lane
+  }
+  return painted ? curve : undefined
+}
+
+/** One character's curve delta. */
+interface CurveLane { rate: number; pitch: number; volume: number }
+
+interface CurveFit { from: number; to: number; delta: CurveLane }
+
+const LANE_KEYS = ['rate', 'pitch', 'volume'] as const
+
+function laneMean(lanes: CurveLane[]): CurveLane {
+  const sum: CurveLane = { rate: 0, pitch: 0, volume: 0 }
+  for (const lane of lanes) for (const key of LANE_KEYS) sum[key] += lane[key]
+  const count = Math.max(1, lanes.length)
+  return {
+    rate: Math.round(sum.rate / count),
+    pitch: Math.round(sum.pitch / count),
+    volume: Math.round(sum.volume / count),
+  }
+}
+
+/**
+ * Fit a whole curve into at most TWO spans, which is the most one request can
+ * carry. Splitting instead would bend more characters, but every extra request
+ * costs about 300 ms of encoder padding around its cut, and that is heard as a
+ * hole in the sentence; so the default path never splits. It picks the cut that
+ * keeps the most of the contour and averages each half.
+ */
+function fitTwoSpans(lanes: CurveLane[]): CurveFit[] {
+  const painted = lanes
+    .map((lane, index) => ({ lane, index }))
+    .filter(({ lane }) => lane.rate !== 0 || lane.pitch !== 0 || lane.volume !== 0)
+  if (painted.length === 0) return []
+  // The fit spans the WHOLE line, not only the painted range: unpainted characters
+  // before and after would otherwise need a third span, and a third span is a
+  // second request.
+  const from = 0
+  const to = lanes.length
+  const inside = lanes.slice(from, to)
+  if (inside.length <= 1) return [{ from, to, delta: laneMean(inside) }]
+  let bestSplit = 1
+  let bestCost = Infinity
+  for (let split = 1; split < inside.length; split += 1) {
+    const left = laneMean(inside.slice(0, split))
+    const right = laneMean(inside.slice(split))
+    let cost = 0
+    for (let index = 0; index < inside.length; index += 1) {
+      const mean = index < split ? left : right
+      const lane = inside[index] as CurveLane
+      for (const key of LANE_KEYS) {
+        const scale = key === 'volume' ? 20 : 10
+        const diff = (lane[key] - mean[key]) / scale
+        cost += diff * diff
+      }
+    }
+    if (cost < bestCost) { bestCost = cost; bestSplit = split }
+  }
+  const fits: CurveFit[] = [
+    { from, to: from + bestSplit, delta: laneMean(inside.slice(0, bestSplit)) },
+    { from: from + bestSplit, to, delta: laneMean(inside.slice(bestSplit)) },
+  ]
+  return fits.filter((fit) => fit.to > fit.from
+    && (fit.delta.rate !== 0 || fit.delta.pitch !== 0 || fit.delta.volume !== 0))
+}
+
+/**
+ * Expand a curve into marks. Default: two spans, one request, no seam. With
+ * granularity 'fine' every character keeps its own value and the caller accepts
+ * the extra requests (and their padding) that costs.
+ */
+function curveMarks(length: number, curve: VoiceCurve, granularity: Granularity | undefined): ProsodyMark[] {
+  const lanes: CurveLane[] = []
+  for (let index = 0; index < length; index += 1) {
+    lanes.push({ rate: curve.rate?.[index] ?? 0, pitch: curve.pitch?.[index] ?? 0, volume: curve.volume?.[index] ?? 0 })
+  }
+  let fits: CurveFit[]
+  if (granularity === 'fine') {
+    const runs: CurveFit[] = []
+    for (let index = 0; index < length; index += 1) {
+      const lane = lanes[index] as CurveLane
+      if (lane.rate === 0 && lane.pitch === 0 && lane.volume === 0) continue
+      const last = runs[runs.length - 1]
+      if (last !== undefined && last.to === index
+        && last.delta.rate === lane.rate && last.delta.pitch === lane.pitch && last.delta.volume === lane.volume) {
+        last.to = index + 1
+        continue
+      }
+      runs.push({ from: index, to: index + 1, delta: { ...lane } })
+    }
+    fits = runs.slice(0, MARK_LIMITS.max)
+  } else {
+    fits = fitTwoSpans(lanes)
+  }
+  const marks: ProsodyMark[] = []
+  for (const fit of fits) {
+    const mark: ProsodyMark = { at: fit.from, to: fit.to }
+    if (fit.delta.rate !== 0) mark.rate = fit.delta.rate
+    if (fit.delta.pitch !== 0) mark.pitch = fit.delta.pitch
+    if (fit.delta.volume !== 0) mark.volume = fit.delta.volume
+    if (mark.rate === undefined && mark.pitch === undefined && mark.volume === undefined) continue
+    marks.push(mark)
+  }
+  return marks
+}
+
 /**
  * Keep at most 12 usable units. An unknown tone/pace/pause token rejects the
  * whole unit: a wrong label must never be silently spoken as neutral.
@@ -378,6 +529,13 @@ export function normalizeVoiceUnits(input: unknown): VoiceUnit[] {
     if (row.mark !== undefined) {
       const mark = normalizeMarks(row.mark)
       if (mark !== undefined) unit.mark = mark
+    }
+    if (row.curve !== undefined) {
+      const curve = normalizeCurve(row.curve)
+      if (curve !== undefined) {
+        const expanded = curveMarks(Array.from(unit.say ?? '').length, curve, unit.granularity)
+        if (expanded.length > 0) unit.mark = [...(unit.mark ?? []), ...expanded].slice(0, MARK_LIMITS.max)
+      }
     }
     if (style !== undefined) applyStylePreset(unit, style as StyleToken)
     // An explicit lengthen becomes a slowed tail too: text cannot stretch a sound.
